@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.codegraph/
 model/
 out/
+fonts/
 .DS_Store

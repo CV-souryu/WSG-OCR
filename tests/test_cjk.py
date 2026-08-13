@@ -7,7 +7,7 @@ import pytest
 from fixedfontocr import FixedFontOCR
 from fixedfontocr.fontgen import build_templates, write_model
 
-from .conftest import render_text
+from conftest import render_text
 
 
 def _cjk_font() -> Path:

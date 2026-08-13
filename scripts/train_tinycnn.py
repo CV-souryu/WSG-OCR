@@ -25,7 +25,7 @@ try:
 except ImportError:
     sys.exit("PyTorch is required for training: pip install torch")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from fixedfontocr.model import write_cnn_model  # noqa: E402
 from fixedfontocr.preprocess import normalize  # noqa: E402

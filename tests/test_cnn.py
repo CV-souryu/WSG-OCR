@@ -9,7 +9,7 @@ from fixedfontocr import FixedFontOCR
 from fixedfontocr.cnn import forward
 from fixedfontocr.model import load_model, write_cnn_model
 
-from .conftest import render_text
+from conftest import render_text
 
 
 def _random_weights(num_classes: int, seed: int = 0) -> dict[str, np.ndarray]:

@@ -5,7 +5,7 @@ import numpy as np
 from fixedfontocr import FixedFontOCR
 from fixedfontocr.types import Profile
 
-from .conftest import render_text
+from conftest import render_text
 
 
 def test_recognize_digits(font_path, model_dir):

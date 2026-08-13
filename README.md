@@ -3,6 +3,19 @@
 Deterministic CPU baseline for fixed-font OCR, designed so a future WGPU
 backend can consume the exact same model files and produce the same results.
 
+## Repository layout
+
+```
+.
+├── src/fixedfontocr/    # the package
+├── scripts/             # model generation & TinyCNN training utilities
+├── tests/               # pytest suite; fixture CNN models under tests/fixtures/
+├── docs/                # design & architecture notes
+├── fonts/               # local font files (gitignored — drop your own fonts here)
+├── pyproject.toml
+└── README.md
+```
+
 ## Quick start
 
 ```bash
@@ -75,7 +88,7 @@ would read, keeping both backends bit-identical.
 
 ## Profiles
 
-Per-UI-type tuning lives in [`fixedfontocr/types.py`](fixedfontocr/types.py):
+Per-UI-type tuning lives in [`src/fixedfontocr/types.py`](src/fixedfontocr/types.py):
 text color / grayscale threshold, expected character height/width, stroke
 width, spacing, and normalized size. Pass a custom profile to
 `FixedFontOCR(..., profile=...)`.

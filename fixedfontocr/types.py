@@ -1,0 +1,81 @@
+"""Shared data types for the OCR pipeline."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+from numpy.typing import NDArray
+
+
+@dataclass(frozen=True)
+class CharResult:
+    """A single recognized character and its location in the source image."""
+
+    char: str
+    x: int
+    y: int
+    w: int
+    h: int
+    confidence: float
+
+
+@dataclass(frozen=True)
+class OCRResult:
+    """Full recognition result for one image."""
+
+    text: str
+    confidence: float
+    chars: tuple[CharResult, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class Profile:
+    """Per-UI-type configuration used by the preprocessing pipeline."""
+
+    name: str
+    # Color extraction: an RGB target plus tolerance (max per-channel distance).
+    target_color: tuple[int, int, int] | None = None
+    tolerance: int = 40
+    use_grayscale: bool = True
+    grayscale_threshold: int = 140
+    # Character size expectations (used for merging/splitting components).
+    char_height_min: int = 8
+    char_height_max: int = 64
+    char_width_min: int = 4
+    char_width_max: int = 64
+    stroke_width: int = 1
+    char_spacing: int = 1
+    # Normalized output size.
+    target_size: int = 24
+    # Ink polarity: True means text pixels are brighter than the background.
+    bright_text: bool = True
+
+    def color_mask(self, image: NDArray[np.uint8]) -> NDArray[np.bool_]:
+        """Return a boolean mask of pixels matching this profile's text color."""
+        if self.use_grayscale or self.target_color is None:
+            gray = image @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+            if self.bright_text:
+                return gray >= self.grayscale_threshold
+            return gray <= self.grayscale_threshold
+
+        diff = np.abs(image.astype(np.int16) - np.asarray(self.target_color, dtype=np.int16))
+        return np.all(diff <= self.tolerance, axis=-1)
+
+
+def default_profile() -> Profile:
+    return Profile(
+        name="default",
+        target_color=(255, 255, 255),
+        tolerance=48,
+        use_grayscale=True,
+        grayscale_threshold=140,
+        char_height_min=8,
+        char_height_max=64,
+        char_width_min=3,
+        char_width_max=72,
+        stroke_width=1,
+        char_spacing=1,
+        target_size=24,
+        bright_text=True,
+    )

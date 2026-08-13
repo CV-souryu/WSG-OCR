@@ -1,0 +1,206 @@
+"""Custom model format: ``config.json`` + ``charset.txt`` + ``weights.bin``."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+
+@dataclass
+class OCRModel:
+    config: dict
+    charset: list[str]
+    templates: np.ndarray | None
+    input_size: int
+    classifier: str = "template"
+    weights: dict[str, np.ndarray] | None = None
+
+
+CNN_TENSORS: list[tuple[str, tuple[int, ...]]] = [
+    ("conv1.weight", (8, 1, 3, 3)),
+    ("conv1.bias", (8,)),
+    ("dw1.weight", (8, 3, 3)),
+    ("dw1.bias", (8,)),
+    ("pw1.weight", (16, 8)),
+    ("pw1.bias", (16,)),
+    ("dw2.weight", (16, 3, 3)),
+    ("dw2.bias", (16,)),
+    ("pw2.weight", (32, 16)),
+    ("pw2.bias", (32,)),
+    ("fc.weight", (None, 32)),  # (classes, 32)
+    ("fc.bias", (None,)),       # (classes,)
+]
+
+
+def cnn_tensor_shapes(num_classes: int) -> list[tuple[str, tuple[int, ...]]]:
+    shapes: list[tuple[str, tuple[int, ...]]] = []
+    for name, shape in CNN_TENSORS:
+        if None in shape:
+            shapes.append((name, tuple(num_classes if v is None else v for v in shape)))
+        else:
+            shapes.append((name, shape))
+    return shapes
+
+
+def _load_charset(path: Path) -> list[str]:
+    raw = path.read_text(encoding="utf-8")
+    chars: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for ch in line:
+            if ch.isspace():
+                continue
+            chars.append(ch)
+    if not chars:
+        raise ValueError(f"charset file {path} contains no characters")
+    return chars
+
+
+def load_model(model_path: Path) -> OCRModel:
+    """Load a model directory produced by the template generator."""
+
+    config_path = model_path / "config.json"
+    charset_path = model_path / "charset.txt"
+    weights_path = model_path / "weights.bin"
+    if not config_path.exists():
+        raise FileNotFoundError(f"missing {config_path}")
+    if not charset_path.exists():
+        raise FileNotFoundError(f"missing {charset_path}")
+    if not weights_path.exists():
+        raise FileNotFoundError(f"missing {weights_path}")
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    version = config.get("version", 1)
+    if version != 1:
+        raise ValueError(f"unsupported model version {version}")
+    dtype = config.get("dtype", "f32")
+    if dtype != "f32":
+        raise ValueError(f"unsupported dtype {dtype!r} (only f32 is implemented)")
+    input_size = int(config["input_width"])
+    if int(config["input_height"]) != input_size:
+        raise ValueError("input_width and input_height must match for the baseline")
+
+    charset = _load_charset(charset_path)
+    num_classes = int(config["classes"])
+    if num_classes != len(charset):
+        raise ValueError(
+            f"config.classes={num_classes} but charset has {len(charset)} characters"
+        )
+
+    classifier = config.get("classifier", "template")
+    if classifier not in ("template", "tinycnn"):
+        raise ValueError(f"unsupported classifier {classifier!r}")
+    if classifier == "tinycnn":
+        weights = _load_cnn_weights(weights_path, num_classes)
+        templates = None
+    else:
+        templates = _load_template_weights(weights_path, num_classes, input_size)
+        weights = None
+    return OCRModel(
+        config=config,
+        charset=charset,
+        templates=templates,
+        input_size=input_size,
+        classifier=classifier,
+        weights=weights,
+    )
+
+
+def _load_template_weights(
+    path: Path, num_classes: int, input_size: int
+) -> np.ndarray:
+    """Load bitset templates: uint32 count, uint32 bytes_per_template, payload."""
+
+    data = np.fromfile(path, dtype=np.uint8)
+    if data.size < 8:
+        raise ValueError(f"weights.bin too small: {data.size} bytes")
+    count = int(data[:4].view("<u4")[0])
+    bytes_per = int(data[4:8].view("<u4")[0])
+    payload = data[8:]
+    expected = num_classes * bytes_per
+    if count != num_classes:
+        raise ValueError(
+            f"weights.bin has {count} templates but config declares {num_classes}"
+        )
+    if payload.size != expected:
+        raise ValueError(
+            f"weights.bin payload is {payload.size} bytes, expected {expected}"
+        )
+    if bytes_per != (input_size * input_size + 7) // 8:
+        raise ValueError(
+            f"weights.bin bytes_per_template={bytes_per} does not match "
+            f"{input_size}x{input_size} bits"
+        )
+    rows = [payload[i * bytes_per : (i + 1) * bytes_per] for i in range(count)]
+    return np.stack(rows)
+
+
+def _load_cnn_weights(path: Path, num_classes: int) -> dict[str, np.ndarray]:
+    """Load the fixed-order f32 CNN weights from ``weights.bin``."""
+
+    data = np.fromfile(path, dtype="<f4")
+    shapes = cnn_tensor_shapes(num_classes)
+    expected = sum(int(np.prod(s)) for _, s in shapes)
+    if data.size != expected:
+        raise ValueError(
+            f"weights.bin has {data.size} f32 values, expected {expected} "
+            f"for {num_classes} classes"
+        )
+    weights: dict[str, np.ndarray] = {}
+    offset = 0
+    for name, shape in shapes:
+        size = int(np.prod(shape))
+        weights[name] = data[offset : offset + size].reshape(shape)
+        offset += size
+    return weights
+
+
+def write_cnn_weights(
+    path: Path, weights: dict[str, np.ndarray], num_classes: int
+) -> None:
+    """Write CNN weights in the fixed tensor order expected by the loader."""
+
+    tensors: list[np.ndarray] = []
+    for name, shape in cnn_tensor_shapes(num_classes):
+        if name not in weights:
+            raise ValueError(f"missing tensor {name}")
+        arr = np.asarray(weights[name], dtype="<f4")
+        if arr.shape != shape:
+            raise ValueError(
+                f"tensor {name} has shape {arr.shape}, expected {shape}"
+            )
+        tensors.append(arr.reshape(-1))
+    np.concatenate(tensors).tofile(path)
+
+
+def write_cnn_model(
+    model_dir: Path,
+    chars: list[str],
+    weights: dict[str, np.ndarray],
+    input_size: int = 24,
+) -> None:
+    """Write ``config.json`` + ``charset.txt`` + CNN ``weights.bin``."""
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    config = {
+        "input_width": input_size,
+        "input_height": input_size,
+        "classes": len(chars),
+        "version": 1,
+        "dtype": "f32",
+        "classifier": "tinycnn",
+    }
+    (model_dir / "config.json").write_text(
+        json.dumps(config, indent=4) + "\n",
+        encoding="utf-8",
+    )
+    (model_dir / "charset.txt").write_text(
+        "".join(chars) + "\n",
+        encoding="utf-8",
+    )
+    write_cnn_weights(model_dir / "weights.bin", weights, len(chars))

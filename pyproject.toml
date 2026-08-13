@@ -1,0 +1,38 @@
+[project]
+name = "fixedfontocr"
+version = "0.1.0"
+description = "Fixed-font OCR with CPU and WGPU backends."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+wgpu = [
+    "wgpu",
+]
+
+train = [
+    "torch>=2.0",
+    "pillow>=10.0",
+]
+
+dev = [
+    "pytest>=8.0",
+    "torch>=2.0",
+    "pillow>=10.0",
+]
+
+[project.scripts]
+fixedfontocr-generate = "fixedfontocr.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["fixedfontocr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

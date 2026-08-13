@@ -1,0 +1,8 @@
+{
+    "input_width": 24,
+    "input_height": 24,
+    "classes": 8,
+    "version": 1,
+    "dtype": "f32",
+    "classifier": "tinycnn"
+}

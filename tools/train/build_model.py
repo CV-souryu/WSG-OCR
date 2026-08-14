@@ -127,6 +127,8 @@ def main() -> None:
             str(args.template_output),
             "--output",
             str(args.output),
+            "--font",
+            str(font),
             "--skip-test-vectors",
         ]
     )

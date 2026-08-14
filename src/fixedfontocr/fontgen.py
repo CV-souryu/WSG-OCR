@@ -16,6 +16,7 @@ from .defaults import (
     ensure_font_path,
     resolve_font,
 )
+from .geometry import write_geometry_json
 from .preprocess import (
     Component,
     NormalizeSpec,
@@ -112,11 +113,14 @@ def write_model(
     font_path: str | Path | None = None,
     font_sha256: str | None = None,
     render_size: int = 32,
+    threshold: int = 140,
 ) -> None:
-    """Write ``config.json``, ``charset.txt`` and ``weights.bin``.
+    """Write ``config.json``, ``charset.txt``, ``weights.bin`` and ``geometry.json``.
 
     ``font_path`` is resolved against ``fonts/`` and its SHA256 is stored in
-    the model metadata unless an explicit ``font_sha256`` is given.
+    the model metadata unless an explicit ``font_sha256`` is given. When a
+    font is provided, the Goal 8 font-geometry database is generated offline
+    and stored alongside the model so the runtime never needs fontTools.
     """
 
     model_dir = Path(model_dir)
@@ -145,6 +149,15 @@ def write_model(
         "".join(chars) + "\n",
         encoding="utf-8",
     )
+    if font_path is not None:
+        write_geometry_json(
+            model_dir,
+            font_path,
+            chars,
+            render_size=render_size,
+            threshold=threshold,
+            font_sha256=font_sha256,
+        )
 
     header = np.array([len(chars), templates.shape[1]], dtype="<u4")
     payload = np.concatenate([header.view(np.uint8), templates.reshape(-1)])

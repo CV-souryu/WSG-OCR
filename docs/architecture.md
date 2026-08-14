@@ -45,6 +45,7 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/types.py` | Goal 1 core dataclasses: `Component`, `VisualCandidate`, `VisualLattice`, `VisualScores` (Top-K), `DecodePath`, `LexiconMatch`, extended `OCRResult`; plus compatibility `CharResult`, `Profile`, `ClassificationBatch`, `CandidateScore`. |
 | `src/fixedfontocr/preprocess.py` | Color/grayscale mask, line finding, run-length connected components, Goal 3 binary + soft baseline-aligned 24×24 normalization (`NormalizeSpec`, `glyph_normalize_geometry`). |
 | `src/fixedfontocr/frontend.py` | Goal 2 Visual Frontend: one RGB pass extracts `binary_mask` (segmentation/template) and `soft_foreground` (TinyCNN), plus binary/soft glyph normalization helpers. |
+| `src/fixedfontocr/geometry.py` | Goal 8 font geometry database: offline generation from a registered font (`advance`, bbox, aspect, ink, component count, baseline) plus the runtime JSON lookup table used by pruning and geometry scoring. |
 | `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms) and the visual DP decoder. This is the production segmentation path. |
 | `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate; converts raw scores to a shared 0..1 visual score. |
 | `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier`: coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; `match_batch` for the lattice. |
@@ -66,14 +67,14 @@ numpy RGB
   -> line finding (binary mask)
   -> run-length connected components (original components are kept)
   -> candidate lattice (single components + merges of up to 4 + split(Cx),
-     geometrically filtered)
+     geometrically filtered with the Goal 8 font geometry database)
   -> 24x24 normalization (Goal 3 baseline frame, binary + soft)
   -> batched scoring (TemplateClassifier.match_batch / TinyCNN forward)
        template: confidence AND top-1/top-2 margin must both be high
        cnn:      soft glyphs when model input_mode="soft", binary otherwise
                  sigmoid(top1-top2 margin) -> shared 0..1 visual score
        hybrid:   template gate first, CNN fallback for ambiguous glyphs
-  -> visual DP (max mean visual score path, geometry penalties)
+  -> visual DP (max mean visual score path, Goal 8 geometry penalties)
   -> allowed_chars restriction (postprocess)
   -> charset -> string
 ```
@@ -121,6 +122,49 @@ identical placement; the soft path keeps anti-aliasing/edge intensity.
 
 Models without a `normalize` spec (pre-Goal-3 checkpoints) keep the legacy
 centered normalization, so old checkpoints remain loadable.
+
+## Font geometry database (Goal 8)
+
+The offline database is the replacement for the Goal 4 "expected font bbox
+stand-in". It is generated once from the registered font:
+
+```text
+char_id
+advance              (em units, from the font hmtx)
+bbox width/height    (em units, from the outline bounds)
+aspect ratio         (outline bbox width / height)
+ink count            (pixels in the deterministic binary raster)
+component count      (4-connected components of that raster)
+baseline             (font baseline position in em / ink bbox ratio)
+ink ratio            (ink / raster bbox area, for runtime comparison)
+```
+
+`fontgen.write_model`, `model.write_cnn_model` and
+`model.write_hybrid_model` all write `geometry.json` when a font is
+available. The runtime loader (`model.load_model`) parses it without
+fontTools/Pillow and attaches it to `OCRModel.geometry`; models generated
+before Goal 8 simply have `geometry=None` and keep the heuristic path.
+
+At runtime the database is used in three places:
+
+1. **Candidate pruning** (`_geometry_bbox_ok`): the line's expected glyph
+   width is derived from the font's narrow/full-width ratios instead of
+   `0.8 * median height`, and candidate bboxes that no charset glyph can
+   occupy (e.g. a full-width blob 1.8x too wide) are filtered before
+   scoring.
+2. **Geometry score** (`geometry_score`): after the classifier picks a
+   Top-1 character, the candidate's bbox width/height/aspect, ink ratio,
+   component count and baseline are compared to that character's database
+   entry. Penalties stay small (bounded at 0.12) so the visual score remains
+   dominant, but a fragmented `小` no longer has the same prior as a merged
+   `小`, and a full-width blob is never treated like `1/I/l/i/!`.
+3. **Split/merge decisions** (`_estimate_expected_width`): narrow lines
+   (`Z17`) and full-width lines (`巴尔的摩`) use their own font-derived
+   expected widths, so a connected low-res two-glyph blob is split on the
+   real glyph scale rather than a single global heuristic.
+
+The Goal 4/Goal 7 regression strings are unchanged with the database
+enabled (`tests/test_goal8_geometry.py`).
 
 ## Visual Frontend (Goal 2)
 
@@ -496,6 +540,7 @@ verified:
 | Stride-2 forward has no useless work | optimized conv/pw + `tests/test_cnn.py` parity tests, benchmark max_error 0.0 |
 | Goal 6 CPU TinyCNN optimization | `tests/test_goal6_tinycnn.py` (strided im2col, no activation-dict forward, prepared weights, batch, Top-K via partition) |
 | Goal 7 low-res training domain | `tests/test_goal7_low_res.py` (10..18 px coverage, supersampled bilinear/area-like downsample, sub-pixel/scale/blur/alpha/brightness/background/outline augmentation, Z17/巴尔的摩) |
+| Goal 8 font geometry database | `tests/test_goal8_geometry.py` (per-char advance/bbox/aspect/ink/component/baseline, JSON round-trip + model embedding, narrow vs. full-width priors, geometry score and pruning) |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
 | Real game regression passes | `tests/test_game_samples.py` (23 samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |
@@ -509,6 +554,11 @@ array is shared by the classifier at runtime (no copy). Coarse candidate
 features use 8 B/char (uint16 ink + six uint8 bbox/margin values). With
 numpy ≥ 2.0 the popcount fast path is `np.bitwise_count` (0 B table); older
 numpy falls back to a 64 KiB 16-bit lookup table.
+
+The Goal 8 font geometry database (`geometry.json`) adds ~300 B/char
+(~0.9 MiB for 3000 classes) and is loaded once as plain JSON; the runtime
+keeps only the small `char_id -> entry` dict plus the median
+narrow/full-width ratios used by pruning.
 
 TinyCNN weights are `4032 + 33·C` f32 bytes (C = classes): ~391 KiB at
 3000 classes; hybrid models store template + CNN. The WGPU backend keeps

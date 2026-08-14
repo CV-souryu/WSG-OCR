@@ -159,6 +159,7 @@ class SegmentScorer:
         )
         self.cnn_threshold = float(model.config.get("cnn_threshold", 0.0))
         self.cnn_input_mode = model.input_mode
+        self.geometry = model.geometry
         # CNN-only models cannot lean on template confidence; a merged
         # candidate must look like a real character before the DP may prefer
         # it over its components (see segmentation._drop_weak_merges).

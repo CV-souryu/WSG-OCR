@@ -16,6 +16,8 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 │   ├── cnn.py           # numpy TinyCNN reference (Conv + ReLU only)
 │   ├── frontend.py      # Goal 2 Visual Frontend: binary mask + soft
 │   │                    #   foreground from one RGB pass
+│   ├── geometry.py      # Goal 8 font geometry database: offline generation
+│   │                    #   + runtime lookup (no fontTools at runtime)
 │   ├── segmentation.py  # candidate lattice + visual DP decoder (P0)
 │   ├── scorer.py        # unified template/CNN scoring (P4/P6)
 │   ├── defaults.py      # bundled game font / charset / model paths
@@ -177,6 +179,36 @@ See `docs/architecture.md` for the scoring details (unified 0..1 visual
 scores, margin-aware hybrid gate, O(C) Top-2) and the P2 stride-2 CNN
 optimization.
 
+## Font geometry database (Goal 8)
+
+Before Goal 8 the lattice relied on a generic ``0.8 * median height``
+expected-glyph width and a small hand-tuned geometry penalty. The project
+now ships a per-font geometry database generated offline from ``fonts/``:
+
+```text
+fonts/ SourceHanSansSC-Bold.otf + charset
+  -> geometry.json
+       char_id, advance, bbox width/height, aspect ratio, ink count,
+       component count, baseline (+ derived ink ratio)
+```
+
+Every template/CNN/hybrid model written by the package includes
+`geometry.json`. The runtime loader keeps it as plain JSON + small lookup
+tables (no fontTools/Pillow dependency), and `FixedFontOCR` uses it in
+three places:
+
+* candidate pruning uses the font's real narrow vs. full-width bbox
+  ratios, so `1 I l i !` never share a full-width CJK prior;
+* the segmentation geometry score compares each candidate's bbox, ink
+  ratio, component count and baseline with the classifier's Top-1
+  character (a 3-component `小` merge matches its database entry; a single
+  fragment of it does not);
+* split/merge decisions use the database-derived expected glyph width
+  instead of the old height-only heuristic.
+
+`tests/test_goal8_geometry.py` pins the database contract and the Goal 4
+regressions still pass with the database enabled.
+
 ## Visual Frontend (Goal 2)
 
 Every RGB input is converted once into two representations:
@@ -317,6 +349,7 @@ footprint of any model. Measured numbers for a 3000-char CJK template model:
 | --- | --- |
 | template weights on disk | ~211 KiB (`N × 72 B` bitsets + 8 B header) |
 | charset.txt | ~9 KiB (3000 CJK chars) |
+| geometry.json | ~0.9 MiB for 3000 chars (per-char Goal 8 metrics, ~300 B/char) |
 | template bits in RAM | ~211 KiB (shared with the loaded model, no copy) |
 | coarse candidate features | ~23 KiB (`8 B/char`: uint16 ink + uint8 bbox/margins) |
 | popcount table | 0 B with numpy ≥ 2.0 (`bitwise_count`), 64 KiB fallback |
@@ -357,6 +390,7 @@ model/
 │                  # classifier (template|tinycnn|hybrid), thresholds,
 │                  # architecture (tinycnn_v1), font_sha256 + normalize
 │                  # (Goal 3 baseline frame)
+├── geometry.json  # Goal 8 font geometry database (per-char metrics)
 ├── charset.txt
 └── weights.bin    # template: uint32 count + packed bits;
                    # tinycnn/hybrid: f32 tensors in fixed order
@@ -405,6 +439,12 @@ spacing, and normalized size. Pass a custom profile to
   brightness, background blend, outline and shadow augmentation. The
   training entry points default to this domain and
   `tests/test_goal7_low_res.py` covers every size plus `Z17`/`巴尔的摩`.
+- Goal 8 font geometry database is implemented: every model built from a
+  registered font embeds `geometry.json` (advance, bbox, aspect, ink,
+  component count, baseline per character), and the runtime uses it for
+  candidate pruning, the geometry score and split/merge width priors.
+  `tests/test_goal8_geometry.py` covers generation, round-trip, narrow vs.
+  full-width priors and the regression set.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

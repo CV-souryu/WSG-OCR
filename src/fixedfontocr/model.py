@@ -14,6 +14,7 @@ from .cnn import (
     validate_v1_weights,
 )
 from .defaults import compute_font_sha256
+from .geometry import FontGeometryDatabase, write_geometry_json
 from .preprocess import NormalizeSpec, compute_normalize_spec
 
 
@@ -28,6 +29,7 @@ class OCRModel:
     font_sha256: str | None = None
     input_mode: str = "binary"
     normalize_spec: NormalizeSpec | None = None
+    geometry: FontGeometryDatabase | None = None
 
 
 # The tensor shape table (formerly CNN_TENSORS / cnn_tensor_shapes) now
@@ -52,7 +54,13 @@ def _load_charset(path: Path) -> list[str]:
 
 
 def load_model(model_path: Path) -> OCRModel:
-    """Load a model directory produced by the template generator."""
+    """Load a model directory produced by the template generator.
+
+    ``geometry.json`` is optional for backwards compatibility: models
+    generated before Goal 8 simply keep ``geometry=None`` and the
+    segmentation code falls back to its heuristic geometry. New models
+    written by this package always include the database.
+    """
 
     config_path = model_path / "config.json"
     charset_path = model_path / "charset.txt"
@@ -107,6 +115,22 @@ def load_model(model_path: Path) -> OCRModel:
         templates = _load_template_weights(weights_path, num_classes, input_size)
     else:
         templates = None
+    geometry = None
+    geometry_path = model_path / "geometry.json"
+    if geometry_path.exists():
+        geometry = FontGeometryDatabase.load(geometry_path)
+        if len(geometry.entries) != len(charset):
+            raise ValueError(
+                f"geometry.json has {len(geometry.entries)} entries but "
+                f"charset has {len(charset)} characters"
+            )
+        if geometry.charset != "".join(charset):
+            raise ValueError("geometry.json charset differs from charset.txt")
+        config_sha = config.get("font_sha256")
+        if config_sha and geometry.font_sha256 != config_sha:
+            raise ValueError(
+                "geometry.json font_sha256 does not match config.json"
+            )
     return OCRModel(
         config=config,
         charset=charset,
@@ -117,6 +141,7 @@ def load_model(model_path: Path) -> OCRModel:
         font_sha256=config.get("font_sha256"),
         input_mode=input_mode,
         normalize_spec=NormalizeSpec.from_dict(config.get("normalize")),
+        geometry=geometry,
     )
 
 
@@ -205,13 +230,17 @@ def write_cnn_model(
     input_mode: str = "binary",
     normalize_spec: dict | None = None,
     render_size: int = 32,
+    threshold: int = 140,
+    geometry: FontGeometryDatabase | None = None,
 ) -> None:
-    """Write ``config.json`` + ``charset.txt`` + CNN ``weights.bin``.
+    """Write ``config.json`` + ``charset.txt`` + CNN ``weights.bin`` + geometry.
 
     When ``font_path`` is provided its SHA256 is stored in the model
     metadata, unless an explicit ``font_sha256`` is given. ``input_mode``
     records which glyph representation the CNN was trained with
     (``"binary"`` 0/255 masks or ``"soft"`` 0..255 foreground strength).
+    A Goal 8 ``geometry`` database (or ``font_path`` to generate one) is
+    written when available.
     """
 
     if input_mode not in ("binary", "soft"):
@@ -237,6 +266,17 @@ def write_cnn_model(
         ).to_dict()
     if normalize_spec:
         config["normalize"] = normalize_spec
+    if geometry is not None:
+        geometry.save(model_dir / "geometry.json")
+    elif font_path is not None:
+        write_geometry_json(
+            model_dir,
+            font_path,
+            chars,
+            render_size=render_size,
+            threshold=threshold,
+            font_sha256=font_sha256,
+        )
     (model_dir / "config.json").write_text(
         json.dumps(config, indent=4) + "\n",
         encoding="utf-8",
@@ -262,12 +302,15 @@ def write_hybrid_model(
     input_mode: str = "binary",
     normalize_spec: dict | None = None,
     render_size: int = 32,
+    threshold: int = 140,
+    geometry: FontGeometryDatabase | None = None,
 ) -> None:
     """Write a hybrid model: template level-1 + TinyCNN level-2.
 
     Layout: ``config.json`` (``classifier: "hybrid"``), ``charset.txt``,
     ``templates.bin`` (bitset templates, same payload as a template model's
-    ``weights.bin``) and ``weights.bin`` (f32 CNN tensors). The runtime
+    ``weights.bin``), ``weights.bin`` (f32 CNN tensors) and, when a font or
+    prebuilt database is available, ``geometry.json`` (Goal 8). The runtime
     pipeline tries the template first and only runs the CNN on glyphs whose
     template confidence is below ``template_threshold``.
     """
@@ -299,6 +342,17 @@ def write_hybrid_model(
         ).to_dict()
     if normalize_spec:
         config["normalize"] = normalize_spec
+    if geometry is not None:
+        geometry.save(model_dir / "geometry.json")
+    elif font_path is not None:
+        write_geometry_json(
+            model_dir,
+            font_path,
+            chars,
+            render_size=render_size,
+            threshold=threshold,
+            font_sha256=font_sha256,
+        )
     (model_dir / "config.json").write_text(
         json.dumps(config, indent=4) + "\n",
         encoding="utf-8",

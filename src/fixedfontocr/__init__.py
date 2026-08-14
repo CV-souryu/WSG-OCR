@@ -22,6 +22,7 @@ from .types import (
 )
 from .classifier import TemplateClassifier
 from .frontend import VisualFrontend, extract_frontend
+from .geometry import FontGeometryDatabase
 from .model import write_hybrid_model
 from .postprocess import pick
 
@@ -41,6 +42,7 @@ __all__ = [
     "DecodePath",
     "LexiconMatch",
     "VisualFrontend",
+    "FontGeometryDatabase",
     "extract_frontend",
     "Profile",
     "TemplateClassifier",

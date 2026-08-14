@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .geometry import FontGeometryDatabase
 from .preprocess import (
     Segment,
     _bbox_segment,
@@ -82,6 +83,7 @@ def build_candidates(
     profile: Profile,
     max_merge_components: int = 3,
     split_wide: bool = True,
+    geometry: FontGeometryDatabase | None = None,
 ) -> list[VisualCandidate]:
     """Generate all consecutive candidates up to ``max_merge_components``.
 
@@ -96,14 +98,20 @@ def build_candidates(
     if max_merge_components < 1:
         raise ValueError("max_merge_components must be >= 1")
     atoms, expected_width = _expand_atoms(
-        comps, profile, max_merge_components, split_wide=split_wide
+        comps,
+        profile,
+        max_merge_components,
+        split_wide=split_wide,
+        geometry=geometry,
     )
     n = len(atoms)
     cands: list[Candidate] = []
     for i in range(n):
         for j in range(i + 1, min(n, i + max_merge_components) + 1):
             parts = atoms[i:j]
-            if not _passes_filters(parts, profile, expected_width):
+            if not _passes_filters(
+                parts, profile, expected_width, geometry=geometry
+            ):
                 continue
             if j - i == 1:
                 seg = parts[0].segment
@@ -126,21 +134,44 @@ def build_candidates(
 
 
 def _estimate_expected_width(
-    comps: list[Component], profile: Profile
+    comps: list[Component],
+    profile: Profile,
+    geometry: FontGeometryDatabase | None = None,
 ) -> float:
-    """Estimate the line's typical glyph width from its ink height.
+    """Estimate the line's typical glyph width from font geometry + ink height.
 
-    This is the Goal 4 "font expected bbox" stand-in used before the full
-    offline geometry database (Goal 8) exists: full-width CJK is roughly
-    square while narrow Latin/digits are narrower, so ``0.8 * median
-    height`` is a safe upper bound for a single glyph on the line.
+    Goal 8 replaces the old "0.8 * median height" stand-in with the
+    registered font's real ratios: narrow glyphs (``1 I l i !``) use the
+    narrow bbox ratio and full-width CJK uses the full-width ratio. Without
+    a database the Goal 4 heuristic remains unchanged.
     """
 
     if not comps:
         return max(float(profile.char_width_min), 2.0)
     max_h = max(c.h for c in comps)
-    tall = [c.h for c in comps if c.h >= max(2, 0.6 * max_h)]
-    median_h = float(np.median(tall) if tall else max_h)
+    tall = [c for c in comps if c.h >= max(2, 0.6 * max_h)]
+    if geometry is not None:
+        widths: list[float] = []
+        for c in tall:
+            if c.w / max(c.h, 1) < 0.8:
+                em = max(
+                    c.h / max(geometry.narrow_height_ratio, 1e-6),
+                    1.0,
+                )
+                widths.append(em * geometry.narrow_width_ratio)
+            else:
+                em = max(
+                    c.h / max(geometry.full_height_ratio, 1e-6),
+                    1.0,
+                )
+                widths.append(em * geometry.full_width_ratio)
+        if widths:
+            expected = float(np.median(widths))
+            return max(
+                float(profile.char_width_min),
+                min(float(profile.char_width_max), expected),
+            )
+    median_h = float(np.median([c.h for c in tall]) if tall else max_h)
     return max(
         float(profile.char_width_min),
         min(float(profile.char_width_max), median_h * 0.8),
@@ -230,10 +261,11 @@ def _expand_atoms(
     profile: Profile,
     max_merge_components: int,
     split_wide: bool,
+    geometry: FontGeometryDatabase | None = None,
 ) -> tuple[list[_Atom], float]:
     """Build the atom sequence, keeping every original component reachable."""
 
-    expected = _estimate_expected_width(comps, profile)
+    expected = _estimate_expected_width(comps, profile, geometry)
     atoms: list[_Atom] = []
     for i, comp in enumerate(comps):
         if split_wide:
@@ -255,6 +287,7 @@ def _passes_filters(
     parts: list[_Atom],
     profile: Profile,
     expected_width: float,
+    geometry: FontGeometryDatabase | None = None,
 ) -> bool:
     """Reject candidate shapes that cannot be a single character.
 
@@ -267,6 +300,8 @@ def _passes_filters(
     if len(parts) == 1:
         seg = parts[0].segment
         if seg.w > profile.char_width_max or seg.h > profile.char_height_max:
+            return False
+        if not _geometry_bbox_ok(seg, geometry):
             return False
         if seg.h >= max(2, profile.char_height_min):
             ink = int(seg.mask.sum())
@@ -281,6 +316,11 @@ def _passes_filters(
     y1 = max(p.y + p.h for p in segs)
     w, h = x1 - x0, y1 - y0
     if w > profile.char_width_max or h > profile.char_height_max:
+        return False
+    if not _geometry_bbox_ok(
+        Component(mask=segs[0].mask, x=x0, y=y0, w=w, h=h),
+        geometry,
+    ):
         return False
     if h < max(2, profile.char_height_min):
         return False
@@ -315,6 +355,39 @@ def _passes_filters(
     return True
 
 
+def _geometry_bbox_ok(
+    seg: Component,
+    geometry: FontGeometryDatabase | None,
+) -> bool:
+    """Goal 8 bbox prior: reject shapes no charset glyph can occupy.
+
+    The check is deliberately generous (1.35x the widest narrow/full-width
+    glyph, 0.35x the narrowest) so low-resolution fragments are still scored
+    by the visual DP. Without a database every shape passes.
+    """
+
+    if geometry is None or seg.h < 2 or seg.w < 1:
+        return True
+    h = max(seg.h, 1)
+    w = max(seg.w, 1)
+    if w / h < 0.8:
+        em = max(
+            h / max(geometry.narrow_height_ratio, 1e-6),
+            1.0,
+        )
+        max_ratio = geometry.narrow_width_max * 1.35
+        min_ratio = geometry.narrow_width_min * 0.35
+    else:
+        em = max(
+            h / max(geometry.full_height_ratio, 1e-6),
+            1.0,
+        )
+        max_ratio = geometry.full_width_max * 1.35
+        min_ratio = geometry.full_width_min * 0.35
+    ratio = w / em
+    return min_ratio <= ratio <= max_ratio
+
+
 def _vertical_overlap(a: Component, b: Component) -> int:
     return min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
 
@@ -327,16 +400,24 @@ def geometry_score(
     candidate: VisualCandidate,
     comps: list[Component],
     profile: Profile,
+    geometry: FontGeometryDatabase | None = None,
+    char_id: int | None = None,
+    normalize_geometry: tuple[float, float] | None = None,
 ) -> float:
     """Small geometric adjustments on top of the classifier visual score.
 
     Penalties are deliberately small (<= 0.06) so the classifier remains the
     dominant signal, but they break ties between a fragmented glyph path and
-    its merged candidate and keep clearly-adjacent characters apart.
+    its merged candidate and keep clearly-adjacent characters apart. With a
+    Goal 8 database the score also compares the candidate's bbox, ink ratio,
+    component count and baseline against the classifier's Top-1 character:
+    a narrow ``1/I/l`` prior is never treated like a full-width CJK glyph.
     """
 
     score = 0.0
     seg = candidate.segment
+    if seg is None:
+        return score
 
     # Vertical alignment: character centers should sit in one band.
     centers = [c.y + c.h / 2 for c in comps]
@@ -365,7 +446,64 @@ def geometry_score(
         if seg.w > expected * 1.9:
             score -= 0.05
 
-    return score
+    if geometry is None:
+        return max(score, -0.10)
+    if char_id is None and candidate.score is not None:
+        char_id = getattr(candidate.score, "char_id", None)
+    if char_id is None or char_id < 0:
+        return max(score, -0.10)
+    entry = geometry.get(int(char_id))
+    if entry is None:
+        return max(score, -0.10)
+
+    h = max(seg.h, 1)
+    w = max(seg.w, 1)
+    em = max(
+        h / max(entry.bbox_height, 1e-6),
+        w / max(entry.bbox_width, 1e-6),
+        1.0,
+    )
+    w_ratio = w / em
+    h_ratio = h / em
+    width_err = abs(w_ratio - entry.bbox_width) / max(entry.bbox_width, 1e-3)
+    height_err = abs(h_ratio - entry.bbox_height) / max(entry.bbox_height, 1e-3)
+    aspect = w / h
+    aspect_err = (
+        abs(np.log(max(aspect / max(entry.aspect_ratio, 1e-3), 1e-3)))
+        if entry.aspect_ratio > 0
+        else 0.0
+    )
+    score -= min(0.05, width_err * 0.04)
+    score -= min(0.04, height_err * 0.03)
+    score -= min(0.03, aspect_err * 0.02)
+    advance_err = abs(w_ratio - entry.advance) / max(entry.advance, 1e-3)
+    score -= min(0.02, advance_err * 0.01)
+
+    ink_ratio = float(seg.mask.sum()) / float(w * h)
+    ink_err = abs(ink_ratio - entry.ink_ratio) / max(entry.ink_ratio, 0.05)
+    score -= min(0.03, ink_err * 0.01)
+
+    # Component-count prior: a fragmented glyph whose Top-1 needs 3
+    # components is penalized; a merge whose components match the glyph is
+    # not. Split whole-component alternatives (atoms > components) are
+    # exempt because they still represent the original connected glyph.
+    expected_cc = max(1, entry.component_count)
+    actual_cc = max(1, len(candidate.components))
+    start, end = candidate.atom_span
+    is_split_whole = end - start > actual_cc
+    if not is_split_whole:
+        if actual_cc > 1 and expected_cc == 1:
+            score -= min(0.04, (actual_cc - 1) * 0.02)
+        elif actual_cc == 1 and expected_cc > 1:
+            score -= min(0.03, (expected_cc - 1) * 0.015)
+
+    if normalize_geometry is not None:
+        baseline_offset = float(normalize_geometry[0])
+        if 0.0 < baseline_offset <= h * 1.5 and 0.0 < entry.baseline_ratio <= 1.5:
+            cand_ratio = baseline_offset / h
+            score -= min(0.02, abs(cand_ratio - entry.baseline_ratio) * 0.02)
+
+    return max(score, -0.12)
 
 
 def build_lattice(
@@ -477,7 +615,12 @@ def segment_line(
             mean_score=0.0,
             lattice=build_lattice([], [], line),
         )
-    candidates = build_candidates(comps, profile, max_merge_components)
+    candidates = build_candidates(
+        comps,
+        profile,
+        max_merge_components,
+        geometry=getattr(scorer, "geometry", None),
+    )
     if not candidates:
         return DecodePath(
             candidates=(),
@@ -498,7 +641,14 @@ def segment_line(
     for cand, score, geom in zip(candidates, scores, geometries):
         cand.score = score
         cand.scores = score.visual_scores
-        cand.geometry = geometry_score(cand, comps, profile)
+        cand.geometry = geometry_score(
+            cand,
+            comps,
+            profile,
+            geometry=getattr(scorer, "geometry", None),
+            char_id=score.char_id,
+            normalize_geometry=geom,
+        )
         # An exact visual match (template distance 0) is authoritative: the
         # candidate *is* a real glyph, so merge/split geometry penalties must
         # not let a fragmented path of weaker look-alikes win the DP.

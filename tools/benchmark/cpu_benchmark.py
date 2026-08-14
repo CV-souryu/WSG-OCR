@@ -187,13 +187,20 @@ def bench_ocr_stages(
     lines = find_lines(mask, profile)
     line = lines[0]
     comps = connected_components(line)
-    cands = build_candidates(comps, profile)
-    cand_segments = [c.segment for c in cands]
     scorer: SegmentScorer = ocr._scorer
+    geometry = getattr(scorer, "geometry", None)
+    cands = build_candidates(comps, profile, geometry=geometry)
+    cand_segments = [c.segment for c in cands]
     scores = scorer.score(cand_segments, soft=frontend.soft_foreground)
     for cand, score in zip(cands, scores):
         cand.score = score
-        cand.geometry = geometry_score(cand, comps, profile)
+        cand.geometry = geometry_score(
+            cand,
+            comps,
+            profile,
+            geometry=geometry,
+            char_id=score.char_id,
+        )
 
     stages = {
         "frontend": (lambda: extract_frontend(image, profile), 200),
@@ -205,7 +212,7 @@ def bench_ocr_stages(
             200,
         ),
         "candidate_generation": (
-            lambda: build_candidates(comps, profile),
+            lambda: build_candidates(comps, profile, geometry=geometry),
             200,
         ),
         "normalize": (

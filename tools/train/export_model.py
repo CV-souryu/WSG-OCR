@@ -12,6 +12,8 @@ Output:
     ├── config.json     # canonical FixedFontOCR config
     ├── weights.bin     # f32 CNN tensors (BN already folded)
     ├── charset.txt
+    ├── geometry.json   # Goal 8 font geometry database (when --font /
+    │                   #   a template with geometry.json is available)
     └── test_vectors.npz
         # input, every layer's activations, final logits and char_id;
         # WGPU unit tests compare against these directly.
@@ -44,6 +46,7 @@ from fixedfontocr.model import (  # noqa: E402
     write_cnn_model,
     write_hybrid_model,
 )
+from fixedfontocr.geometry import FontGeometryDatabase  # noqa: E402
 
 
 def load_checkpoint(
@@ -98,6 +101,12 @@ def main() -> None:
     parser.add_argument("checkpoint", help="model.pth from tools/train.py")
     parser.add_argument("--output", default="runtime_model", help="output model dir")
     parser.add_argument(
+        "--font",
+        help="registered font under fonts/ used to generate geometry.json "
+        "(Goal 8); when --templates is given, its geometry.json is reused "
+        "if present",
+    )
+    parser.add_argument(
         "--templates",
         help="template model dir to combine into a hybrid model "
         "(same charset required)",
@@ -130,6 +139,8 @@ def main() -> None:
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
 
+    font_path = None
+    geometry = None
     if args.templates:
         tmpl = load_model(Path(args.templates))
         if tmpl.classifier != "template":
@@ -137,6 +148,11 @@ def main() -> None:
         if tmpl.charset != charset:
             raise SystemExit("template charset differs from the CNN checkpoint")
         font_sha256 = font_sha256 or tmpl.config.get("font_sha256")
+        tmpl_geometry = Path(args.templates) / "geometry.json"
+        if tmpl_geometry.exists():
+            geometry = FontGeometryDatabase.load(tmpl_geometry)
+    if args.font:
+        font_path = Path(args.font)
     if not font_sha256:
         raise SystemExit(
             "checkpoint/template has no font_sha256; retrain with the "
@@ -158,6 +174,8 @@ def main() -> None:
             font_sha256=font_sha256,
             input_mode=input_mode,
             normalize_spec=normalize_spec,
+            font_path=font_path,
+            geometry=geometry,
         )
     else:
         write_cnn_model(
@@ -167,6 +185,8 @@ def main() -> None:
             input_size=24,
             font_sha256=font_sha256,
             input_mode=input_mode,
+            font_path=font_path,
+            geometry=geometry,
         )
 
     # The plan's runtime layout names it model.json; keep config.json too

@@ -3,7 +3,8 @@
 
 Measured on a 3000-char CJK template model:
 
-    disk:   216 KB weights.bin + ~9 KB charset.txt (~225 KB total)
+    disk:   216 KB weights.bin + ~9 KB charset.txt + ~0.9 MB
+            geometry.json (Goal 8) (~1.1 MB total)
     memory: 216 KB template bits + 24 KB coarse features + 0 popcount table
              (numpy >= 2.0 vectorized bit_count; 64 KB fallback table on
              older numpy)
@@ -71,7 +72,15 @@ def main() -> None:
     print(f"model: {model_dir}  classifier={model.classifier}  classes={n}")
     print("\n== on-disk (runtime model dir) ==")
     disk_total = 0
-    for name in ("config.json", "model.json", "charset.txt", "weights.bin", "templates.bin", "test_vectors.npz"):
+    for name in (
+        "config.json",
+        "model.json",
+        "charset.txt",
+        "weights.bin",
+        "templates.bin",
+        "geometry.json",
+        "test_vectors.npz",
+    ):
         p = model_dir / name
         if p.exists():
             size = p.stat().st_size

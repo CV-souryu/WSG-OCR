@@ -1,4 +1,4 @@
-"""Goal 11: Lexicon Layer.
+"""Goal 11/12: Lexicon Layer with partial-word support.
 
 The runtime lexicon is a pure-Python layer over ``charsets/words/``. It
 loads the domain word lists (ships / equipment / ui), normalizes away the
@@ -14,6 +14,14 @@ whitespace the OCR pipeline cannot emit, and exposes three API modes:
 The layer never invents visible text: ``prefer`` changes a character only
 when the lexicon target is present in that candidate's Top-K visual
 alternatives and the original character was visually uncertain.
+
+Goal 12 partial-word matching is built into the same matcher. A screen
+crop of a dictionary term (``"C2C3C4C5"`` from ``"C1C2C3C4C5C6"``) is
+allowed as ``prefix_crop`` / ``suffix_crop`` / ``inner_crop``, while
+internally missing characters are ranked as ``gap_crop`` with a higher
+penalty. The visible text is never expanded into the full term; the
+inferred entity and its half-open span are returned in
+``matched_term`` / ``matched_span`` (and ``LexiconMatch``).
 """
 
 from __future__ import annotations

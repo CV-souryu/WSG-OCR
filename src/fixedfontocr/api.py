@@ -194,8 +194,12 @@ class FixedFontOCR:
         when no lexicon is supplied), ``"prefer"`` (default when a lexicon
         is supplied) or ``"strict"``. The visible ``text`` is never
         rewritten unless the lexicon target is already a visually plausible
-        Top-K alternative for a low-confidence character; ``strict`` rejects
-        non-dictionary text with an empty result.
+        Top-K alternative for a low-confidence character. Goal 12 partial
+        words follow the same rule: a screen crop keeps its visible
+        ``text`` and only annotates ``matched_term``/``matched_span`` (for
+        example ``text="尔的摩"``, ``matched_term="巴尔的摩"``,
+        ``matched_span=(1, 4)``). ``strict`` rejects non-exact text with an
+        empty result.
         """
 
         image = np.asarray(image)

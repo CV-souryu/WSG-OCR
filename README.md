@@ -486,11 +486,20 @@ spacing, and normalized size. Pass a custom profile to
 - Goal 11 lexicon layer is implemented: `charsets/words/` is loaded by
   domain (`ships`, `equipment`, `ui`, plus `all` or explicit paths), and
   `recognize(..., lexicon=..., lexicon_mode=...)` supports
-  `none`/`prefer`/`strict`. The matcher handles exact, full-term-in-text and
-  Goal 12 partial-word alignments; `prefer` only rewrites visually
+  `none`/`prefer`/`strict`. The matcher handles exact and full-term-in-text
+  alignments; `prefer` only rewrites visually
   uncertain characters when the dictionary target is already in the
   candidate's Top-K, and `strict` rejects non-dictionary text.
   `tests/test_goal11_lexicon.py` covers loading, matching and the modes.
+- Goal 12 partial-word support is implemented: a screen crop of a
+  dictionary term is matched as `prefix_crop` / `suffix_crop` / `inner_crop`
+  while internally missing characters are ranked as `gap_crop` with a
+  higher penalty. The result always keeps the visible `text` and only
+  annotates the inferred entity: `text="C2C3C4C5"`,
+  `matched_term="C1C2C3C4C5C6"`, `matched_span=(1, 5)`; the visible text is
+  never fabricated into the full term. `tests/test_goal12_partial_word.py`
+  covers matcher conventions, penalty ordering and end-to-end crops
+  (`巴尔的摩`, `塞瓦斯托波尔`).
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

@@ -30,7 +30,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from fixedfontocr import defaults  # noqa: E402
 from fixedfontocr.defaults import resolve_font  # noqa: E402
 from fixedfontocr.model import write_cnn_model  # noqa: E402
-from fixedfontocr.preprocess import normalize  # noqa: E402
+from fixedfontocr.preprocess import (  # noqa: E402
+    Component,
+    compute_normalize_spec,
+    glyph_normalize_geometry,
+    normalize,
+    normalize_grayscale,
+)
 from fixedfontocr.types import Profile  # noqa: E402
 
 
@@ -61,12 +67,14 @@ def make_dataset(
     size_max: int,
     threshold_min: int = 100,
     threshold_max: int = 180,
+    soft: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Render ``charset`` at random sizes/thresholds into 24x24 float tensors."""
 
     from PIL import Image, ImageDraw, ImageFont
 
     profile = Profile(name="train", use_grayscale=True, grayscale_threshold=140)
+    spec = compute_normalize_spec(font, charset, 24, None)
     x_list: list[np.ndarray] = []
     y_list: list[int] = []
     for label, char in enumerate(charset):
@@ -91,8 +99,30 @@ def make_dataset(
                 raise ValueError(
                     f"font {font} cannot render {char!r}: no ink rendered"
                 )
-            tight = mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
-            glyph = normalize(tight, 24).astype(np.float32) / 255.0
+            y0, y1 = ys.min(), ys.max() + 1
+            x0, x1 = xs.min(), xs.max() + 1
+            tight = mask[y0:y1, x0:x1]
+            tight_gray = gray[y0:y1, x0:x1].astype(np.uint8)
+            th, tw = tight.shape
+            candidate = Component(mask=tight, x=0, y=0, w=tw, h=th)
+            baseline_offset, scale = glyph_normalize_geometry(candidate, spec, 24)
+            glyph = (
+                normalize_grayscale(
+                    tight_gray,
+                    24,
+                    baseline_offset=baseline_offset,
+                    scale=scale,
+                    baseline_row=spec.baseline_row,
+                )
+                if soft
+                else normalize(
+                    tight,
+                    24,
+                    baseline_offset=baseline_offset,
+                    scale=scale,
+                    baseline_row=spec.baseline_row,
+                )
+            ).astype(np.float32) / 255.0
             # Random sub-pixel segmentation jitter: shift by -1..1 px.
             dx = int(rng.integers(-1, 2))
             dy = int(rng.integers(-1, 2))
@@ -176,6 +206,11 @@ def main() -> None:
     parser.add_argument("--render-size-max", type=int, default=36)
     parser.add_argument("--threshold-min", type=int, default=100)
     parser.add_argument("--threshold-max", type=int, default=180)
+    parser.add_argument(
+        "--soft",
+        action="store_true",
+        help="train on 0..255 soft foreground glyphs (Goal 2 Visual Frontend)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--val-split", type=float, default=0.1)
     args = parser.parse_args()
@@ -195,6 +230,7 @@ def main() -> None:
         args.render_size_max,
         args.threshold_min,
         args.threshold_max,
+        soft=args.soft,
     )
     n = x.shape[0]
     perm = rng.permutation(n)
@@ -235,7 +271,15 @@ def main() -> None:
         print(f"epoch {epoch + 1:>2}: loss {total / steps:.4f}  val_acc {acc:.3f}")
 
     out = Path(args.output)
-    write_cnn_model(out, charset, export_weights(model), font_path=font)
+    normalize_spec = compute_normalize_spec(font, charset, 24, 32).to_dict()
+    write_cnn_model(
+        out,
+        charset,
+        export_weights(model),
+        font_path=font,
+        input_mode="soft" if args.soft else "binary",
+        normalize_spec=normalize_spec,
+    )
     print(f"wrote TinyCNN model ({len(charset)} classes) to {out}")
 
 

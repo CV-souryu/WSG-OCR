@@ -21,9 +21,16 @@ import numpy as np
 from .classifier import TemplateClassifier
 from .cnn import prepare_weights
 from .model import OCRModel
+from .postprocess import second_ids as topk_second_ids
 from .postprocess import top2
-from .preprocess import Segment, normalize
-from .types import CandidateScore, ClassificationBatch
+from .preprocess import (
+    Component,
+    NormalizeSpec,
+    glyph_normalize_geometry,
+    normalize,
+    normalize_grayscale,
+)
+from .types import CandidateScore, ClassificationBatch, VisualScores
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,7 @@ class SegmentScore:
     visual_score: float
     raw_score: float
     score_type: str  # "template" | "cnn"
+    visual_scores: VisualScores | None = None
 
     @property
     def candidate_score(self) -> CandidateScore:
@@ -69,17 +77,77 @@ def to_confidence(raw: float, score_type: str) -> float:
     return 0.0
 
 
+def _template_visual_scores(tb, i: int) -> VisualScores:
+    second_id = int(tb.second_ids[i]) if tb.second_ids is not None else -1
+    return VisualScores(
+        char_ids=(int(tb.ids[i]), second_id),
+        logits=(float(tb.scores[i]), float(tb.second_scores[i])),
+        top_k=(int(tb.ids[i]), second_id),
+        margin=float(tb.margins[i]),
+        raw_score=float(tb.dists[i]),
+        score_type="template",
+    )
+
+
+def _cnn_visual_scores(batch: ClassificationBatch, i: int) -> VisualScores:
+    second_id = int(batch.second_ids[i]) if batch.second_ids is not None else -1
+    return VisualScores(
+        char_ids=(int(batch.ids[i]), second_id),
+        logits=(float(batch.top1[i]), float(batch.top2[i])),
+        top_k=(int(batch.ids[i]), second_id),
+        margin=float(batch.margins[i]),
+        raw_score=float(batch.margins[i]),
+        score_type="cnn",
+    )
+
+
+def _soft_glyph_batch(
+    segments: list[Segment],
+    soft: NDArray[np.uint8],
+    target: int,
+    geometries: list[tuple[float, float] | None] | None = None,
+    spec: NormalizeSpec | None = None,
+) -> np.ndarray:
+    """Crop + normalize soft ROIs for every candidate segment."""
+
+    if not segments:
+        return np.empty((0, target, target), dtype=np.uint8)
+    geoms = geometries or [None] * len(segments)
+    row = spec.baseline_row if spec is not None else 18.0
+    return np.stack(
+        [
+            (
+                normalize_grayscale(
+                    soft[int(s.y) : int(s.y + s.h), int(s.x) : int(s.x + s.w)],
+                    target,
+                )
+                if g is None
+                else normalize_grayscale(
+                    soft[int(s.y) : int(s.y + s.h), int(s.x) : int(s.x + s.w)],
+                    target,
+                    baseline_offset=g[0],
+                    scale=g[1],
+                    baseline_row=row,
+                )
+            )
+            for s, g in zip(segments, geoms)
+        ]
+    )
+
+
 class SegmentScorer:
     """Batch-scorer used by the segmentation DP for one model."""
 
     def __init__(self, model: OCRModel):
         self.model = model
         self.input_size = model.input_size
+        self.normalize_spec = model.normalize_spec
         self.template = (
             TemplateClassifier(
                 templates=model.templates,
                 charset=model.charset,
                 input_size=model.input_size,
+                normalize_spec=model.normalize_spec,
             )
             if model.templates is not None
             else None
@@ -90,6 +158,7 @@ class SegmentScorer:
             model.config.get("template_margin_threshold", 0.04)
         )
         self.cnn_threshold = float(model.config.get("cnn_threshold", 0.0))
+        self.cnn_input_mode = model.input_mode
         # CNN-only models cannot lean on template confidence; a merged
         # candidate must look like a real character before the DP may prefer
         # it over its components (see segmentation._drop_weak_merges).
@@ -101,12 +170,57 @@ class SegmentScorer:
         self,
         segments: list[Segment],
         allowed_ids: set[int] | None = None,
+        soft: NDArray[np.uint8] | None = None,
+        geometries: list[tuple[float, float] | None] | None = None,
     ) -> list[SegmentScore]:
-        """Score every candidate segment in one batched pass."""
+        """Score every candidate segment in one batched pass.
+
+        ``soft`` is the Visual Frontend's ``soft_foreground`` map. When the
+        model's ``input_mode`` is ``"soft"`` the TinyCNN consumes
+        soft-normalized glyphs (which preserve anti-aliasing/edge
+        intensity); the template path always consumes binary-normalized
+        glyphs. Binary-trained models (``input_mode="binary"``) ignore the
+        soft map, so old checkpoints keep their exact training-domain
+        inputs.
+        """
 
         if not segments:
             return []
-        glyphs = np.stack([normalize(s.mask, self.input_size) for s in segments])
+        spec = self.normalize_spec
+        if geometries is None and spec is not None:
+            geometries = [
+                glyph_normalize_geometry(
+                    Component(mask=s.mask, x=s.x, y=s.y, w=s.w, h=s.h),
+                    spec,
+                    self.input_size,
+                )
+                for s in segments
+            ]
+        geoms = geometries or [None] * len(segments)
+        if spec is None:
+            glyphs = np.stack([normalize(s.mask, self.input_size) for s in segments])
+        else:
+            glyphs = np.stack(
+                [
+                    (
+                        normalize(s.mask, self.input_size)
+                        if g is None
+                        else normalize(
+                            s.mask,
+                            self.input_size,
+                            baseline_offset=g[0],
+                            scale=g[1],
+                            baseline_row=spec.baseline_row,
+                        )
+                    )
+                    for s, g in zip(segments, geoms)
+                ]
+            )
+        soft_batch = (
+            _soft_glyph_batch(segments, soft, self.input_size, geoms, spec)
+            if soft is not None and self.cnn_input_mode == "soft"
+            else None
+        )
         n = len(segments)
 
         if self.template is not None:
@@ -118,6 +232,7 @@ class SegmentScorer:
                         visual_score=float(tb.scores[i]),
                         raw_score=float(tb.dists[i]),
                         score_type="template",
+                        visual_scores=_template_visual_scores(tb, i),
                     )
                     for i in range(n)
                 ]
@@ -131,7 +246,7 @@ class SegmentScorer:
                 & (tb.margins < self.template_margin_threshold)
             )
             if np.any(needs_cnn):
-                cnn = self._cnn_batch(glyphs, allowed_ids)
+                cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch)
             out: list[SegmentScore] = []
             for i in range(n):
                 if needs_cnn[i]:
@@ -141,6 +256,7 @@ class SegmentScorer:
                             visual_score=cnn_visual(float(cnn.margins[i])),
                             raw_score=float(cnn.margins[i]),
                             score_type="cnn",
+                            visual_scores=_cnn_visual_scores(cnn, i),
                         )
                     )
                 else:
@@ -150,18 +266,20 @@ class SegmentScorer:
                             visual_score=float(tb.scores[i]),
                             raw_score=float(tb.dists[i]),
                             score_type="template",
+                            visual_scores=_template_visual_scores(tb, i),
                         )
                     )
             return out
 
         if self.weights is not None:
-            cnn = self._cnn_batch(glyphs, allowed_ids)
+            cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch)
             return [
                 SegmentScore(
                     char_id=int(cnn.ids[i]),
                     visual_score=cnn_visual(float(cnn.margins[i])),
                     raw_score=float(cnn.margins[i]),
                     score_type="cnn",
+                    visual_scores=_cnn_visual_scores(cnn, i),
                 )
                 for i in range(n)
             ]
@@ -171,18 +289,21 @@ class SegmentScorer:
         self,
         glyphs: np.ndarray,
         allowed_ids: set[int] | None,
+        soft_batch: np.ndarray | None = None,
     ) -> ClassificationBatch:
         from .cnn import forward
 
         if allowed_ids is not None and not allowed_ids:
-            n = glyphs.shape[0]
+            n = soft_batch.shape[0] if soft_batch is not None else glyphs.shape[0]
             return ClassificationBatch(
                 ids=np.full(n, -1, dtype=np.int32),
                 top1=np.full(n, -np.inf, dtype=np.float32),
                 top2=np.full(n, -np.inf, dtype=np.float32),
                 margins=np.full(n, 0.0, dtype=np.float32),
+                second_ids=np.full(n, -1, dtype=np.int32),
             )
-        x = glyphs.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
+        cnn_input = soft_batch if soft_batch is not None else glyphs
+        x = cnn_input.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
         logits = forward(x, self.weights)
         if allowed_ids is not None:
             masked = np.full_like(logits, -np.inf)
@@ -190,4 +311,10 @@ class SegmentScorer:
             masked[:, idx] = logits[:, idx]
             logits = masked
         ids, top1, top2v, margins = top2(logits)
-        return ClassificationBatch(ids=ids, top1=top1, top2=top2v, margins=margins)
+        return ClassificationBatch(
+            ids=ids,
+            top1=top1,
+            top2=top2v,
+            margins=margins,
+            second_ids=topk_second_ids(logits, ids),
+        )

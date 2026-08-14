@@ -28,11 +28,14 @@ def test_cpu_benchmark_fast_mode(tmp_path):
     assert result.returncode == 0, result.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
     assert set(data["ocr_stages"]) == {
+        "frontend",
         "mask",
+        "soft_foreground",
         "line_detection",
         "connected_components",
         "candidate_generation",
         "normalize",
+        "normalize_soft",
         "classifier",
         "decoder",
         "recognize_total",

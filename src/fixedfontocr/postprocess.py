@@ -47,6 +47,26 @@ def top2(
     return top1.astype(np.int32), best.astype(np.float32), second.astype(np.float32), margins.astype(np.float32)
 
 
+def second_ids(
+    logits: NDArray[np.float32],
+    ids: NDArray[np.int32],
+) -> NDArray[np.int32]:
+    """Return the second-ranked character id per row (``-1`` if absent)."""
+    logits = np.asarray(logits, dtype=np.float32)
+    n, c = logits.shape
+    if n == 0 or c <= 1:
+        return np.full(n, -1, dtype=np.int32)
+    best = np.asarray(ids, dtype=np.int64)
+    # argpartition puts the two largest columns at positions 0 and 1; the
+    # second id is whichever of those is not the argmax.
+    idx = np.argpartition(-logits, 1, axis=-1)[:, :2]
+    second_idx = np.where(idx[:, 0] != best, idx[:, 0], idx[:, 1])
+    row = np.arange(n)
+    second_logits = logits[row, second_idx]
+    out = np.where(np.isneginf(second_logits), -1, second_idx)
+    return out.astype(np.int32)
+
+
 def allowed_ids(charset: list[str], allowed_chars: str | None) -> set[int] | None:
     """Map an ``allowed_chars`` string to charset indices (``None`` = all)."""
     if allowed_chars is None:

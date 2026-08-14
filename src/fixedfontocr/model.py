@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .defaults import compute_font_sha256
+from .preprocess import NormalizeSpec, compute_normalize_spec
 
 
 @dataclass
@@ -20,6 +21,8 @@ class OCRModel:
     classifier: str = "template"
     weights: dict[str, np.ndarray] | None = None
     font_sha256: str | None = None
+    input_mode: str = "binary"
+    normalize_spec: NormalizeSpec | None = None
 
 
 CNN_TENSORS: list[tuple[str, tuple[int, ...]]] = [
@@ -98,6 +101,9 @@ def load_model(model_path: Path) -> OCRModel:
     classifier = config.get("classifier", "template")
     if classifier not in ("template", "tinycnn", "hybrid"):
         raise ValueError(f"unsupported classifier {classifier!r}")
+    input_mode = config.get("input_mode", "binary")
+    if input_mode not in ("binary", "soft"):
+        raise ValueError(f"unsupported input_mode {input_mode!r}")
     if classifier in ("tinycnn", "hybrid"):
         weights = _load_cnn_weights(weights_path, num_classes)
     else:
@@ -119,6 +125,8 @@ def load_model(model_path: Path) -> OCRModel:
         classifier=classifier,
         weights=weights,
         font_sha256=config.get("font_sha256"),
+        input_mode=input_mode,
+        normalize_spec=NormalizeSpec.from_dict(config.get("normalize")),
     )
 
 
@@ -196,13 +204,20 @@ def write_cnn_model(
     input_size: int = 24,
     font_path: str | Path | None = None,
     font_sha256: str | None = None,
+    input_mode: str = "binary",
+    normalize_spec: dict | None = None,
+    render_size: int = 32,
 ) -> None:
     """Write ``config.json`` + ``charset.txt`` + CNN ``weights.bin``.
 
     When ``font_path`` is provided its SHA256 is stored in the model
-    metadata, unless an explicit ``font_sha256`` is given.
+    metadata, unless an explicit ``font_sha256`` is given. ``input_mode``
+    records which glyph representation the CNN was trained with
+    (``"binary"`` 0/255 masks or ``"soft"`` 0..255 foreground strength).
     """
 
+    if input_mode not in ("binary", "soft"):
+        raise ValueError(f"unsupported input_mode {input_mode!r}")
     model_dir.mkdir(parents=True, exist_ok=True)
     if font_path is not None and font_sha256 is None:
         font_sha256 = compute_font_sha256(font_path)
@@ -213,9 +228,16 @@ def write_cnn_model(
         "version": 1,
         "dtype": "f32",
         "classifier": "tinycnn",
+        "input_mode": input_mode,
     }
     if font_sha256:
         config["font_sha256"] = font_sha256
+    if normalize_spec is None and font_path is not None:
+        normalize_spec = compute_normalize_spec(
+            font_path, chars, input_size, render_size
+        ).to_dict()
+    if normalize_spec:
+        config["normalize"] = normalize_spec
     (model_dir / "config.json").write_text(
         json.dumps(config, indent=4) + "\n",
         encoding="utf-8",
@@ -238,6 +260,9 @@ def write_hybrid_model(
     cnn_threshold: float = 0.0,
     font_path: str | Path | None = None,
     font_sha256: str | None = None,
+    input_mode: str = "binary",
+    normalize_spec: dict | None = None,
+    render_size: int = 32,
 ) -> None:
     """Write a hybrid model: template level-1 + TinyCNN level-2.
 
@@ -248,6 +273,8 @@ def write_hybrid_model(
     template confidence is below ``template_threshold``.
     """
 
+    if input_mode not in ("binary", "soft"):
+        raise ValueError(f"unsupported input_mode {input_mode!r}")
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     if font_path is not None and font_sha256 is None:
@@ -262,9 +289,16 @@ def write_hybrid_model(
         "template_threshold": float(template_threshold),
         "template_margin_threshold": float(template_margin_threshold),
         "cnn_threshold": float(cnn_threshold),
+        "input_mode": input_mode,
     }
     if font_sha256:
         config["font_sha256"] = font_sha256
+    if normalize_spec is None and font_path is not None:
+        normalize_spec = compute_normalize_spec(
+            font_path, chars, input_size, render_size
+        ).to_dict()
+    if normalize_spec:
+        config["normalize"] = normalize_spec
     (model_dir / "config.json").write_text(
         json.dumps(config, indent=4) + "\n",
         encoding="utf-8",

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from .preprocess import normalize
+from .preprocess import Component, NormalizeSpec, glyph_normalize_geometry, normalize
 from .postprocess import pick
 from .types import Profile
 
@@ -19,7 +19,8 @@ class TemplateBatch:
 
     ``scores`` are ``1 - dist / area`` (0..1); ``margins`` are the
     normalized top-1/top-2 Hamming-distance gap in the same 0..1 scale.
-    ``dists`` keep the raw distances for reporting.
+    ``dists`` keep the raw distances for reporting and ``second_ids`` the
+    second-ranked character id (``-1`` when the charset has one class).
     """
 
     ids: np.ndarray  # int32 [N]
@@ -28,6 +29,7 @@ class TemplateBatch:
     margins: np.ndarray  # f32 [N]
     dists: np.ndarray  # int32 [N]
     second_dists: np.ndarray  # int32 [N]
+    second_ids: np.ndarray | None = None  # int32 [N]
 
 
 class Classifier(ABC):
@@ -61,6 +63,7 @@ class TemplateClassifier(Classifier):
         charset: list[str],
         input_size: int = 24,
         candidate_filter: bool = True,
+        normalize_spec: NormalizeSpec | None = None,
     ):
         if len(charset) != templates.shape[0]:
             raise ValueError("charset and templates must have the same length")
@@ -70,6 +73,7 @@ class TemplateClassifier(Classifier):
         self.charset = list(charset)
         self.input_size = input_size
         self.candidate_filter = bool(candidate_filter)
+        self.normalize_spec = normalize_spec
         self.last_candidates: int | None = None
         self._template_bits = np.ascontiguousarray(
             templates.reshape(len(charset), -1)
@@ -103,7 +107,21 @@ class TemplateClassifier(Classifier):
         """Best template (optionally restricted to ``allowed_ids``)."""
         if allowed_ids is not None and not allowed_ids:
             return "?", 0.0
-        glyph = normalize(mask, self.input_size)
+        if self.normalize_spec is not None:
+            h, w = mask.shape
+            candidate = Component(mask=mask, x=0, y=0, w=w, h=h)
+            baseline_offset, scale = glyph_normalize_geometry(
+                candidate, self.normalize_spec, self.input_size
+            )
+            glyph = normalize(
+                mask,
+                self.input_size,
+                baseline_offset=baseline_offset,
+                scale=scale,
+                baseline_row=self.normalize_spec.baseline_row,
+            )
+        else:
+            glyph = normalize(mask, self.input_size)
         bits = np.packbits(glyph.reshape(-1), bitorder="little").view(np.uint64)
         candidates = self._allowed_candidates(allowed_ids)
         if self.candidate_filter and candidates.size:
@@ -278,6 +296,7 @@ class TemplateClassifier(Classifier):
                 margins=np.empty(0, dtype=np.float32),
                 dists=np.empty(0, dtype=np.int32),
                 second_dists=np.empty(0, dtype=np.int32),
+                second_ids=np.empty(0, dtype=np.int32),
             )
         if allowed_ids is not None and not allowed_ids:
             return TemplateBatch(
@@ -289,6 +308,7 @@ class TemplateClassifier(Classifier):
                 second_dists=np.full(
                     n, self.input_size * self.input_size, dtype=np.int32
                 ),
+                second_ids=np.full(n, -1, dtype=np.int32),
             )
         if glyphs.shape[1:] != (self.input_size, self.input_size):
             raise ValueError(
@@ -306,6 +326,7 @@ class TemplateClassifier(Classifier):
         if dists.shape[1] == 1:
             best = np.zeros(n, dtype=np.int64)
             second = np.full(n, self.input_size * self.input_size, dtype=np.int64)
+            second_ids_raw = np.full(n, -1, dtype=np.int64)
         else:
             idx = np.argpartition(dists, 1, axis=-1)[:, :2]
             v = dists[np.arange(n)[:, None], idx]
@@ -314,9 +335,11 @@ class TemplateClassifier(Classifier):
             second = np.maximum(a, b)
             # Recover the ids that produced the two distances.
             best_ids = np.where(a <= b, idx[:, 0], idx[:, 1])
+            second_ids_raw = np.where(a <= b, idx[:, 1], idx[:, 0])
         if dists.shape[1] == 1:
             best_ids = np.zeros(n, dtype=np.int64)
         ids = candidates[best_ids].astype(np.int32)
+        second_ids = candidates[second_ids_raw].astype(np.int32)
         area = self.input_size * self.input_size
         scores = (1.0 - best.astype(np.float32) / area).astype(np.float32)
         second_scores = (1.0 - second.astype(np.float32) / area).astype(np.float32)
@@ -328,4 +351,5 @@ class TemplateClassifier(Classifier):
             margins=margins,
             dists=best.astype(np.int32),
             second_dists=second.astype(np.int32),
+            second_ids=second_ids,
         )

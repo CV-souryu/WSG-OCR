@@ -1,8 +1,16 @@
-"""Shared data types for the OCR pipeline."""
+"""Shared data types for the OCR pipeline.
+
+Goal 1 defines the lattice/decoder vocabulary: connected components,
+visual candidates, the lattice that holds them, per-candidate Top-K
+visual scores, decoded paths and lexicon matches. ``CharResult`` remains
+only as a public compatibility projection; the internal pipeline works
+with the new structures below.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -43,13 +51,190 @@ class CharResult:
     confidence: float
 
 
+@dataclass
+class Component:
+    """One connected component in a text line.
+
+    ``x/y/w/h`` describe the component's tight bounding box in image
+    coordinates; ``mask`` is the component bitmap (same shape as the bbox).
+    Components are the atomic units of the visual lattice: a candidate can
+    cover one component, a consecutive run of components, or a split of a
+    single wide component.
+    """
+
+    mask: NDArray[np.bool_]
+    x: int
+    y: int
+    w: int
+    h: int
+
+    @property
+    def bbox(self) -> tuple[int, int, int, int]:
+        return (self.x, self.y, self.w, self.h)
+
+    @property
+    def ink(self) -> int:
+        return int(self.mask.sum())
+
+
+@dataclass(frozen=True)
+class VisualScores:
+    """Top-K classifier scores for one visual candidate.
+
+    Top-1 alone is never enough for lattice decoding: the decoder needs the
+    competing glyphs and their raw scores so it can let the lexicon or a
+    segmentation hypothesis override a marginally-better classifier pick.
+    ``char_ids``/``logits`` are the ranked Top-K lists and ``top_k`` mirrors
+    ``char_ids`` for callers that prefer that name.
+    """
+
+    char_ids: tuple[int, ...] = ()
+    logits: tuple[float, ...] = ()
+    top_k: tuple[int, ...] = ()
+    margin: float = 0.0
+    raw_score: float = 0.0
+    score_type: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.top_k:
+            object.__setattr__(self, "top_k", self.char_ids)
+
+
+@dataclass
+class VisualCandidate:
+    """One hypothesis that a consecutive component range is one glyph.
+
+    A candidate may be a single component (``C0``), a merged run
+    (``C0+C1+C2``), or a split of a wide component (``C0 -> A+B``, where the
+    split parts are represented as separate candidates). ``bbox`` is the
+    image-space ``(x, y, w, h)`` box; ``glyph`` is the normalized bitmap
+    consumed by the template/CNN scorer when available. ``atoms`` records the
+    candidate's half-open atom range (atoms are whole components or split
+    pieces), which is what the DP covers; ``start``/``end`` keep the original
+    component range for compatibility.
+
+    ``score`` is kept as a compatibility view of the unified scorer output;
+    the canonical Top-K data lives in ``scores``.
+    """
+
+    start: int
+    end: int
+    bbox: tuple[int, int, int, int] | None = None
+    glyph: NDArray[np.uint8] | None = None
+    components: tuple[int, ...] = ()
+    atoms: tuple[int, int] | None = None
+    segment: Component | None = None
+    normalize_geometry: tuple[float, float] | None = None
+    geometry_score: float = 0.0
+    scores: VisualScores | None = None
+    score: Any | None = None
+
+    def __post_init__(self) -> None:
+        if self.bbox is None and self.segment is not None:
+            self.bbox = (self.segment.x, self.segment.y, self.segment.w, self.segment.h)
+
+    @property
+    def geometry(self) -> float:
+        """Compatibility alias for :attr:`geometry_score`."""
+        return self.geometry_score
+
+    @geometry.setter
+    def geometry(self, value: float) -> None:
+        self.geometry_score = float(value)
+
+    @property
+    def total_score(self) -> float:
+        """Unified candidate score used by the visual DP."""
+        if self.score is not None:
+            visual = float(getattr(self.score, "visual_score", self.score))
+            return visual + self.geometry_score
+        if self.scores is not None:
+            return self.scores.margin + self.geometry_score
+        return self.geometry_score
+
+    @property
+    def atom_span(self) -> tuple[int, int]:
+        """Half-open atom range used by the decoder.
+
+        An atom is either one whole connected component or one piece of a
+        split component. Candidates created without explicit split metadata
+        (legacy/manual constructions) fall back to their component range.
+        """
+
+        if self.atoms is not None:
+            return self.atoms
+        return (self.start, self.end)
+
+
+@dataclass
+class VisualLattice:
+    """The full candidate lattice of one line.
+
+    Keeps every original connected component and every generated visual
+    candidate, so the decoder can still choose a different merge/split path
+    after scoring. Nothing here is an irreversible decision.
+    """
+
+    components: tuple[Component, ...] = ()
+    candidates: tuple[VisualCandidate, ...] = ()
+    width: int = 0
+    height: int = 0
+
+    def by_end(self) -> dict[int, list[VisualCandidate]]:
+        """Index candidates by their exclusive end atom index."""
+        out: dict[int, list[VisualCandidate]] = {}
+        for cand in self.candidates:
+            out.setdefault(cand.atom_span[1], []).append(cand)
+        return out
+
+
+@dataclass(frozen=True)
+class DecodePath:
+    """Best (or alternative) decoder path through a visual lattice."""
+
+    candidates: tuple[VisualCandidate, ...] = field(default_factory=tuple)
+    mean_score: float = 0.0
+    text: str = ""
+    confidence: float = 0.0
+    alternatives: tuple[str, ...] = field(default_factory=tuple)
+    lattice: VisualLattice | None = None
+
+
+@dataclass(frozen=True)
+class LexiconMatch:
+    """A dictionary match over a span of visible text.
+
+    ``term`` is the full entity inferred from the lexicon; ``span`` is the
+    half-open character range it covers in :attr:`OCRResult.text`. The
+    visible text itself is never rewritten by the lexicon layer.
+    """
+
+    term: str
+    span: tuple[int, int]
+    confidence: float = 0.0
+    score: float = 0.0
+    mode: str = "none"
+
+
 @dataclass(frozen=True)
 class OCRResult:
-    """Full recognition result for one image."""
+    """Full recognition result for one image.
+
+    ``text`` is exactly what is visible on screen. ``matched_term`` (and
+    ``lexicon_match``) are dictionary-inferred entities and must never be
+    conflated with the visible text. ``alternatives`` holds alternate
+    decoder outputs, and ``path`` retains the chosen lattice path for
+    debugging/inspection.
+    """
 
     text: str
     confidence: float
     chars: tuple[CharResult, ...] = field(default_factory=tuple)
+    matched_term: str | None = None
+    matched_span: tuple[int, int] | None = None
+    alternatives: tuple[str, ...] = field(default_factory=tuple)
+    lexicon_match: LexiconMatch | None = None
+    path: DecodePath | None = None
 
 
 @dataclass(frozen=True)
@@ -58,14 +243,17 @@ class ClassificationBatch:
 
     ``ids`` is the top-1 character id, ``top1``/``top2`` are the raw
     classifier scores of the first two candidates and ``margins`` is
-    ``top1 - top2``. The API supports ``top_k`` > 2 for future dictionary
-    decoding without changing the CNN itself.
+    ``top1 - top2``. ``second_ids`` carries the second-ranked id so callers
+    can build a real Top-K :class:`VisualScores` (never only Top-1).
+    The API supports ``top_k`` > 2 for future dictionary decoding without
+    changing the CNN itself.
     """
 
     ids: np.ndarray  # int32 [N]
     top1: np.ndarray  # f32 [N]
     top2: np.ndarray  # f32 [N]
     margins: np.ndarray  # f32 [N]
+    second_ids: np.ndarray | None = None  # int32 [N]
 
 
 @dataclass(frozen=True)
@@ -129,6 +317,40 @@ class Profile:
 
         diff = np.abs(image.astype(np.int16) - np.asarray(self.target_color, dtype=np.int16))
         return np.all(diff <= self.tolerance, axis=-1)
+
+    def soft_foreground(self, image: NDArray[np.uint8]) -> NDArray[np.uint8]:
+        """Return a 0..255 foreground-strength map without a hard cutoff.
+
+        ``color_mask`` keeps its hard decision for segmentation and the
+        template path; this map is the *soft* twin that preserves
+        anti-aliasing, alpha, edge gray and low-resolution information for
+        the TinyCNN. Values are 0 (definitely background) .. 255
+        (definitely text-colored), with anti-aliased edge pixels retaining
+        their intermediate intensity instead of being snapped to a
+        threshold.
+        """
+
+        if self.use_hsl:
+            lightness, saturation = _hsl_lightness_saturation(image)
+            sat_atten = 1.0 - np.clip(
+                saturation / max(self.hsl_saturation_max, 1e-6), 0.0, 1.0
+            )
+            if self.bright_text:
+                soft = lightness * sat_atten
+            else:
+                soft = (1.0 - lightness) * sat_atten
+            return (np.clip(soft, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        if self.use_grayscale or self.target_color is None:
+            gray = image @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+            if self.bright_text:
+                return np.clip(gray, 0, 255).astype(np.uint8)
+            return np.clip(255.0 - gray, 0, 255).astype(np.uint8)
+
+        diff = np.abs(
+            image.astype(np.int16) - np.asarray(self.target_color, dtype=np.int16)
+        ).max(axis=-1)
+        return np.clip(255 - diff, 0, 255).astype(np.uint8)
 
 
 def default_profile() -> Profile:

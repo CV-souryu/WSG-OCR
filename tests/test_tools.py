@@ -38,6 +38,25 @@ def test_generate_font_dataset(tmp_path, font_path):
     assert list(data["chars"]) == list(charset)
     assert data["x"].shape[0] == data["y"].shape[0]
     assert len(str(data["font_sha256"][0])) == 64
+    assert str(data["input_mode"][0]) == "binary"
+
+
+def test_generate_font_dataset_soft(tmp_path, font_path):
+    out = tmp_path / "synth_soft.npz"
+    charset = "01A"
+    generate_dataset(
+        font_path,
+        list(charset),
+        samples_per_char=3,
+        output=out,
+        seed=1,
+        soft=True,
+    )
+    data = np.load(out)
+    assert data["x"].dtype == np.uint8
+    # Soft glyphs keep intermediate foreground intensities (anti-aliasing).
+    assert np.any((data["x"] > 0) & (data["x"] < 255))
+    assert str(data["input_mode"][0]) == "soft"
 
 
 def test_collect_real_samples(tmp_path, font_path):
@@ -70,10 +89,13 @@ def test_train_checkpoint_load(tmp_path):
         },
         tmp_path / "model.pth",
     )
-    loaded, charset, font_sha256 = load_checkpoint(tmp_path / "model.pth")
+    loaded, charset, font_sha256, input_mode = load_checkpoint(
+        tmp_path / "model.pth"
+    )
     assert charset == list("01234")
     assert isinstance(loaded, tinycnn_arch.TinyCNNBN)
     assert font_sha256 is None
+    assert input_mode == "binary"  # legacy checkpoints default to binary
 
 
 def test_train_build_dataset_merges_charsets(tmp_path, font_path):
@@ -84,11 +106,12 @@ def test_train_build_dataset_merges_charsets(tmp_path, font_path):
     real = tmp_path / "real.npz"
     generate_dataset(font_path, ["0", "1"], 2, synth, seed=1)
     generate_dataset(font_path, ["1", "A"], 2, real, seed=2)
-    x, y, charset, font_sha256 = build_dataset(synth, real)
+    x, y, charset, font_sha256, input_mode = build_dataset(synth, real)
     assert charset == ["0", "1", "A"]
     assert x.shape[0] == y.shape[0]
     assert set(np.unique(y)) <= {0, 1, 2}
     assert font_sha256
+    assert input_mode == "binary"
 
 
 def test_export_folds_batchnorm(tmp_path):
@@ -163,7 +186,7 @@ def test_export_hybrid_runtime_model(tmp_path, font_path):
         },
         tmp_path / "model.pth",
     )
-    _, ck_charset, _ = load_checkpoint(tmp_path / "model.pth")
+    _, ck_charset, _, _ = load_checkpoint(tmp_path / "model.pth")
     assert ck_charset == charset
     from fixedfontocr import write_hybrid_model
 

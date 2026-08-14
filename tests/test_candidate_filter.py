@@ -4,6 +4,7 @@ import numpy as np
 
 from fixedfontocr.classifier import TemplateClassifier
 from fixedfontocr.fontgen import build_templates, render_glyph
+from fixedfontocr.preprocess import compute_normalize_spec
 from fixedfontocr.types import default_profile
 
 
@@ -15,8 +16,9 @@ def test_candidate_filter_preserves_results(font_path):
         "+-×÷%.,:;!?()[]"
     )
     chars, templates = build_templates(font_path, list(charset), render_size=28)
-    full = TemplateClassifier(templates, chars, candidate_filter=False)
-    filtered = TemplateClassifier(templates, chars, candidate_filter=True)
+    spec = compute_normalize_spec(font_path, list(charset), 24, 28)
+    full = TemplateClassifier(templates, chars, candidate_filter=False, normalize_spec=spec)
+    filtered = TemplateClassifier(templates, chars, candidate_filter=True, normalize_spec=spec)
     profile = default_profile()
     total = 0
     reduced = 0
@@ -34,7 +36,8 @@ def test_candidate_filter_preserves_results(font_path):
 def test_candidate_filter_keeps_ambiguous_chars_together(font_path):
     charset = "O0Il"
     chars, templates = build_templates(font_path, list(charset), render_size=28)
-    filtered = TemplateClassifier(templates, chars, candidate_filter=True)
+    spec = compute_normalize_spec(font_path, list(charset), 24, 28)
+    filtered = TemplateClassifier(templates, chars, candidate_filter=True, normalize_spec=spec)
     profile = default_profile()
     for ch in chars:
         mask = render_glyph(font_path, ch, render_size=28)
@@ -47,8 +50,9 @@ def test_candidate_filter_signed_comparison_safe(font_path):
     from PIL import Image, ImageDraw, ImageFont
 
     chars, templates = build_templates(font_path, list("0123456789"), render_size=28)
-    full = TemplateClassifier(templates, chars, candidate_filter=False)
-    filtered = TemplateClassifier(templates, chars, candidate_filter=True)
+    spec = compute_normalize_spec(font_path, list("0123456789"), 24, 28)
+    full = TemplateClassifier(templates, chars, candidate_filter=False, normalize_spec=spec)
+    filtered = TemplateClassifier(templates, chars, candidate_filter=True, normalize_spec=spec)
     profile = default_profile()
     font = ImageFont.truetype(str(font_path), 28)
     canvas = Image.new("RGB", (120, 80), (0, 0, 0))

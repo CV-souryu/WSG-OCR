@@ -42,7 +42,11 @@ from fixedfontocr.classifier import TemplateClassifier  # noqa: E402
 from fixedfontocr.cnn import TinyCNNClassifier, forward  # noqa: E402
 from fixedfontocr.fontgen import build_templates, write_model  # noqa: E402
 from fixedfontocr.model import load_model  # noqa: E402
-from fixedfontocr.preprocess import normalize, preprocess  # noqa: E402
+from fixedfontocr.preprocess import (  # noqa: E402
+    compute_normalize_spec,
+    normalize,
+    preprocess,
+)
 from fixedfontocr.types import default_profile  # noqa: E402
 
 BUNDLED_FONT = defaults.resolve_font(defaults.FONT_PATH)
@@ -220,7 +224,8 @@ def bench_classifiers(repeat: int, iters: int) -> None:
         ("template cjk", BUNDLED_FONT, CJK_CHARSET),
     ):
         chars, templates = build_templates(font, list(charset), render_size=32)
-        clf = TemplateClassifier(templates, chars)
+        spec = compute_normalize_spec(font, list(charset), 24, 32)
+        clf = TemplateClassifier(templates, chars, normalize_spec=spec)
         masks = [glyph_mask(font, c) for c in chars]
         t = median_time(cycle(clf, masks), repeat, iters)
         print(f"  {name:24s} {fmt_us(t):>12s} {fmt_rate(1 / t):>12s}")

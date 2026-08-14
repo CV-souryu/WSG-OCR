@@ -17,13 +17,22 @@ from .backends import (
 )
 from .classifier import Classifier, TemplateClassifier
 from .cnn import forward
+from .frontend import extract_frontend
 from .model import load_model
 from .postprocess import allowed_ids as build_allowed_ids
 from .postprocess import pick
 from .preprocess import find_lines, normalize
 from .scorer import SegmentScorer, to_confidence
 from .segmentation import segment_line
-from .types import CharResult, OCRResult, Profile, default_profile
+from .types import (
+    CharResult,
+    Component,
+    DecodePath,
+    OCRResult,
+    Profile,
+    VisualCandidate,
+    default_profile,
+)
 
 UNKNOWN_CHAR = "?"
 
@@ -67,6 +76,7 @@ class FixedFontOCR:
         self.model = load_model(Path(self.model_path))
         self.profile = self.profile or default_profile()
         self._scorer = SegmentScorer(self.model)
+        self._normalize_spec = self.model.normalize_spec
         self._benchmark: dict[int, dict[str, float]] | None = None
         self._benchmark_error: str | None = None
         self._backend: Backend | None = None
@@ -82,12 +92,14 @@ class FixedFontOCR:
                 templates=self.model.templates,
                 charset=self.model.charset,
                 input_size=self.model.input_size,
+                normalize_spec=self.model.normalize_spec,
             )
         if self.model.classifier == "hybrid":
             self._template_classifier = TemplateClassifier(
                 templates=self.model.templates,
                 charset=self.model.charset,
                 input_size=self.model.input_size,
+                normalize_spec=self.model.normalize_spec,
             )
             self._template_threshold = float(
                 self.model.config.get("template_threshold", 0.90)
@@ -172,68 +184,147 @@ class FixedFontOCR:
             raise ValueError(f"expected uint8 image, got {image.dtype}")
 
         allowed = build_allowed_ids(self.model.charset, allowed_chars)
-        mask = self.profile.color_mask(image)
-        chars: list[CharResult] = []
+        frontend = extract_frontend(image, self.profile)
+        mask = frontend.binary_mask
+        paths: list[DecodePath] = []
+        decoded: list[tuple[VisualCandidate, str, float]] = []
         for line in find_lines(mask, self.profile):
-            path = segment_line(line, self.profile, self._scorer, allowed)
+            path = segment_line(
+                line,
+                self.profile,
+                self._scorer,
+                allowed,
+                soft=frontend.soft_foreground,
+            )
             if not path.candidates:
                 continue
             segments = [c.segment for c in path.candidates]
+            geometries = [c.normalize_geometry for c in path.candidates]
             if self.model.classifier == "template":
-                for seg in segments:
-                    char, conf = self._classifier(seg.mask, self.profile, allowed)
-                    chars.append(
-                        CharResult(
-                            char=char,
-                            x=seg.x,
-                            y=seg.y,
-                            w=seg.w,
-                            h=seg.h,
-                            confidence=conf,
+                glyphs = self._binary_glyph_batch(segments, geometries)
+                tb = self._classifier.match_batch(glyphs, allowed)
+                for i, cand in enumerate(path.candidates):
+                    cid = int(tb.ids[i])
+                    if cid < 0:
+                        decoded.append((cand, UNKNOWN_CHAR, 0.0))
+                    else:
+                        decoded.append(
+                            (
+                                cand,
+                                self.model.charset[cid],
+                                to_confidence(float(tb.scores[i]), "template"),
+                            )
                         )
-                    )
             else:
-                glyphs = np.stack(
-                    [normalize(s.mask, self.model.input_size) for s in segments]
-                )
+                if self.model.input_mode == "soft":
+                    glyphs = frontend.soft_glyph_batch(
+                        segments,
+                        self.model.input_size,
+                        geometries=geometries,
+                        spec=self._normalize_spec,
+                    )
+                    cnn_soft = frontend.soft_foreground
+                else:
+                    glyphs = self._binary_glyph_batch(segments, geometries)
+                    cnn_soft = None
                 if self.model.classifier == "hybrid":
-                    chars.extend(self._recognize_hybrid(segments, glyphs, allowed))
+                    pairs = self._classify_hybrid(
+                        path.candidates,
+                        glyphs,
+                        allowed,
+                        soft=cnn_soft,
+                        geometries=geometries,
+                    )
                 else:
                     result = self._backend.classify(glyphs)
-                    chars.extend(
-                        self._chars_from_backend(segments, glyphs, result, allowed)
+                    pairs = self._classify_backend(
+                        path.candidates, glyphs, result, allowed
                     )
+                decoded.extend(
+                    (cand, char, conf)
+                    for cand, (char, conf) in zip(path.candidates, pairs)
+                )
+            paths.append(path)
 
-        if not chars:
-            return OCRResult(text="", confidence=0.0, chars=())
-        text = "".join(c.char for c in chars)
-        confidence = float(np.mean([c.confidence for c in chars]))
-        return OCRResult(text=text, confidence=confidence, chars=tuple(chars))
+        if not decoded:
+            return OCRResult(text="", confidence=0.0, chars=(), alternatives=())
 
-    def _chars_from_backend(
+        text = "".join(char for _, char, _ in decoded)
+        confidence = float(
+            np.mean([conf for _, _, conf in decoded])
+        ) if decoded else 0.0
+        chars = tuple(
+            CharResult(
+                char=char,
+                x=cand.segment.x,
+                y=cand.segment.y,
+                w=cand.segment.w,
+                h=cand.segment.h,
+                confidence=conf,
+            )
+            for cand, char, conf in decoded
+        )
+        return OCRResult(
+            text=text,
+            confidence=confidence,
+            chars=chars,
+            matched_term=None,
+            matched_span=None,
+            alternatives=self._alternatives(paths),
+            lexicon_match=None,
+            path=paths[0] if len(paths) == 1 else None,
+        )
+
+    def _binary_glyph_batch(
         self,
-        segments,
+        segments: list[Component],
+        geometries: list[tuple[float, float] | None] | None = None,
+    ) -> NDArray[np.uint8]:
+        """Normalize binary candidate masks (Goal 3 baseline frame)."""
+
+        geoms = geometries or [None] * len(segments)
+        spec = self._normalize_spec
+        if spec is None:
+            return np.stack(
+                [normalize(s.mask, self.model.input_size) for s in segments]
+            )
+        return np.stack(
+            [
+                (
+                    normalize(s.mask, self.model.input_size)
+                    if g is None
+                    else normalize(
+                        s.mask,
+                        self.model.input_size,
+                        baseline_offset=g[0],
+                        scale=g[1],
+                        baseline_row=spec.baseline_row,
+                    )
+                )
+                for s, g in zip(segments, geoms)
+            ]
+        )
+
+    def _classify_backend(
+        self,
+        candidates: list[VisualCandidate],
         glyphs: NDArray[np.uint8],
         result,
         allowed: set[int] | None,
-    ) -> list[CharResult]:
-        """Map a backend result to CharResults, masking disallowed picks."""
-        n = len(segments)
+    ) -> list[tuple[str, float]]:
+        """Map a backend result to (char, confidence), masking disallowed picks."""
+        n = len(candidates)
         if n == 0:
             return []
-        chars: list[CharResult | None] = [None] * n
+        pairs: list[tuple[str, float] | None] = [None] * n
         remask: list[int] = []
-        for i, (seg, char_id, score) in enumerate(
-            zip(segments, result.char_ids, result.scores)
+        for i, (_, char_id, score) in enumerate(
+            zip(candidates, result.char_ids, result.scores)
         ):
             if allowed is None or int(char_id) in allowed:
-                chars[i] = CharResult(
-                    char=self.model.charset[int(char_id)],
-                    x=seg.x,
-                    y=seg.y,
-                    w=seg.w,
-                    h=seg.h,
-                    confidence=to_confidence(float(score), "cnn"),
+                pairs[i] = (
+                    self.model.charset[int(char_id)],
+                    to_confidence(float(score), "cnn"),
                 )
             else:
                 remask.append(i)
@@ -243,36 +334,28 @@ class FixedFontOCR:
             logits = forward(x, self.model.weights)
             for k, i in enumerate(remask):
                 char, conf = pick(logits[k], self.model.charset, allowed)
-                seg = segments[i]
-                chars[i] = CharResult(
-                    char=char,
-                    x=seg.x,
-                    y=seg.y,
-                    w=seg.w,
-                    h=seg.h,
-                    confidence=to_confidence(conf, "cnn"),
-                )
-        return [c for c in chars if c is not None]
+                pairs[i] = (char, to_confidence(conf, "cnn"))
+        return [p for p in pairs if p is not None]
 
-    def _recognize_hybrid(
+    def _classify_hybrid(
         self,
-        segments,
+        candidates: list[VisualCandidate],
         glyphs: NDArray[np.uint8],
         allowed: set[int] | None,
-    ) -> list[CharResult]:
-        """Three-level strategy: template (margin-gated) -> CNN -> unknown.
-
-        Uses the same :class:`SegmentScorer` as the segmentation DP, so the
-        final hybrid classification and the lattice share one margin-aware
-        gate: a template match is trusted only when both its confidence and
-        its top-1/top-2 margin are high.
-        """
-
-        if not segments:
+        soft: NDArray[np.uint8] | None = None,
+        geometries: list[tuple[float, float] | None] | None = None,
+    ) -> list[tuple[str, float]]:
+        """Three-level strategy: template (margin-gated) -> CNN -> unknown."""
+        if not candidates:
             return []
-        scores = self._scorer.score(segments, allowed)
-        chars: list[CharResult] = []
-        for seg, score in zip(segments, scores):
+        scores = self._scorer.score(
+            [c.segment for c in candidates],
+            allowed,
+            soft=soft,
+            geometries=geometries,
+        )
+        pairs: list[tuple[str, float]] = []
+        for score in scores:
             if score.char_id < 0:
                 char = UNKNOWN_CHAR
                 conf = 0.0
@@ -282,14 +365,37 @@ class FixedFontOCR:
             else:
                 char = self.model.charset[int(score.char_id)]
                 conf = score.visual_score
-            chars.append(
-                CharResult(
-                    char=char,
-                    x=seg.x,
-                    y=seg.y,
-                    w=seg.w,
-                    h=seg.h,
-                    confidence=conf,
-                )
-            )
-        return chars
+            pairs.append((char, conf))
+        return pairs
+
+    def _candidate_char(self, candidate: VisualCandidate) -> str:
+        """Visible character for one chosen lattice candidate."""
+        score = candidate.score
+        if score is None or score.char_id < 0:
+            return UNKNOWN_CHAR
+        if (
+            score.score_type == "cnn"
+            and score.raw_score < getattr(self, "_cnn_threshold", 0.0)
+        ):
+            return UNKNOWN_CHAR
+        return self.model.charset[int(score.char_id)]
+
+    def _alternatives(self, paths: list[DecodePath]) -> tuple[str, ...]:
+        """Single-substitution alternatives from each candidate's Top-K."""
+        out: list[str] = []
+        for path in paths:
+            chars = [self._candidate_char(c) for c in path.candidates]
+            base = "".join(chars)
+            for i, cand in enumerate(path.candidates):
+                scores = cand.scores
+                if scores is None or len(scores.char_ids) < 2:
+                    continue
+                second_id = int(scores.char_ids[1])
+                if second_id < 0 or second_id >= len(self.model.charset):
+                    continue
+                alt = list(chars)
+                alt[i] = self.model.charset[second_id]
+                text = "".join(alt)
+                if text != base and text not in out:
+                    out.append(text)
+        return tuple(out[:8])

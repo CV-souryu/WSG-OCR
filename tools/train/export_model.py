@@ -48,7 +48,7 @@ from fixedfontocr.model import (  # noqa: E402
 
 def load_checkpoint(
     path: str | Path,
-) -> tuple[tinycnn_arch.TinyCNNBN, list[str], str | None]:
+) -> tuple[tinycnn_arch.TinyCNNBN, list[str], str | None, str]:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt.get("architecture") != "tinycnn_bn":
         raise SystemExit(f"unsupported checkpoint architecture: {ckpt.get('architecture')}")
@@ -56,7 +56,7 @@ def load_checkpoint(
     model = tinycnn_arch.TinyCNNBN(len(charset))
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
-    return model, charset, ckpt.get("font_sha256")
+    return model, charset, ckpt.get("font_sha256"), ckpt.get("input_mode", "binary")
 
 
 def make_test_vectors(
@@ -121,7 +121,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    model, charset, ckpt_sha = load_checkpoint(args.checkpoint)
+    model, charset, ckpt_sha, input_mode = load_checkpoint(args.checkpoint)
     font_sha256 = ckpt_sha
     weights = {
         name: arr.detach().numpy()
@@ -142,6 +142,9 @@ def main() -> None:
             "checkpoint/template has no font_sha256; retrain with the "
             "current pipeline before exporting"
         )
+    normalize_spec = None
+    if args.templates:
+        normalize_spec = tmpl.config.get("normalize")
     if args.templates:
         write_hybrid_model(
             out,
@@ -153,9 +156,18 @@ def main() -> None:
             template_margin_threshold=args.template_margin_threshold,
             cnn_threshold=args.cnn_threshold,
             font_sha256=font_sha256,
+            input_mode=input_mode,
+            normalize_spec=normalize_spec,
         )
     else:
-        write_cnn_model(out, charset, weights, input_size=24, font_sha256=font_sha256)
+        write_cnn_model(
+            out,
+            charset,
+            weights,
+            input_size=24,
+            font_sha256=font_sha256,
+            input_mode=input_mode,
+        )
 
     # The plan's runtime layout names it model.json; keep config.json too
     # for the existing loader.

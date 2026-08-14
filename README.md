@@ -14,14 +14,19 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 │   ├── backends.py      # CPUBackend / WGPUBackend / AutoBackend + benchmark
 │   ├── classifier.py    # template matcher (with coarse candidate filtering)
 │   ├── cnn.py           # numpy TinyCNN reference (Conv + ReLU only)
+│   ├── frontend.py      # Goal 2 Visual Frontend: binary mask + soft
+│   │                    #   foreground from one RGB pass
 │   ├── segmentation.py  # candidate lattice + visual DP decoder (P0)
 │   ├── scorer.py        # unified template/CNN scoring (P4/P6)
 │   ├── defaults.py      # bundled game font / charset / model paths
 │   ├── postprocess.py   # allowed-chars restriction / confidence scoring
 │   ├── model.py         # config.json + charset.txt + weights.bin I/O
-│   ├── preprocess.py    # mask / lines / run-length CC + 24x24 normalization
+│   ├── preprocess.py    # mask / lines / run-length CC + Goal 3 baseline-
+│   │                    #   aligned binary/soft 24x24 normalization
 │   ├── shaders/         # WGSL layer shaders
-│   └── types.py         # CharResult / OCRResult / Profile
+│   └── types.py         # Goal 1 core types: Component / VisualCandidate /
+│                        #   VisualLattice / VisualScores / DecodePath /
+│                        #   LexiconMatch + OCRResult / Profile
 ├── charsets/            # charset assets (English names, no spaces)
 │   ├── words/           #   generated word lists: one word per line
 │   └── sets/            #   single-line OCR charsets (combined.txt default)
@@ -70,9 +75,16 @@ image: np.ndarray = ...  # shape (H, W, 3), dtype uint8
 result = ocr.recognize(image)
 print(result.text)        # "获得金币1000"
 print(result.confidence)
+print(result.alternatives)  # Top-K single-substitution alternatives
+print(result.matched_term)  # None until a lexicon is supplied
 for c in result.chars:
     print(c.char, c.x, c.y, c.w, c.h, c.confidence)
 ```
+
+`result.chars` is kept as a public compatibility projection. The internal
+pipeline now works on `VisualCandidate`/`VisualLattice`/`DecodePath`, and
+`OCRResult` explicitly separates the visible `text` from the
+lexicon-inferred `matched_term`/`matched_span`.
 
 Three classifier types are supported in the same model directory format:
 
@@ -140,10 +152,15 @@ regenerates the whole thing in one command.
 ## Segmentation: candidate lattice + visual DP
 
 Segmentation never merges connected components irreversibly. Every line is
-expanded into a candidate lattice (each original component plus merges of
-up to 4 consecutive components), every candidate is scored once in a batch,
-and a dynamic program over the lattice picks the path with the highest mean
-visual score. This is what fixes the old `stroke_width=2` special cases:
+expanded into a candidate lattice: each original component, merges of up to
+4 consecutive components, and `split(Cx)` atoms for wide components that
+have a real vertical valley. Candidates are pruned by width/height,
+component gap, vertical proximity, ink area and the expected font bbox
+before scoring. Every surviving candidate is scored once in a batch, and a
+dynamic program over the lattice picks the path with the highest mean
+visual score. The lattice is exposed as `VisualLattice`, each hypothesis as
+`VisualCandidate`, and the decoder output as `DecodePath`. This is what
+fixes the old `stroke_width=2` special cases:
 
 ```text
 鲃     -> 鲃      (fragmented into 3 components)
@@ -151,11 +168,43 @@ visual score. This is what fixes the old `stroke_width=2` special cases:
 小     -> 小      (3 components)
 潜甲   -> 潜甲    (潜 has 4 components)
 潜乙   -> 潜乙
+巴尔的摩 -> 巴尔的摩
+Z17    -> Z17
+甲申   -> 甲申    (connected two-glyph blob split by split(Cx))
 ```
 
 See `docs/architecture.md` for the scoring details (unified 0..1 visual
 scores, margin-aware hybrid gate, O(C) Top-2) and the P2 stride-2 CNN
 optimization.
+
+## Visual Frontend (Goal 2)
+
+Every RGB input is converted once into two representations:
+
+```text
+RGB
+ ├─ binary mask     -> connected components / font geometry / Template
+ └─ soft foreground -> TinyCNN
+```
+
+`fixedfontocr.extract_frontend(image, profile)` returns a
+`VisualFrontend` holding both: `binary_mask` is the hard color/grayscale
+decision used by segmentation and templates, and `soft_foreground` is a
+0..255 foreground-strength map that keeps anti-aliasing, alpha, edge gray
+and low-resolution intensity for the CNN.
+
+The model config records which glyph representation the CNN was trained on
+(`"input_mode": "binary"` for 0/255 masks or `"soft"` for 0..255 soft
+glyphs). Soft-mode models are fed soft glyphs end to end; binary-mode
+models keep their original 0/255 input so existing checkpoints are not
+silently retrained by a frontend change. The bundled `model/game_cn`
+hybrid is currently binary-mode; `tests/fixtures/cnn_digits` and
+`cnn_cjk` are soft-mode fixtures that exercise the soft CNN path.
+
+Generate a soft training dataset with
+`tools/dataset/generate_font_dataset.py --soft`; `input_mode` is stored in
+the npz, propagated through training/export, and written to the model
+config.
 
 ## CPU benchmark suite and game regression set
 
@@ -266,8 +315,8 @@ mask during segmentation.
 numpy RGB
   -> profile color/grayscale mask
   -> line finding
-  -> connected components + merge/split
-  -> 24x24 normalization (CPU)
+  -> connected components -> candidate lattice (merge + split(Cx))
+  -> 24x24 normalization (CPU, Goal 3 baseline frame)
   -> backend:
        template: coarse feature filter -> XOR + popcount
        tinycnn:  CPUBackend / WGPUBackend / AutoBackend
@@ -282,7 +331,7 @@ numpy RGB
 model/
 ├── config.json    # input_width, input_height, classes, version, dtype,
 │                  # classifier (template|tinycnn|hybrid), thresholds,
-│                  # font_sha256 (source font identity)
+│                  # font_sha256 + normalize (Goal 3 baseline frame)
 ├── charset.txt
 └── weights.bin    # template: uint32 count + packed bits;
                    # tinycnn/hybrid: f32 tensors in fixed order
@@ -299,6 +348,20 @@ spacing, and normalized size. Pass a custom profile to
 
 ## Current status
 
+- Goal 3 normalization is implemented: glyphs keep their aspect ratio, are
+  aligned to the font baseline (a fixed output row) and centered/padded into
+  24×24. The same per-glyph frame (ink-fit scale + baseline offset) is used
+  by template generation, training data and runtime candidates (binary and
+  soft), and the frame parameters are stored per model in
+  `config.json["normalize"]`.
+- Goal 1 core data structures are defined and wired through segmentation
+  and the public result: `Component`, `VisualCandidate`, `VisualLattice`,
+  `VisualScores` (Top-K), `DecodePath`, `LexiconMatch` and the extended
+  `OCRResult`.
+- Goal 4 segmentation lattice is implemented: original components are kept,
+  merge/split candidates are generated with geometric pruning, and a visual
+  DP decodes the best path (`鲃`/`小`/`鲃鱼。` plus `潜甲`/`潜乙`/
+  `巴尔的摩`/`Z17` regressions are covered).
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

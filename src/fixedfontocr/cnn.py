@@ -24,6 +24,7 @@ from numpy.typing import NDArray
 
 from .classifier import Classifier
 from .preprocess import normalize
+from .postprocess import second_ids as topk_second_ids
 from .postprocess import top2
 from .types import ClassificationBatch, Profile
 
@@ -263,6 +264,7 @@ class TinyCNNClassifier(Classifier):
                 top1=np.empty(0, dtype=np.float32),
                 top2=np.empty(0, dtype=np.float32),
                 margins=np.empty(0, dtype=np.float32),
+                second_ids=np.empty(0, dtype=np.int32),
             )
         if allowed_ids is not None and not allowed_ids:
             return ClassificationBatch(
@@ -270,6 +272,7 @@ class TinyCNNClassifier(Classifier):
                 top1=np.full(n, -np.inf, dtype=np.float32),
                 top2=np.full(n, -np.inf, dtype=np.float32),
                 margins=np.full(n, 0.0, dtype=np.float32),
+                second_ids=np.full(n, -1, dtype=np.int32),
             )
         x = glyphs.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
         logits = forward(x, self.weights)
@@ -279,7 +282,13 @@ class TinyCNNClassifier(Classifier):
             masked[:, idx] = logits[:, idx]
             logits = masked
         ids, top1, top2v, margins = top2(logits)
-        return ClassificationBatch(ids=ids, top1=top1, top2=top2v, margins=margins)
+        return ClassificationBatch(
+            ids=ids,
+            top1=top1,
+            top2=top2v,
+            margins=margins,
+            second_ids=topk_second_ids(logits, ids),
+        )
 
     def __call__(
         self,

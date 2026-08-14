@@ -1,24 +1,45 @@
-"""Fixed CPU pipeline: mask -> lines -> characters -> 24x24 normalization."""
+"""Fixed CPU pipeline: mask -> lines -> characters -> 24x24 normalization.
+
+Goal 3 normalization contract
+-----------------------------
+The old normalizer took a tight glyph bbox and force-fit/centered it into
+``24x24``. That destroys the font's vertical layout: ``1/I/l``, ``Z/2/7``,
+full-width CJK, narrow Latin and punctuation all end up centered by their
+ink box, so glyphs that should sit on the same baseline drift relative to
+each other and to the templates/CNN training samples.
+
+The Goal 3 normalizer instead uses a *font baseline frame*:
+
+    glyph
+      -> keep aspect ratio
+      -> font baseline alignment (fixed output row)
+      -> horizontal centering / padding
+      -> 24x24
+
+Template/training generation and runtime candidates all use the same
+size-invariant estimator (:func:`glyph_normalize_geometry`), so a glyph and
+its template land in the same 24x24 frame at any source font size. Both
+binary masks (:func:`normalize`) and soft foreground ROIs
+(:func:`normalize_grayscale`) use the same frame, so the template path and
+the TinyCNN path see glyphs in the same coordinate system.
+"""
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
 
-from .types import CharResult, Profile
+from .defaults import ensure_font_path
+from .types import Component, Profile
 
-
-@dataclass
-class Segment:
-    """A connected text region (line or character) in image coordinates."""
-
-    mask: NDArray[np.bool_]
-    x: int
-    y: int
-    w: int
-    h: int
+# Compatibility name: ``Segment`` was the pre-Goal-1 connected-region type.
+# The core type is now ``Component``; all existing callers can keep importing
+# ``Segment`` because the two names refer to the same dataclass.
+Segment = Component
 
 
 def preprocess(
@@ -26,30 +47,26 @@ def preprocess(
     profile: Profile,
     classify,
     allowed_ids: set[int] | None = None,
-) -> tuple[list[CharResult], str]:
-    """Run the full CPU pipeline and return (char results, recognized text)."""
+) -> tuple[list[Component], str]:
+    """Legacy CPU benchmark helper: return (components, recognized text).
+
+    The production OCR path uses :func:`fixedfontocr.segmentation.segment_line`
+    and returns :class:`DecodePath`; this helper exists for stage timing and
+    does not use ``CharResult`` as the internal representation.
+    """
 
     mask = profile.color_mask(image)
-    chars: list[CharResult] = []
+    components: list[Component] = []
     text_parts: list[str] = []
 
     for line in _find_lines(mask, profile):
         line_chars = _segment_line(line, profile)
         for seg in line_chars:
             char_id, conf = classify(seg.mask, profile, allowed_ids)
-            chars.append(
-                CharResult(
-                    char=char_id,
-                    x=seg.x,
-                    y=seg.y,
-                    w=seg.w,
-                    h=seg.h,
-                    confidence=float(conf),
-                )
-            )
+            components.append(seg)
             text_parts.append(char_id)
 
-    return chars, "".join(text_parts)
+    return components, "".join(text_parts)
 
 
 def collect_glyphs(
@@ -380,36 +397,197 @@ def _split_wide(segments: list[Segment], profile: Profile) -> list[Segment]:
     return out
 
 
-def normalize(mask: NDArray[np.bool_], target: int = 24) -> NDArray[np.uint8]:
-    """Center a character bitmap in a ``target x target`` binary image.
+@dataclass(frozen=True)
+class NormalizeSpec:
+    """Font + charset normalization parameters (Goal 3 / Goal 8 seed).
 
+    The values are computed offline from the registered font
+    (:func:`compute_normalize_spec`) and stored in the model ``config.json``
+    so the numpy runtime never needs fontTools. They define one canonical
+    output frame for every glyph:
+
+    * ``scale_units``: canonical ink-fit fill (`0.8 * target_size / 1000`
+      of the em box; the runtime scale is the per-glyph ink-fit value);
+    * ``baseline_row``: the fixed output row the font baseline maps to
+      (``0.75 * target_size``);
+    * ``cjk_height_ratio`` / ``cjk_width_ratio``: median full-width ink
+      height/width in em, used to estimate the glyph's em for the baseline
+      offset;
+    * ``cjk_baseline_offset_ratio``: median distance (in em) between a
+      full-width glyph's ink bottom and the baseline;
+    * ``latin_tall_ratio``: median ink height in em of narrow
+      cap/digit/ascender glyphs (informational; kept for the Goal 8
+      geometry database);
+    * ``render_size``: the raster size used to build the templates.
+    """
+
+    baseline_row: float = 18.0
+    scale_units: float = 0.0192
+    cjk_height_ratio: float = 0.933
+    cjk_width_ratio: float = 0.933
+    cjk_baseline_offset_ratio: float = 0.087
+    latin_tall_ratio: float = 0.768
+    render_size: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "baseline_row": self.baseline_row,
+            "scale_units": self.scale_units,
+            "cjk_height_ratio": self.cjk_height_ratio,
+            "cjk_width_ratio": self.cjk_width_ratio,
+            "cjk_baseline_offset_ratio": self.cjk_baseline_offset_ratio,
+            "latin_tall_ratio": self.latin_tall_ratio,
+            "render_size": self.render_size,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "NormalizeSpec | None":
+        if not data:
+            return None
+        known = {
+            "baseline_row",
+            "scale_units",
+            "cjk_height_ratio",
+            "cjk_width_ratio",
+            "cjk_baseline_offset_ratio",
+            "latin_tall_ratio",
+            "render_size",
+        }
+        return cls(**{k: data[k] for k in known if k in data})
+
+
+def compute_normalize_spec(
+    font_path: str | Path,
+    charset: list[str],
+    target_size: int = 24,
+    render_size: int | None = None,
+) -> NormalizeSpec:
+    """Compute font-aware normalization parameters from a registered font.
+
+    Uses glyph outline bounds (font units, baseline at 0) for every charset
+    member. Missing glyphs are skipped here; the template renderer reports
+    them as hard errors, per the Font Policy.
+    """
+
+    from fontTools.pens.boundsPen import BoundsPen
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(str(ensure_font_path(font_path)))
+    cmap = font.getBestCmap() or {}
+    glyph_set = font.getGlyphSet()
+    cjk_h: list[float] = []
+    cjk_w: list[float] = []
+    cjk_desc: list[float] = []
+    latin_tall: list[float] = []
+    for ch in charset:
+        name = cmap.get(ord(ch))
+        if name is None:
+            continue
+        pen = BoundsPen(glyph_set)
+        glyph_set[name].draw(pen)
+        bounds = pen.bounds
+        if bounds is None:
+            continue
+        x0, y0, x1, y1 = bounds
+        h = y1 - y0
+        w = x1 - x0
+        if h <= 0 or w <= 0:
+            continue
+        aspect = w / h
+        h_em = h / 1000.0
+        if 0.85 <= aspect <= 1.15 and h_em >= 0.8:
+            # Full-width (CJK / full-width punctuation) glyphs.
+            cjk_h.append(h_em)
+            cjk_w.append(w / 1000.0)
+            cjk_desc.append(-y0 / 1000.0)
+        elif aspect < 0.8 and 0.6 <= h_em <= 0.9:
+            # Narrow tall glyphs: caps, digits, Latin ascenders.
+            latin_tall.append(h_em)
+
+    def _median(values: list[float], fallback: float) -> float:
+        return float(statistics.median(values)) if values else fallback
+
+    return NormalizeSpec(
+        baseline_row=0.75 * target_size,
+        scale_units=0.8 * target_size / 1000.0,
+        cjk_height_ratio=_median(cjk_h, 0.933),
+        cjk_width_ratio=_median(cjk_w, 0.933),
+        cjk_baseline_offset_ratio=_median(cjk_desc, 0.087),
+        latin_tall_ratio=_median(latin_tall, 0.768),
+        render_size=float(render_size) if render_size else None,
+    )
+
+
+def _resample(
+    glyph: NDArray,
+    new_h: int,
+    new_w: int,
+) -> NDArray:
+    """Nearest-neighbor resize (deterministic, preserves ink)."""
+
+    h, w = glyph.shape
+    ys = (np.arange(new_h)[:, None] * h / new_h).astype(np.int32)
+    xs = (np.arange(new_w)[None, :] * w / new_w).astype(np.int32)
+    return glyph[ys, xs]
+
+
+def normalize(
+    mask: NDArray[np.bool_],
+    target: int = 24,
+    *,
+    baseline_offset: float | None = None,
+    scale: float | None = None,
+    baseline_row: float = 18.0,
+) -> NDArray[np.uint8]:
+    """Normalize a character bitmap into a ``target x target`` binary image.
+
+    Without geometry this keeps the legacy behavior: the ink bbox is scaled
+    to ``0.8 * target`` (aspect ratio preserved) and centered. With
+    ``baseline_offset``/``scale`` (Goal 3) the glyph is scaled in the same
+    aspect-preserving way, then placed so its font baseline lands on
+    ``baseline_row`` instead of being centered by ink bbox.
+
+    ``baseline_offset`` is the distance in source pixels from the mask's top
+    row to the font baseline; ``scale`` is output pixels per source pixel.
     Returns uint8 0/255 so the result can be packed or fed to a CNN.
     """
 
+    mask = np.asarray(mask, dtype=bool)
     h, w = mask.shape
-    scale = min(target * 0.8 / max(h, 1), target * 0.8 / max(w, 1))
+    if scale is None:
+        scale = min(target * 0.8 / max(h, 1), target * 0.8 / max(w, 1))
+    else:
+        # Never let estimation error blow a glyph up beyond the box.
+        scale = min(float(scale), target / max(h, 1), target / max(w, 1))
     new_h = max(1, int(round(h * scale)))
     new_w = max(1, int(round(w * scale)))
-
-    # Nearest-neighbor resize is deterministic and preserves ink.
-    ys = (np.arange(new_h)[:, None] * h / new_h).astype(np.int32)
-    xs = (np.arange(new_w)[None, :] * w / new_w).astype(np.int32)
-    resized = mask[ys, xs]
+    resized = _resample(mask, new_h, new_w).astype(np.uint8) * 255
 
     out = np.zeros((target, target), dtype=np.uint8)
-    y0 = (target - new_h) // 2
+    if baseline_offset is None:
+        y0 = (target - new_h) // 2
+    else:
+        y0 = int(round(baseline_row - baseline_offset * scale))
+        y0 = min(max(y0, 0), target - new_h)
     x0 = (target - new_w) // 2
-    out[y0 : y0 + new_h, x0 : x0 + new_w] = resized.astype(np.uint8) * 255
+    out[y0 : y0 + new_h, x0 : x0 + new_w] = resized
     return out
 
 
-def normalize_grayscale(roi: NDArray[np.uint8], target: int = 24) -> NDArray[np.uint8]:
-    """Center a tight grayscale ROI in a ``target x target`` image.
+def normalize_grayscale(
+    roi: NDArray[np.uint8],
+    target: int = 24,
+    *,
+    baseline_offset: float | None = None,
+    scale: float | None = None,
+    baseline_row: float = 18.0,
+) -> NDArray[np.uint8]:
+    """Normalize a soft/grayscale ROI into a ``target x target`` image.
 
-    Unlike :func:`normalize` this keeps anti-aliasing, edge intensity and
-    sub-pixel scaling information: the result is ``uint8 [target, target]``
-    with values in 0..255 (not just 0/255). Used for the P1 grayscale-CNN
-    experiment; segmentation still consumes the binary mask.
+    Same baseline frame as :func:`normalize`, but keeps anti-aliasing, edge
+    intensity and sub-pixel scaling information: the result is
+    ``uint8 [target, target]`` with values in 0..255 (not just 0/255).
+    This is the Goal 2/3 soft twin consumed by the TinyCNN.
     """
 
     roi = np.asarray(roi, dtype=np.uint8)
@@ -418,17 +596,80 @@ def normalize_grayscale(roi: NDArray[np.uint8], target: int = 24) -> NDArray[np.
     h, w = roi.shape
     if h == 0 or w == 0:
         return np.zeros((target, target), dtype=np.uint8)
-    scale = min(target * 0.8 / h, target * 0.8 / w)
+    if scale is None:
+        scale = min(target * 0.8 / h, target * 0.8 / w)
+    else:
+        scale = min(float(scale), target / h, target / w)
     new_h = max(1, int(round(h * scale)))
     new_w = max(1, int(round(w * scale)))
-    ys = (np.arange(new_h)[:, None] * h / new_h).astype(np.int32)
-    xs = (np.arange(new_w)[None, :] * w / new_w).astype(np.int32)
-    resized = roi[ys, xs]
+    resized = _resample(roi, new_h, new_w)
+
     out = np.zeros((target, target), dtype=np.uint8)
-    y0 = (target - new_h) // 2
+    if baseline_offset is None:
+        y0 = (target - new_h) // 2
+    else:
+        y0 = int(round(baseline_row - baseline_offset * scale))
+        y0 = min(max(y0, 0), target - new_h)
     x0 = (target - new_w) // 2
     out[y0 : y0 + new_h, x0 : x0 + new_w] = resized
     return out
+
+
+def _estimate_single_glyph(
+    seg: Component,
+    spec: NormalizeSpec,
+) -> tuple[float, float]:
+    """Estimate ``(baseline_y, em_px)`` from one glyph/candidate bbox.
+
+    The estimate is size-invariant: it only uses the ink bbox's aspect and
+    the font's script ratios, so a glyph rendered at 16 px, 32 px or 64 px
+    maps to exactly the same 24x24 frame. Template generation, training
+    data generation and runtime candidates all use this identical estimator
+    (Goal 3 consistency).
+
+    The font-size estimate is only used for the baseline offset (the
+    *scale* stays the classic aspect-preserving ink-fit, see
+    :func:`glyph_normalize_geometry`). The offset is applied only when the
+    ink is genuinely full-width (square-ish and at least ~0.83 em wide
+    under the unified em estimate); narrow digits/caps, x-height letters
+    and floating punctuation sit on (or above) the baseline.
+    """
+
+    em = max(
+        seg.h / spec.cjk_height_ratio,
+        seg.w / spec.cjk_width_ratio,
+        1.0,
+    )
+    if seg.w / seg.h >= 0.75 and seg.w / em >= 0.83:
+        baseline = seg.y + seg.h - spec.cjk_baseline_offset_ratio * em
+    else:
+        baseline = seg.y + seg.h
+    return baseline, em
+
+
+def glyph_normalize_geometry(
+    segment: Component,
+    spec: NormalizeSpec,
+    target: int = 24,
+) -> tuple[float, float]:
+    """Per-candidate ``(baseline_offset, scale)`` for Goal 3 normalization.
+
+    ``baseline_offset`` is the estimated distance from the bbox top to the
+    font baseline in source pixels; ``scale`` is output pixels per source
+    pixel. Both sides of the fixed-font pipeline (template/training and
+    runtime) use this function, so a glyph candidate and its template land
+    in the same 24x24 frame at any source font size.
+    """
+
+    baseline_y, _em_px = _estimate_single_glyph(segment, spec)
+    # Goal 3 keeps the classic aspect-preserving ink-fit scale
+    # (``0.8 * target`` on the largest ink dimension); the font baseline
+    # alignment comes from the vertical offset, not from stretching.
+    scale = min(
+        target * 0.8 / max(segment.h, 1),
+        target * 0.8 / max(segment.w, 1),
+    )
+    return (baseline_y - segment.y, float(scale))
 
 
 def collect_glyphs_grayscale(

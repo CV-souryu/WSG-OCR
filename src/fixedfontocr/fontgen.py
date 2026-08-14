@@ -16,7 +16,13 @@ from .defaults import (
     ensure_font_path,
     resolve_font,
 )
-from .preprocess import normalize
+from .preprocess import (
+    Component,
+    NormalizeSpec,
+    compute_normalize_spec,
+    glyph_normalize_geometry,
+    normalize,
+)
 
 
 @functools.lru_cache(maxsize=16)
@@ -71,13 +77,25 @@ def build_templates(
     """
 
     font_path = resolve_font(font_path)
+    spec = compute_normalize_spec(font_path, charset, target_size, render_size)
     chars: list[str] = []
     rows: list[NDArray[np.uint8]] = []
     for char in charset:
         ink = render_glyph(font_path, char, render_size, threshold)
         if ink.size == 0:
             raise ValueError(f"font {font_path} cannot render {char!r}: no ink")
-        normalized = normalize(ink, target_size)
+        h, w = ink.shape
+        candidate = Component(mask=ink, x=0, y=0, w=w, h=h)
+        baseline_offset, scale = glyph_normalize_geometry(
+            candidate, spec, target_size
+        )
+        normalized = normalize(
+            ink,
+            target_size,
+            baseline_offset=baseline_offset,
+            scale=scale,
+            baseline_row=spec.baseline_row,
+        )
         rows.append(np.packbits(normalized.reshape(-1), bitorder="little"))
         chars.append(char)
     if not rows:
@@ -93,6 +111,7 @@ def write_model(
     version: int = 1,
     font_path: str | Path | None = None,
     font_sha256: str | None = None,
+    render_size: int = 32,
 ) -> None:
     """Write ``config.json``, ``charset.txt`` and ``weights.bin``.
 
@@ -114,6 +133,10 @@ def write_model(
     }
     if font_sha256:
         config["font_sha256"] = font_sha256
+    if font_path is not None:
+        config["normalize"] = compute_normalize_spec(
+            font_path, chars, target_size, render_size
+        ).to_dict()
     (model_dir / "config.json").write_text(
         json.dumps(config, indent=4) + "\n",
         encoding="utf-8",

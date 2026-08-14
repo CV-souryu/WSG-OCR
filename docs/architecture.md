@@ -42,9 +42,10 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/api.py` | Public `FixedFontOCR` engine. Loads the model, builds the selected backend (`cpu`/`wgpu`/`auto`), runs the template→CNN→unknown hybrid flow and applies `allowed_chars`. |
 | `src/fixedfontocr/backends.py` | Unified batch classifier API (`Backend.classify(glyphs)`): `CPUBackend` (numpy), `WGPUBackend` (WGSL compute) and `AutoBackend` (measured per-batch selection). |
 | `src/fixedfontocr/shaders/*.wgsl` | Phase-1 WGSL layers: normalize, conv3x3, dwconv3x3, pointwise, gap, linear, argmax, fused linear+argmax. |
-| `src/fixedfontocr/types.py` | Shared dataclasses: `CharResult`, `OCRResult`, `Profile`, `ClassificationBatch`, `CandidateScore` (the unified scoring unit). |
-| `src/fixedfontocr/preprocess.py` | Color/grayscale mask, line finding, run-length connected components, binary + grayscale 24×24 normalization. |
-| `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components) and the visual DP decoder. This is the production segmentation path. |
+| `src/fixedfontocr/types.py` | Goal 1 core dataclasses: `Component`, `VisualCandidate`, `VisualLattice`, `VisualScores` (Top-K), `DecodePath`, `LexiconMatch`, extended `OCRResult`; plus compatibility `CharResult`, `Profile`, `ClassificationBatch`, `CandidateScore`. |
+| `src/fixedfontocr/preprocess.py` | Color/grayscale mask, line finding, run-length connected components, Goal 3 binary + soft baseline-aligned 24×24 normalization (`NormalizeSpec`, `glyph_normalize_geometry`). |
+| `src/fixedfontocr/frontend.py` | Goal 2 Visual Frontend: one RGB pass extracts `binary_mask` (segmentation/template) and `soft_foreground` (TinyCNN), plus binary/soft glyph normalization helpers. |
+| `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms) and the visual DP decoder. This is the production segmentation path. |
 | `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate; converts raw scores to a shared 0..1 visual score. |
 | `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier`: coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; `match_batch` for the lattice. |
 | `src/fixedfontocr/cnn.py` | `TinyCNNClassifier` numpy forward pass (stride-2 optimized), `forward_with_activations` for exported test vectors and `classify_batch(glyphs, top_k=2)`. |
@@ -59,19 +60,88 @@ the source font's SHA256 as `font_sha256`.
 
 ```
 numpy RGB
-  -> profile color/grayscale mask
-  -> line finding
+  -> Visual Frontend (one pass)
+       binary mask   -> profile color/grayscale mask
+       soft          -> 0..255 foreground strength (anti-aliasing/alpha/edges)
+  -> line finding (binary mask)
   -> run-length connected components (original components are kept)
-  -> candidate lattice (single components + merges of up to 4, filtered)
+  -> candidate lattice (single components + merges of up to 4 + split(Cx),
+     geometrically filtered)
+  -> 24x24 normalization (Goal 3 baseline frame, binary + soft)
   -> batched scoring (TemplateClassifier.match_batch / TinyCNN forward)
        template: confidence AND top-1/top-2 margin must both be high
-       cnn:      sigmoid(top1-top2 margin) -> shared 0..1 visual score
+       cnn:      soft glyphs when model input_mode="soft", binary otherwise
+                 sigmoid(top1-top2 margin) -> shared 0..1 visual score
        hybrid:   template gate first, CNN fallback for ambiguous glyphs
   -> visual DP (max mean visual score path, geometry penalties)
-  -> 24x24 normalization -> final classification (backend or template)
   -> allowed_chars restriction (postprocess)
   -> charset -> string
 ```
+
+## Normalization (Goal 3)
+
+Normalization is the point where the fixed font's vertical layout is
+preserved. The old path took a tight glyph bbox and force-stretched/centered
+it into 24×24; that destroys baseline information, so `1/I/l`, `Z/2/7`,
+full-width CJK, narrow Latin and punctuation all ended up in unrelated
+frames.
+
+The Goal 3 frame is:
+
+```
+glyph
+  -> keep aspect ratio
+  -> font baseline alignment (fixed output row)
+  -> horizontal centering / padding
+  -> 24x24
+```
+
+`NormalizeSpec` (computed from the registered font + charset with
+`compute_normalize_spec`, stored in `config.json["normalize"]`) holds the
+font's script ratios: median full-width ink height/width and the CJK
+baseline offset. Every candidate's geometry is then estimated once by
+`glyph_normalize_geometry`:
+
+* the scale stays the classic aspect-preserving ink-fit (`0.8 × 24` on the
+  largest ink dimension), so glyph shapes are stable across font sizes;
+* full-width (CJK) candidates are placed with their baseline ~0.087 em below
+  their ink bottom, matching the font's true layout;
+* narrow candidates (digits, caps, ascenders, `1/I/l`...) sit on the
+  baseline, so `Z/2/7` share one bottom row while full-width CJK extends
+  below it.
+
+Critically, template generation (`fontgen.build_templates`), synthetic
+dataset generation (`tools/dataset/generate_font_dataset.py`,
+`scripts/train_tinycnn.py`) and runtime candidates
+(`segmentation.segment_line` -> `SegmentScorer` -> `api.py`) all call the
+same `glyph_normalize_geometry` + `normalize`/`normalize_grayscale` pair, so
+a rendered glyph and its template land on the exact same bitmap (proven by
+`tests/test_goal3_normalize.py`). Binary masks and soft foreground ROIs use
+identical placement; the soft path keeps anti-aliasing/edge intensity.
+
+Models without a `normalize` spec (pre-Goal-3 checkpoints) keep the legacy
+centered normalization, so old checkpoints remain loadable.
+
+## Visual Frontend (Goal 2)
+
+The frontend is the single entry point from RGB pixels to the two internal
+representations used downstream. `extract_frontend(image, profile)` runs
+one pass over the `uint8 [H, W, 3]` input and returns:
+
+* `binary_mask` — the hard `Profile.color_mask` decision. Connected
+  components, font-geometry checks and the Template matcher consume this;
+* `soft_foreground` — a 0..255 foreground-strength map with no hard cutoff.
+  Anti-aliased edge pixels, alpha-blended intensities, edge gray and
+  low-resolution sampling information survive here for the TinyCNN.
+
+The model config records `input_mode` (`"binary"` or `"soft"`) so the
+runtime feeds the CNN exactly the representation it was trained on.
+`generate_font_dataset.py --soft` stores 0..255 glyphs in the training npz,
+`tools/train/train.py` propagates the mode into the checkpoint, and
+`tools/train/export_model.py` writes it into the runtime config. Binary
+mode is the default, so pre-existing models keep their 0/255 training
+domain; soft-mode models (e.g. the checked-in `cnn_digits`/`cnn_cjk`
+fixtures) are scored with soft glyphs end to end.
 
 TinyCNN models use a unified batch backend; both implementations return the
 same `BackendResult(char_ids, scores)` where `scores` is the top1-top2 logit
@@ -109,10 +179,25 @@ The old pipeline merged connected components irreversibly before
 classification, so fragment-heavy glyphs such as `鲃` or `小` could never be
 recovered without a `stroke_width` special case. The lattice
 (`src/fixedfontocr/segmentation.py`) keeps every original component and
-generates all consecutive candidate ranges (single components plus merges
-of up to 4 components), filters obviously impossible shapes by size and
-internal gap, scores every candidate once in a batch, then decodes the best
-path with dynamic programming.
+generates all consecutive candidate ranges: single components, merges of up
+to 4 components, and `split(Cx)` atoms for wide components. A wide component
+is split only when its width clearly exceeds the line's expected glyph bbox
+*and* a vertical valley exists, so closed CJK glyphs (口/日/中) stay whole
+while a low-resolution two-glyph blob becomes left/right alternatives plus
+the original whole candidate. Candidate shapes are pruned before scoring by
+maximum width/height, minimum height, component gap, vertical overlap/
+proximity and ink area; then every surviving candidate is scored once in a
+batch and the best path is decoded with dynamic programming.
+
+Goal 1 names these objects explicitly: each original blob is a
+`Component`, each merge/split hypothesis is a `VisualCandidate`, the full
+non-destructive hypothesis set is a `VisualLattice`, and the DP output is a
+`DecodePath`. Split candidates carry an atom span in addition to their
+component range, so the decoder can cover a split component piece by piece
+while the original component remains available as a whole-candidate merge.
+The scorer stores a `VisualScores` Top-K object per candidate (template/CNN
+second-ranked id included), so the decoder never has to commit to a Top-1
+pick before it sees geometry, lexicon or path evidence.
 
 The DP maximizes the *mean* visual score of the candidates on the path
 (ties prefer fewer segments). Using the mean — not the sum — is essential:
@@ -128,7 +213,8 @@ glyph-internal proximity. This keeps CNN-only fixtures such as `1000` from
 merging digits while the hybrid path (the recommended production model)
 relies on the template margin gate instead.
 
-Acceptance (all verified by `tests/test_segmentation.py`):
+Acceptance (verified by `tests/test_segmentation.py` and
+`tests/test_goal4_segmentation.py`):
 
 ```text
 鲃     -> 鲃
@@ -136,6 +222,8 @@ Acceptance (all verified by `tests/test_segmentation.py`):
 小     -> 小
 潜甲   -> 潜甲
 潜乙   -> 潜乙
+巴尔的摩 -> 巴尔的摩
+Z17    -> Z17
 ```
 
 No `stroke_width = 2` special case is needed.
@@ -159,8 +247,31 @@ The public `CharResult.confidence` is always mapped to 0..1 as well
 The CNN classifier API returns `ClassificationBatch(ids, top1, top2,
 margins)` from `classify_batch(glyphs, top_k=2)`, so segmentation and a
 future dictionary decoder get the raw top-2 information instead of a single
-`char + confidence`. Top-2 uses `argmax` + a single `argpartition`, i.e.
-O(C) per glyph rather than a full `argsort`.
+`char + confidence`. `TemplateBatch` now also carries `second_ids`, and both
+classifier paths can be projected into `VisualScores(char_ids, logits,
+top_k, margin, raw_score, score_type)`. Top-2 uses `argmax` + a single
+`argpartition`, i.e. O(C) per glyph rather than a full `argsort`.
+
+## Goal 1 data structures
+
+The public contract of Goal 1 is:
+
+```python
+Component(        # one connected component: mask + bbox
+VisualCandidate(  # one glyph hypothesis over components[start:end]
+    start, end, bbox, glyph, geometry_score, scores
+)
+VisualLattice(    # all components + candidates, no irreversible decision
+VisualScores(     # Top-K char_ids/logits, margin, raw_score, score_type
+DecodePath(       # chosen candidates, mean score, text, alternatives
+LexiconMatch(     # dictionary entity + span over visible text
+OCRResult(        # visible text + confidence + matched_term/span +
+                  # alternatives + lexicon_match + path
+```
+
+`OCRResult.text` is exactly the visible screen text; `matched_term` and
+`lexicon_match` are dictionary-inferred entities and are kept separate by
+design. `result.chars` remains as a compatibility projection.
 
 ## TinyCNN stride-2 optimization
 

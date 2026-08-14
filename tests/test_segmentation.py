@@ -117,28 +117,28 @@ def test_dp_prefers_fewer_segments_on_tie():
             start=0,
             end=1,
             components=(0,),
-            geometry=0.0,
+            geometry_score=0.0,
         ),
         Candidate(
             segment=None,  # type: ignore[arg-type]
             start=1,
             end=2,
             components=(1,),
-            geometry=0.0,
+            geometry_score=0.0,
         ),
         Candidate(
             segment=None,  # type: ignore[arg-type]
             start=2,
             end=3,
             components=(2,),
-            geometry=0.0,
+            geometry_score=0.0,
         ),
         Candidate(
             segment=None,  # type: ignore[arg-type]
             start=0,
             end=3,
             components=(0, 1, 2),
-            geometry=0.0,
+            geometry_score=0.0,
         ),
     ]
     from fixedfontocr.scorer import SegmentScore

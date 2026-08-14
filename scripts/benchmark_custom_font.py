@@ -44,7 +44,12 @@ from fixedfontocr import defaults  # noqa: E402
 from fixedfontocr.defaults import resolve_font  # noqa: E402
 from fixedfontocr.fontgen import build_templates, write_model  # noqa: E402
 from fixedfontocr.model import load_model  # noqa: E402
-from fixedfontocr.preprocess import normalize  # noqa: E402
+from fixedfontocr.preprocess import (  # noqa: E402
+    Component,
+    compute_normalize_spec,
+    glyph_normalize_geometry,
+    normalize,
+)
 from fixedfontocr.types import default_profile  # noqa: E402
 
 
@@ -140,7 +145,8 @@ def bench_per_glyph(font: Path, tinycnn_model: Path, repeat: int, iters: int) ->
     with tempfile.TemporaryDirectory() as tmp:
         chars, templates = build_templates(font, list(model.charset), render_size=32)
         write_model(Path(tmp) / "template", chars, templates, font_path=font)
-        tpl = TemplateClassifier(templates, chars)
+        spec = compute_normalize_spec(font, list(model.charset), 24, 32)
+        tpl = TemplateClassifier(templates, chars, normalize_spec=spec)
         masks = [glyph_mask(font, c) for c in model.charset]
         state = {"i": 0}
 

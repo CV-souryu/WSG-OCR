@@ -4,8 +4,9 @@ The old pipeline merged connected components irreversibly before
 classification, so fragment-heavy glyphs such as ``鲃`` or ``小`` could never
 be recovered. The lattice instead keeps every original component and
 generates all plausible consecutive candidates (single components plus
-merges of up to ``max_merge_components``), scores them with the classifier
-scorer, then decodes the best path with dynamic programming.
+merges of up to ``max_merge_components`` plus ``split(Cx)`` atoms for wide
+components), scores them with the classifier scorer, then decodes the best
+path with dynamic programming.
 
 Path score is the *mean* visual score of the candidates on the path, with
 small geometry penalties. Using the mean (instead of the sum) is essential:
@@ -13,14 +14,14 @@ summing would reward splitting one glyph into many fragments because each
 fragment contributes positive score.
 
     components  C0  C1  C2
-    candidates  C0, C0+C1, C0+C1+C2, C1, C1+C2, C2, ...
-    edges       0->1, 0->2, 0->3, 1->2, 1->3, 2->3
-    DP          best-scoring path from component 0 to component N
+    atoms       C0a C0b C1 C2   (C0 split into two pieces)
+    candidates  C0a, C0b, C0a+C0b(=C0), C0a+C0b+C1, ..., C1, C1+C2, C2, ...
+    edges       best-scoring path from atom 0 to atom N
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -29,94 +30,261 @@ from .preprocess import (
     _bbox_segment,
     _connected_components,
     _union,
+    glyph_normalize_geometry,
     normalize,
 )
 from .scorer import SegmentScore, SegmentScorer
-from .types import Profile
+from .types import Component, DecodePath, Profile, VisualCandidate, VisualLattice
 
-
-@dataclass
-class Candidate:
-    """One candidate segment covering ``components[start:end]``."""
-
-    segment: Segment
-    start: int
-    end: int  # exclusive
-    components: tuple[int, ...]
-    score: SegmentScore | None = None
-    geometry: float = 0.0
-
-    @property
-    def total_score(self) -> float:
-        if self.score is None:
-            return self.geometry
-        return self.score.visual_score + self.geometry
+# Goal 1 names: ``Candidate``/``DecodedPath`` remain as compatibility aliases
+# for the previous internal names, but the pipeline now speaks the new core
+# vocabulary (VisualCandidate / DecodePath / VisualLattice).
+Candidate = VisualCandidate
+DecodedPath = DecodePath
 
 
 @dataclass(frozen=True)
-class DecodedPath:
-    """Result of decoding one line: the chosen candidates."""
+class _Atom:
+    """One atomic slice of a connected component.
 
-    candidates: tuple[Candidate, ...] = field(default_factory=tuple)
-    mean_score: float = 0.0
+    Most components have exactly one atom (the component itself). A wide
+    component that provably contains several glyphs is split at vertical
+    valleys into multiple atoms; the original component is then available to
+    the decoder as the merge of those atoms, while each atom is also its own
+    ``split(Cx)`` candidate. The lattice therefore never destroys the
+    original components -- it only adds finer-grained alternatives.
+    """
+
+    component_index: int
+    segment: Component
 
 
-def connected_components(line: Segment) -> list[Segment]:
-    """Original 4-connected components of a line, left to right."""
+def connected_components(line: Segment) -> list[Component]:
+    """Original 4-connected components of a line, left to right.
 
-    comps = [_bbox_segment(c, line.y) for c in _connected_components(line.mask)]
+    ``_bbox_segment`` returns coordinates relative to the line mask; the
+    line's own image-space offset is added so every component's ``x/y`` is
+    absolute (matching the :class:`Component` contract and letting the
+    Visual Frontend crop soft ROIs straight from the source image).
+    """
+
+    comps: list[Component] = []
+    for c in _connected_components(line.mask):
+        seg = _bbox_segment(c, line.y)
+        seg.x += line.x
+        comps.append(seg)
     comps.sort(key=lambda s: (s.x, s.y))
     return comps
 
 
 def build_candidates(
-    comps: list[Segment],
+    comps: list[Component],
     profile: Profile,
     max_merge_components: int = 3,
-) -> list[Candidate]:
+    split_wide: bool = True,
+) -> list[VisualCandidate]:
     """Generate all consecutive candidates up to ``max_merge_components``.
 
-    Only consecutive component ranges are considered (``C0+C2`` without
-    ``C1`` is not a character candidate). Obviously impossible combinations
-    are filtered by size and internal-gap bounds before any classification
-    work happens.
+    Only consecutive ranges are considered (``C0+C2`` without ``C1`` is not
+    a character candidate). Wide components are additionally split at
+    vertical valleys into ``split(Cx)`` atoms, so a connected two-glyph blob
+    is represented by its whole-component candidate and by each split piece.
+    Obviously impossible combinations are filtered by size, vertical
+    proximity, internal-gap and ink-area bounds before classification.
     """
 
     if max_merge_components < 1:
         raise ValueError("max_merge_components must be >= 1")
-    n = len(comps)
+    atoms, expected_width = _expand_atoms(
+        comps, profile, max_merge_components, split_wide=split_wide
+    )
+    n = len(atoms)
     cands: list[Candidate] = []
     for i in range(n):
         for j in range(i + 1, min(n, i + max_merge_components) + 1):
-            parts = tuple(range(i, j))
-            if not _passes_filters([comps[k] for k in parts], profile):
+            parts = atoms[i:j]
+            if not _passes_filters(parts, profile, expected_width):
                 continue
             if j - i == 1:
-                seg = comps[i]
+                seg = parts[0].segment
             else:
-                acc = comps[i]
-                for k in range(i + 1, j):
-                    acc = _union(acc, comps[k])
+                acc = parts[0].segment
+                for part in parts[1:]:
+                    acc = _union(acc, part.segment)
                 seg = acc
-            cands.append(Candidate(segment=seg, start=i, end=j, components=parts))
+            comp_indices = tuple(sorted({p.component_index for p in parts}))
+            cands.append(
+                Candidate(
+                    segment=seg,
+                    start=comp_indices[0],
+                    end=comp_indices[-1] + 1,
+                    components=comp_indices,
+                    atoms=(i, j),
+                )
+            )
     return cands
 
 
-def _passes_filters(parts: list[Segment], profile: Profile) -> bool:
-    """Reject candidate shapes that cannot be a single character."""
+def _estimate_expected_width(
+    comps: list[Component], profile: Profile
+) -> float:
+    """Estimate the line's typical glyph width from its ink height.
+
+    This is the Goal 4 "font expected bbox" stand-in used before the full
+    offline geometry database (Goal 8) exists: full-width CJK is roughly
+    square while narrow Latin/digits are narrower, so ``0.8 * median
+    height`` is a safe upper bound for a single glyph on the line.
+    """
+
+    if not comps:
+        return max(float(profile.char_width_min), 2.0)
+    max_h = max(c.h for c in comps)
+    tall = [c.h for c in comps if c.h >= max(2, 0.6 * max_h)]
+    median_h = float(np.median(tall) if tall else max_h)
+    return max(
+        float(profile.char_width_min),
+        min(float(profile.char_width_max), median_h * 0.8),
+    )
+
+
+def _valley_cuts(
+    mask: np.ndarray,
+    expected_width: float,
+    profile: Profile,
+    max_splits: int,
+) -> list[int]:
+    """Return x positions where a wide component should be split.
+
+    A cut is the middle of a vertical valley: columns whose ink count is at
+    most ``~12%`` of the component height. That catches a low-resolution
+    connector between two glyphs while avoiding interior whitespace of
+    closed CJK glyphs (口/日/中 have top/bottom strokes keeping the valley
+    columns well above the threshold). Edge valleys are ignored and each
+    resulting piece must be wide enough to be a glyph.
+    """
+
+    h, w = mask.shape
+    proj = mask.sum(axis=0).astype(np.int32)
+    threshold = max(1, int(h * 0.12))
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for x in range(w):
+        if proj[x] <= threshold:
+            if start is None:
+                start = x
+        elif start is not None:
+            runs.append((start, x - 1))
+            start = None
+    if start is not None:
+        runs.append((start, w - 1))
+
+    min_piece = max(profile.char_width_min, int(expected_width * 0.4))
+    cuts: list[int] = []
+    for a, b in runs:
+        if a < min_piece or w - 1 - b < min_piece:
+            continue
+        cut = (a + b + 1) // 2
+        if not cuts or cut - cuts[-1] >= min_piece:
+            cuts.append(cut)
+        if len(cuts) >= max_splits:
+            break
+    return cuts
+
+
+def _split_atoms(
+    comp: Component,
+    component_index: int,
+    expected_width: float,
+    profile: Profile,
+    max_splits: int,
+) -> list[_Atom]:
+    """Return one whole atom, or one atom per vertically-split piece."""
+
+    whole = [_Atom(component_index=component_index, segment=comp)]
+    if (
+        max_splits < 1
+        or comp.h < max(2, profile.char_height_min)
+        or comp.w <= max(expected_width * 1.8, comp.h * 1.4)
+    ):
+        return whole
+    cuts = _valley_cuts(comp.mask, expected_width, profile, max_splits)
+    if not cuts:
+        return whole
+
+    bounds = [0, *cuts, comp.w]
+    pieces: list[Component] = []
+    for a, b in zip(bounds, bounds[1:]):
+        piece_mask = comp.mask[:, a:b]
+        if not np.any(piece_mask):
+            continue
+        seg = _bbox_segment(piece_mask, comp.y)
+        seg.x += comp.x + a
+        pieces.append(seg)
+    if len(pieces) < 2:
+        return whole
+    return [_Atom(component_index=component_index, segment=p) for p in pieces]
+
+
+def _expand_atoms(
+    comps: list[Component],
+    profile: Profile,
+    max_merge_components: int,
+    split_wide: bool,
+) -> tuple[list[_Atom], float]:
+    """Build the atom sequence, keeping every original component reachable."""
+
+    expected = _estimate_expected_width(comps, profile)
+    atoms: list[_Atom] = []
+    for i, comp in enumerate(comps):
+        if split_wide:
+            atoms.extend(
+                _split_atoms(
+                    comp,
+                    i,
+                    expected,
+                    profile,
+                    max_splits=max_merge_components - 1,
+                )
+            )
+        else:
+            atoms.append(_Atom(component_index=i, segment=comp))
+    return atoms, expected
+
+
+def _passes_filters(
+    parts: list[_Atom],
+    profile: Profile,
+    expected_width: float,
+) -> bool:
+    """Reject candidate shapes that cannot be a single character.
+
+    Pruning covers the Goal 4 list: maximum width/height, minimum height,
+    component gap, vertical overlap/proximity, ink area, and the expected
+    font bbox. Rules stay conservative so ambiguous low-resolution glyphs
+    are still scored by the visual DP instead of being discarded.
+    """
 
     if len(parts) == 1:
-        seg = parts[0]
-        return seg.w <= profile.char_width_max and seg.h <= profile.char_height_max
+        seg = parts[0].segment
+        if seg.w > profile.char_width_max or seg.h > profile.char_height_max:
+            return False
+        if seg.h >= max(2, profile.char_height_min):
+            ink = int(seg.mask.sum())
+            if ink < max(1, int(0.02 * seg.w * seg.h)):
+                return False
+        return True
 
-    x0 = min(p.x for p in parts)
-    y0 = min(p.y for p in parts)
-    x1 = max(p.x + p.w for p in parts)
-    y1 = max(p.y + p.h for p in parts)
+    segs = [p.segment for p in parts]
+    x0 = min(p.x for p in segs)
+    y0 = min(p.y for p in segs)
+    x1 = max(p.x + p.w for p in segs)
+    y1 = max(p.y + p.h for p in segs)
     w, h = x1 - x0, y1 - y0
     if w > profile.char_width_max or h > profile.char_height_max:
         return False
     if h < max(2, profile.char_height_min):
+        return False
+    if w > max(profile.char_width_max, expected_width * 1.8):
         return False
     # Conservative internal-gap bound: a merge across a wide blank is a
     # different character, not a fragmented glyph. The bound is generous
@@ -124,15 +292,40 @@ def _passes_filters(parts: list[Segment], profile: Profile) -> bool:
     # dozen pixels apart; the visual DP is what rejects actual
     # character-to-character merges.
     max_gap = max(
-        parts[k + 1].x - (parts[k].x + parts[k].w) for k in range(len(parts) - 1)
+        segs[k + 1].x - (segs[k].x + segs[k].w) for k in range(len(segs) - 1)
     )
     gap_limit = max(2, profile.char_height_min) + 2
-    return max_gap <= gap_limit
+    if max_gap > gap_limit:
+        return False
+
+    # Vertical overlap/proximity: at least one adjacent pair must overlap
+    # vertically or be close enough to belong to one glyph (colon and i-dot
+    # punctuation are deliberately allowed by the generous gap bound).
+    max_v_gap = max(4, profile.char_height_min // 2)
+    if not any(
+        _vertical_overlap(a.segment, b.segment) >= 1
+        or _vertical_gap(a.segment, b.segment) <= max_v_gap
+        for a, b in zip(parts, parts[1:])
+    ):
+        return False
+
+    ink = sum(int(s.mask.sum()) for s in segs)
+    if ink < max(1, int(0.02 * w * h)):
+        return False
+    return True
+
+
+def _vertical_overlap(a: Component, b: Component) -> int:
+    return min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+
+
+def _vertical_gap(a: Component, b: Component) -> int:
+    return max(a.y, b.y) - min(a.y + a.h, b.y + b.h)
 
 
 def geometry_score(
-    candidate: Candidate,
-    comps: list[Segment],
+    candidate: VisualCandidate,
+    comps: list[Component],
     profile: Profile,
 ) -> float:
     """Small geometric adjustments on top of the classifier visual score.
@@ -175,60 +368,90 @@ def geometry_score(
     return score
 
 
+def build_lattice(
+    comps: list[Component],
+    candidates: list[VisualCandidate],
+    line: Segment | None = None,
+) -> VisualLattice:
+    """Wrap components and candidates in a non-destructive visual lattice."""
+    return VisualLattice(
+        components=tuple(comps),
+        candidates=tuple(candidates),
+        width=line.w if line is not None else 0,
+        height=line.h if line is not None else 0,
+    )
+
+
 def decode(
-    candidates: list[Candidate],
-    n_components: int,
-) -> DecodedPath:
+    candidates: list[VisualCandidate] | VisualLattice,
+    n_components: int | None = None,
+) -> DecodePath:
     """Visual DP over the candidate lattice (max mean score path).
 
-    ``dp[end]`` stores the best (sum, count) covering components
-    ``0..end-1``; ties are broken toward fewer candidates (i.e. prefer the
-    merged glyph over a tie of its fragments).
+    The DP runs over the lattice's atom sequence: an atom is a whole
+    connected component or one split piece of a wide component. ``dp[end]``
+    stores the best (sum, count) covering atoms ``0..end-1``; ties are broken
+    toward fewer candidates (i.e. prefer the merged glyph over a tie of its
+    fragments).
     """
 
-    by_end: dict[int, list[Candidate]] = {}
+    lattice: VisualLattice | None = None
+    if isinstance(candidates, VisualLattice):
+        lattice = candidates
+        n_components = len(lattice.components)
+        candidates = list(lattice.candidates)
+    if n_components is None:
+        raise ValueError("decode() needs n_components when given a candidate list")
+
+    if not candidates:
+        return DecodePath(candidates=(), mean_score=0.0, lattice=lattice)
+
+    n_atoms = max(c.atom_span[1] for c in candidates)
+    by_end: dict[int, list[tuple[Candidate, int, int]]] = {}
     for c in candidates:
-        by_end.setdefault(c.end, []).append(c)
+        start, end = c.atom_span
+        by_end.setdefault(end, []).append((c, start, end))
 
     NEG = -1e18
-    dp_sum = [NEG] * (n_components + 1)
-    dp_cnt = [0] * (n_components + 1)
-    dp_prev: list[list | None] = [None] * (n_components + 1)
+    dp_sum = [NEG] * (n_atoms + 1)
+    dp_cnt = [0] * (n_atoms + 1)
+    dp_prev: list[list | None] = [None] * (n_atoms + 1)
     dp_sum[0] = 0.0
 
-    for end in range(1, n_components + 1):
+    for end in range(1, n_atoms + 1):
         best_sum: float | None = None
         best_cnt = 0
         best_prev = None
         best_cand: Candidate | None = None
-        for c in by_end.get(end, []):
-            if dp_sum[c.start] <= NEG / 2:
+        for c, start, _ in by_end.get(end, []):
+            if dp_sum[start] <= NEG / 2:
                 continue
-            s = dp_sum[c.start] + c.total_score
-            cnt = dp_cnt[c.start] + 1
+            s = dp_sum[start] + c.total_score
+            cnt = dp_cnt[start] + 1
             mean = s / cnt
             if best_sum is None or mean > best_sum / best_cnt + 1e-9 or (
                 abs(mean - best_sum / best_cnt) <= 1e-9 and cnt < best_cnt
             ):
-                best_sum, best_cnt, best_prev, best_cand = s, cnt, c.start, c
+                best_sum, best_cnt, best_prev, best_cand = s, cnt, start, c
         if best_cand is not None:
             dp_sum[end] = best_sum
             dp_cnt[end] = best_cnt
             dp_prev[end] = [best_prev, best_cand]
 
-    if dp_sum[n_components] <= NEG / 2:
-        return DecodedPath(candidates=(), mean_score=0.0)
+    if dp_sum[n_atoms] <= NEG / 2:
+        return DecodePath(candidates=(), mean_score=0.0, lattice=lattice)
 
     chosen: list[Candidate] = []
-    pos = n_components
+    pos = n_atoms
     while pos > 0:
         prev, cand = dp_prev[pos]  # type: ignore[misc]
         chosen.append(cand)
         pos = prev
     chosen.reverse()
-    return DecodedPath(
+    return DecodePath(
         candidates=tuple(chosen),
-        mean_score=float(dp_sum[n_components] / dp_cnt[n_components]),
+        mean_score=float(dp_sum[n_atoms] / dp_cnt[n_atoms]),
+        lattice=lattice,
     )
 
 
@@ -238,45 +461,79 @@ def segment_line(
     scorer: SegmentScorer,
     allowed_ids: set[int] | None = None,
     max_merge_components: int = 4,
-) -> DecodedPath:
-    """Segment one line with the candidate lattice + visual DP."""
+    soft: np.ndarray | None = None,
+) -> DecodePath:
+    """Segment one line with the candidate lattice + visual DP.
+
+    ``soft`` is the Visual Frontend's soft foreground map; when provided it
+    is passed to the scorer so the TinyCNN scores soft-normalized glyphs
+    while the template path keeps using binary glyphs.
+    """
 
     comps = connected_components(line)
     if not comps:
-        return DecodedPath(candidates=(), mean_score=0.0)
+        return DecodePath(
+            candidates=(),
+            mean_score=0.0,
+            lattice=build_lattice([], [], line),
+        )
     candidates = build_candidates(comps, profile, max_merge_components)
     if not candidates:
-        return DecodedPath(candidates=(), mean_score=0.0)
+        return DecodePath(
+            candidates=(),
+            mean_score=0.0,
+            lattice=build_lattice(comps, [], line),
+        )
 
     segments = [c.segment for c in candidates]
-    scores = scorer.score(segments, allowed_ids)
-    for cand, score in zip(candidates, scores):
+    spec = scorer.normalize_spec
+    if spec is not None:
+        geometries = [
+            glyph_normalize_geometry(cand.segment, spec, profile.target_size)
+            for cand in candidates
+        ]
+    else:
+        geometries = [None] * len(candidates)
+    scores = scorer.score(segments, allowed_ids, soft=soft, geometries=geometries)
+    for cand, score, geom in zip(candidates, scores, geometries):
         cand.score = score
+        cand.scores = score.visual_scores
         cand.geometry = geometry_score(cand, comps, profile)
+        # An exact visual match (template distance 0) is authoritative: the
+        # candidate *is* a real glyph, so merge/split geometry penalties must
+        # not let a fragmented path of weaker look-alikes win the DP.
+        if score.score_type == "template" and score.visual_score >= 1.0 - 1e-9:
+            cand.geometry = 0.0
+        cand.normalize_geometry = geom
     candidates = _drop_weak_merges(candidates, scorer, comps, profile)
     if not candidates:
-        return DecodedPath(candidates=(), mean_score=0.0)
-    return decode(candidates, len(comps))
+        return DecodePath(
+            candidates=(),
+            mean_score=0.0,
+            lattice=build_lattice(comps, [], line),
+        )
+    return decode(build_lattice(comps, candidates, line))
 
 
 def _drop_weak_merges(
     candidates: list[Candidate],
     scorer: SegmentScorer,
-    comps: list[Segment],
+    comps: list[Component],
     profile: Profile,
 ) -> list[Candidate]:
-    """Drop low-confidence multi-component candidates (CNN-only models).
+    """Drop low-confidence multi-atom candidates (CNN-only models).
 
     The pure visual DP can merge adjacent characters when the CNN's margin
     for a combined blob is only slightly better than its margin for each
-    part (e.g. three ``0``s merged into one ``0``). Template/hybrid models
+    part (e.g. three ``0``s merged into one ``0``), or when a split wide
+    component's whole blob scores like one character. Template/hybrid models
     get a confident template score for real glyphs, so they do not need this
     gate. CNN-only models only allow a merge when:
 
     * the merged candidate looks like a real character
       (``cnn_merge_threshold``);
-    * it scores at least as well as every single component inside it; and
-    * the components are in glyph-internal proximity (the old merger's
+    * it scores at least as well as every single atom inside it; and
+    * the atoms are in glyph-internal proximity (the old merger's
       overlap rule), so unrelated characters such as ``1000`` cannot merge.
     """
 
@@ -292,7 +549,8 @@ def _drop_weak_merges(
             )
     out = []
     for cand in candidates:
-        if len(cand.components) > 1 and cand.score is not None:
+        start, end = cand.atom_span
+        if end - start > 1 and cand.score is not None:
             if cand.score.visual_score < threshold:
                 continue
             if not _proximity_merge_ok(cand, comps, profile):

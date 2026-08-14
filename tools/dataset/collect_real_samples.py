@@ -32,9 +32,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from fixedfontocr.defaults import (  # noqa: E402
     compute_font_sha256,
+    read_charset,
     resolve_font,
 )
-from fixedfontocr.preprocess import collect_glyphs, normalize  # noqa: E402
+from fixedfontocr.preprocess import (  # noqa: E402
+    Segment,
+    collect_glyphs,
+    compute_normalize_spec,
+    glyph_normalize_geometry,
+    normalize,
+)
 from fixedfontocr.types import default_profile  # noqa: E402
 
 EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -45,17 +52,24 @@ def collect_directory(
     output: str | Path,
     profile=None,
     font_path: str | Path | None = None,
+    augment: int = 1,
+    seed: int = 0,
 ) -> None:
     from PIL import Image
 
     profile = profile or default_profile()
+    rng = np.random.default_rng(seed)
     root = Path(root)
     if not root.is_dir():
         raise SystemExit(f"not a directory: {root}")
     font_sha256 = None
+    spec = None
     if font_path is not None:
         font_path = resolve_font(font_path)
         font_sha256 = compute_font_sha256(font_path)
+        spec = compute_normalize_spec(
+            font_path, list(read_charset()), profile.target_size, 32
+        )
 
     charset: list[str] = []
     label_id: dict[str, int] = {}
@@ -90,9 +104,29 @@ def collect_directory(
                     skipped += 1
                     continue
                 tight = mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
-                x_list.append(normalize(tight, profile.target_size))
-                y_list.append(label_id[label_chars[0]])
-                origins.append(str(img_path))
+                seg = Segment(
+                    mask=tight,
+                    x=int(xs.min()),
+                    y=int(ys.min()),
+                    w=int(xs.max() - xs.min() + 1),
+                    h=int(ys.max() - ys.min() + 1),
+                )
+                geom = (
+                    glyph_normalize_geometry(seg, spec, profile.target_size)
+                    if spec is not None
+                    else None
+                )
+                base = normalize(
+                    tight,
+                    profile.target_size,
+                    baseline_offset=geom[0] if geom else None,
+                    scale=geom[1] if geom else None,
+                    baseline_row=spec.baseline_row if spec else 18.0,
+                )
+                for _ in range(max(1, augment)):
+                    x_list.append(_augment_glyph(base, rng, profile.target_size))
+                    y_list.append(label_id[label_chars[0]])
+                    origins.append(str(img_path))
                 continue
 
             segments, glyphs = collect_glyphs(arr, profile)
@@ -104,9 +138,22 @@ def collect_directory(
                 skipped += 1
                 continue
             for ch, seg in zip(label_chars, segments):
-                x_list.append(normalize(seg.mask, profile.target_size))
-                y_list.append(label_id[ch])
-                origins.append(f"{img_path}#{ch}")
+                geom = (
+                    glyph_normalize_geometry(seg, spec, profile.target_size)
+                    if spec is not None
+                    else None
+                )
+                base = normalize(
+                    seg.mask,
+                    profile.target_size,
+                    baseline_offset=geom[0] if geom else None,
+                    scale=geom[1] if geom else None,
+                    baseline_row=spec.baseline_row if spec else 18.0,
+                )
+                for _ in range(max(1, augment)):
+                    x_list.append(_augment_glyph(base, rng, profile.target_size))
+                    y_list.append(label_id[ch])
+                    origins.append(f"{img_path}#{ch}")
 
     if not x_list:
         raise SystemExit(f"no samples collected from {root}")
@@ -127,6 +174,27 @@ def collect_directory(
     )
 
 
+def _augment_glyph(
+    glyph: np.ndarray,
+    rng: np.random.Generator,
+    target: int,
+) -> np.ndarray:
+    """Sub-pixel jitter for real-sample augmentation (shift by -1..1 px)."""
+
+    out = glyph
+    dx = int(rng.integers(-1, 2))
+    dy = int(rng.integers(-1, 2))
+    if dx or dy:
+        shifted = np.zeros_like(glyph)
+        y0, y1 = max(0, dy), min(target, target + dy)
+        x0, x1 = max(0, dx), min(target, target + dx)
+        sy0, sy1 = max(0, -dy), min(target, target - dy)
+        sx0, sx1 = max(0, -dx), min(target, target - dx)
+        shifted[y0:y1, x0:x1] = glyph[sy0:sy1, sx0:sx1]
+        out = shifted
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", help="directory of label-named subdirectories")
@@ -137,8 +205,21 @@ def main() -> None:
         default=None,
         help="registered font under fonts/ this UI text comes from",
     )
+    parser.add_argument(
+        "--augment",
+        type=int,
+        default=1,
+        help="emit N shifted variants per collected glyph (default 1)",
+    )
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    collect_directory(args.root, args.output, font_path=args.font)
+    collect_directory(
+        args.root,
+        args.output,
+        font_path=args.font,
+        augment=args.augment,
+        seed=args.seed,
+    )
 
 
 if __name__ == "__main__":

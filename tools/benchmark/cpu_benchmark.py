@@ -44,12 +44,16 @@ from fixedfontocr import defaults  # noqa: E402
 from fixedfontocr.backends import CPUBackend  # noqa: E402
 from fixedfontocr.classifier import TemplateClassifier  # noqa: E402
 from fixedfontocr.fontgen import build_templates, render_glyph  # noqa: E402
+from fixedfontocr.frontend import extract_frontend  # noqa: E402
 from fixedfontocr.model import load_model  # noqa: E402
 from fixedfontocr.reference_cnn import reference_forward  # noqa: E402
 from fixedfontocr.preprocess import (  # noqa: E402
+    Component,
     Segment,
     _connected_components,
+    compute_normalize_spec,
     find_lines,
+    glyph_normalize_geometry,
     normalize,
 )
 from fixedfontocr.scorer import SegmentScorer  # noqa: E402
@@ -82,6 +86,23 @@ def timed_samples(fn, calls: int) -> tuple[float, float]:
         t1 = time.perf_counter_ns()
         samples.append((t1 - t0) / 1e9)
     return median_p95(samples)
+
+
+def _normalize_template_glyph(
+    mask: np.ndarray,
+    spec,
+) -> np.ndarray:
+    """Goal 3 frame: same normalization templates use."""
+    h, w = mask.shape
+    cand = Component(mask=mask, x=0, y=0, w=w, h=h)
+    baseline_offset, scale = glyph_normalize_geometry(cand, spec, 24)
+    return normalize(
+        mask,
+        24,
+        baseline_offset=baseline_offset,
+        scale=scale,
+        baseline_row=spec.baseline_row,
+    )
 
 
 def render_line(
@@ -161,21 +182,23 @@ def bench_ocr_stages(
     profile,
     calls: int,
 ) -> dict[str, dict[str, float]]:
-    mask = profile.color_mask(image)
+    frontend = extract_frontend(image, profile)
+    mask = frontend.binary_mask
     lines = find_lines(mask, profile)
     line = lines[0]
     comps = connected_components(line)
     cands = build_candidates(comps, profile)
     cand_segments = [c.segment for c in cands]
-    glyphs = np.stack([normalize(s.mask, 24) for s in cand_segments])
     scorer: SegmentScorer = ocr._scorer
-    scores = scorer.score(cand_segments)
+    scores = scorer.score(cand_segments, soft=frontend.soft_foreground)
     for cand, score in zip(cands, scores):
         cand.score = score
         cand.geometry = geometry_score(cand, comps, profile)
 
     stages = {
+        "frontend": (lambda: extract_frontend(image, profile), 200),
         "mask": (lambda: profile.color_mask(image), 200),
+        "soft_foreground": (lambda: profile.soft_foreground(image), 200),
         "line_detection": (lambda: find_lines(mask, profile), 200),
         "connected_components": (
             lambda: _connected_components(line.mask),
@@ -189,7 +212,14 @@ def bench_ocr_stages(
             lambda: np.stack([normalize(s.mask, 24) for s in cand_segments]),
             200,
         ),
-        "classifier": (lambda: scorer.score(cand_segments), 50),
+        "normalize_soft": (
+            lambda: frontend.soft_glyph_batch(cand_segments, 24),
+            200,
+        ),
+        "classifier": (
+            lambda: scorer.score(cand_segments, soft=frontend.soft_foreground),
+            50,
+        ),
         "decoder": (lambda: decode(cands, len(comps)), 200),
         "recognize_total": (lambda: ocr.recognize(image), 30),
     }
@@ -231,10 +261,15 @@ def bench_charsets(
         chars, templates = build_templates(
             font_path, charset, render_size=32
         )
-        clf = TemplateClassifier(templates, charset, candidate_filter=False)
+        spec = compute_normalize_spec(font_path, charset, 24, 32)
+        clf = TemplateClassifier(
+            templates, charset, candidate_filter=False, normalize_spec=spec
+        )
         glyph_batch = np.stack(
             [
-                normalize(render_glyph(font_path, ch, 32), 24)
+                _normalize_template_glyph(
+                    render_glyph(font_path, ch, 32), spec
+                )
                 for ch in charset[: min(64, len(charset))]
             ]
         )

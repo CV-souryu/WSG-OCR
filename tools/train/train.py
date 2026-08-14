@@ -33,19 +33,23 @@ from tools.train import tinycnn_arch  # noqa: E402
 
 def load_npz(
     path: str | Path,
-) -> tuple[np.ndarray, np.ndarray, list[str], str | None]:
+) -> tuple[np.ndarray, np.ndarray, list[str], str | None, str]:
     data = np.load(path)
     chars = [str(c) for c in data["chars"]]
     font_sha256 = None
     if "font_sha256" in data.files:
         arr = data["font_sha256"]
         font_sha256 = str(arr.item() if arr.ndim == 0 else arr[0])
-    return data["x"], data["y"], chars, font_sha256
+    input_mode = "binary"
+    if "input_mode" in data.files:
+        arr = data["input_mode"]
+        input_mode = str(arr.item() if arr.ndim == 0 else arr[0])
+    return data["x"], data["y"], chars, font_sha256, input_mode
 
 
 def build_dataset(
     synthetic: str | Path, real: str | Path | None
-) -> tuple[np.ndarray, np.ndarray, list[str], str]:
+) -> tuple[np.ndarray, np.ndarray, list[str], str, str]:
     """Merge synthetic + real npz files into a common charset.
 
     All datasets that record a font must come from the same registered font;
@@ -53,7 +57,9 @@ def build_dataset(
     prove that training used only ``fonts/``.
     """
 
-    datasets: list[tuple[np.ndarray, np.ndarray, list[str], str | None]] = []
+    datasets: list[
+        tuple[np.ndarray, np.ndarray, list[str], str | None, str]
+    ] = []
     syn = load_npz(synthetic)
     if syn[3] is None:
         raise SystemExit(
@@ -64,18 +70,25 @@ def build_dataset(
     if real is not None:
         datasets.append(load_npz(real))
 
-    font_shas = {sha for _, _, _, sha in datasets if sha is not None}
+    font_shas = {sha for _, _, _, sha, _ in datasets if sha is not None}
     if len(font_shas) > 1:
         raise SystemExit(
             "training data mixes multiple fonts; font-family augmentation "
             f"is forbidden (got {sorted(font_shas)})"
         )
 
+    input_modes = {mode for _, _, _, _, mode in datasets}
+    if len(input_modes) > 1:
+        raise SystemExit(
+            "training data mixes binary and soft glyphs; regenerate datasets "
+            f"with one input_mode (got {sorted(input_modes)})"
+        )
+
     charset: list[str] = []
     char_id: dict[str, int] = {}
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
-    for x, y, chars, _ in datasets:
+    for x, y, chars, _, _ in datasets:
         if x.shape[1:] != (24, 24):
             raise SystemExit(f"expected 24x24 glyphs, got {x.shape[1:]}")
         for ch in chars:
@@ -85,7 +98,13 @@ def build_dataset(
         mapping = np.array([char_id[ch] for ch in chars])
         xs.append(x)
         ys.append(mapping[y])
-    return np.concatenate(xs), np.concatenate(ys), charset, datasets[0][3]
+    return (
+        np.concatenate(xs),
+        np.concatenate(ys),
+        charset,
+        datasets[0][3],
+        datasets[0][4],
+    )
 
 
 def main() -> None:
@@ -118,7 +137,9 @@ def main() -> None:
         device_name = args.device
     device = torch.device(device_name)
     print(f"device: {device}")
-    x, y, charset, font_sha256 = build_dataset(args.synthetic, args.real)
+    x, y, charset, font_sha256, input_mode = build_dataset(
+        args.synthetic, args.real
+    )
     n = x.shape[0]
     rng = np.random.default_rng(args.seed)
     perm = rng.permutation(n)
@@ -187,6 +208,7 @@ def main() -> None:
             "input_size": 24,
             "version": 1,
             "font_sha256": font_sha256,
+            "input_mode": input_mode,
         },
         out,
     )

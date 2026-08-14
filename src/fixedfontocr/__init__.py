@@ -21,6 +21,14 @@ from .types import (
     VisualScores,
 )
 from .classifier import TemplateClassifier
+from .decoder import (
+    DecoderConfig,
+    PathScore,
+    decode_beam,
+    decode_dp,
+    decode_lattice,
+    score_path,
+)
 from .frontend import VisualFrontend, extract_frontend
 from .geometry import FontGeometryDatabase
 from .lexicon import (
@@ -55,6 +63,12 @@ __all__ = [
     "VisualScores",
     "DecodePath",
     "LexiconMatch",
+    "DecoderConfig",
+    "PathScore",
+    "decode_dp",
+    "decode_beam",
+    "decode_lattice",
+    "score_path",
     "VisualFrontend",
     "FontGeometryDatabase",
     "Lexicon",

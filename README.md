@@ -14,11 +14,15 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 │   ├── backends.py      # CPUBackend / WGPUBackend / AutoBackend + benchmark
 │   ├── classifier.py    # template matcher V1/V2 (coarse filter + XOR/popcount)
 │   ├── cnn.py           # numpy TinyCNN reference (Conv + ReLU only)
+│   ├── decoder.py       # Goal 13 joint decoder: DP + beam search over the
+│   │                    #   lattice with visual/geometry/lexicon/word-prior
+│   │                    #   evidence, outputting the best path + alternatives
 │   ├── frontend.py      # Goal 2 Visual Frontend: binary mask + soft
 │   │                    #   foreground from one RGB pass
 │   ├── geometry.py      # Goal 8 font geometry database: offline generation
 │   │                    #   + runtime lookup (no fontTools at runtime)
-│   ├── segmentation.py  # candidate lattice + visual DP decoder (P0)
+│   ├── segmentation.py  # candidate lattice + visual DP decoder (P0), feeds
+│   │                    #   the Goal 13 joint decoder when lexicon is used
 │   ├── scorer.py        # unified template/CNN scoring (P4/P6)
 │   ├── defaults.py      # bundled game font / charset / model paths
 │   ├── postprocess.py   # allowed-chars restriction / confidence scoring
@@ -187,6 +191,39 @@ Z17    -> Z17
 See `docs/architecture.md` for the scoring details (unified 0..1 visual
 scores, margin-aware hybrid gate, O(C) Top-2) and the P2 stride-2 CNN
 optimization.
+
+## Joint decoder (Goal 13)
+
+The decoder is the architecture's core: it consumes the scored
+`VisualLattice` (every merge/split candidate with its Top-K visual scores),
+the font `geometry.json` database and an optional lexicon, then picks the
+best path with one unified score:
+
+```text
+total = visual + geometry + lexicon + word_prior - segmentation_penalty
+```
+
+* `visual` is the classifier-only fused score of the chosen character;
+* `geometry` is the Goal 8 font-geometry agreement of the candidate;
+* `lexicon` is the Goal 11/12 dictionary match of the complete visible
+  string, scaled by the path's visual uncertainty so a confident screen
+  glyph is never rewritten by a dictionary substring (Goal 15);
+* `word_prior` is a per-character prior estimated from the lexicon's own
+  terms, gated by each character's visual uncertainty;
+* `segmentation_penalty` is a small per-extra-hypothesis cost that breaks
+  near-ties toward fewer characters, so a glyph (`小`) is not fragmented
+  into several look-alike characters.
+
+`decode_dp` is the first-version exact dynamic program (its state keeps the
+lexicon prefix trie node); `decode_beam` is the beam-search upgrade
+(`beam_width` 8..32, default 16) that supplies `DecodePath.alternatives`.
+The exact DP stays authoritative for the best path so the frozen CPU
+segmentation regressions are never overturned by a fragmented look-alike
+path; the beam's runner-up texts are ranked with the full formula.
+`recognize(..., lexicon=...)` runs the joint decoder and the chosen
+characters (`DecodePath.char_ids`) are authoritative, while `apply_lexicon`
+still handles strict mode and the Goal 12 `matched_term`/`matched_span`
+annotation.
 
 ## Font geometry database (Goal 8)
 
@@ -391,6 +428,9 @@ numpy RGB
        tinycnn:  CPUBackend / WGPUBackend / AutoBackend
        hybrid:   template first, CNN fallback, unknown
   -> allowed_chars restriction (postprocess)
+  -> Goal 13 joint decoder (DP + beam alternatives, lexicon/word-prior
+     evidence, segmentation penalty)
+  -> apply_lexicon (none/prefer/strict annotation, Goal 11/12)
   -> charset -> string
 ```
 
@@ -500,6 +540,17 @@ spacing, and normalized size. Pass a custom profile to
   never fabricated into the full term. `tests/test_goal12_partial_word.py`
   covers matcher conventions, penalty ordering and end-to-end crops
   (`巴尔的摩`, `塞瓦斯托波尔`).
+- Goal 13 joint decoder is implemented: `decoder.py` consumes the visual
+  lattice + Top-K visual scores + font geometry + lexicon and scores every
+  path as `visual + geometry + lexicon + word_prior - segmentation_penalty`.
+  `decode_dp` is the exact first-version DP (lexicon-prefix trie state),
+  `decode_beam` is the beam-search upgrade (`beam_width` 8..32, default 16)
+  that outputs the best path and `alternatives`; the public
+  `recognize(..., lexicon=...)` pipeline uses the decoder, keeps the frozen
+  CPU regressions intact and never lets a dictionary substring override
+  confident visual evidence (Goal 15). `tests/test_goal13_decoder.py` pins
+  the formula, DP/beam behavior, segmentation penalty, lexicon tie-breaking,
+  geometry input and the end-to-end acceptance strings.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per
@@ -509,5 +560,5 @@ spacing, and normalized size. Pass a custom profile to
 - Template coarse features are stored in compact uint8/uint16 arrays
   (8 B/char) and numpy ≥ 2.0 uses `bitwise_count` instead of the 64 KiB
   popcount table; `tools/benchmark/footprint.py` reports storage/memory.
-- Next milestones: shader fusion (fewer dispatches), GPU preprocessing,
-  and real-screenshot collection at scale.
+- Next milestones: Goal 14 regression hardening at scale, real-screenshot
+  collection, shader fusion (fewer dispatches) and GPU preprocessing.

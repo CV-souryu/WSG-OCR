@@ -17,6 +17,7 @@ from .backends import (
 )
 from .classifier import Classifier, TemplateClassifier, TemplateV2Classifier
 from .cnn import forward
+from .decoder import DecoderConfig
 from .frontend import extract_frontend
 from .lexicon import Lexicon, apply_lexicon, is_lexicon_ref, load_lexicon
 from .model import load_model
@@ -259,6 +260,8 @@ class FixedFontOCR:
                 self._scorer,
                 allowed,
                 soft=frontend.soft_foreground,
+                lexicon=lexicon if lexicon_mode != "none" else None,
+                decoder_config=DecoderConfig(),
             )
             if not path.candidates:
                 continue
@@ -313,6 +316,23 @@ class FixedFontOCR:
                     for cand, (char, conf) in zip(path.candidates, pairs)
                 )
             paths.append(path)
+            if path.char_ids:
+                start = len(decoded) - len(path.candidates)
+                for offset, cid in enumerate(path.char_ids):
+                    idx = start + offset
+                    cand, _char, conf = decoded[idx]
+                    if self._candidate_char(cand) == UNKNOWN_CHAR:
+                        # The model's unknown gate (CNN threshold / no
+                        # allowed class) stays authoritative: the decoder
+                        # may not promote a visually-gated-out character.
+                        char = UNKNOWN_CHAR
+                    else:
+                        char = (
+                            self.model.charset[int(cid)]
+                            if 0 <= int(cid) < len(self.model.charset)
+                            else UNKNOWN_CHAR
+                        )
+                    decoded[idx] = (cand, char, conf)
 
         if not decoded:
             return OCRResult(text="", confidence=0.0, chars=(), alternatives=())
@@ -470,8 +490,14 @@ class FixedFontOCR:
         return self.model.charset[int(score.char_id)]
 
     def _alternatives(self, paths: list[DecodePath]) -> tuple[str, ...]:
-        """Single-substitution alternatives from each candidate's Top-K."""
+        """Goal 13 decoder alternatives, with Top-K substitution fallback."""
         out: list[str] = []
+        for path in paths:
+            for alt in path.alternatives:
+                if alt and alt not in out:
+                    out.append(alt)
+            if len(out) >= 8:
+                return tuple(out[:8])
         for path in paths:
             chars = [self._candidate_char(c) for c in path.candidates]
             base = "".join(chars)

@@ -48,6 +48,7 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/geometry.py` | Goal 8 font geometry database: offline generation from a registered font (`advance`, bbox, aspect, ink, component count, baseline) plus the runtime JSON lookup table used by pruning and geometry scoring. |
 | `src/fixedfontocr/lexicon.py` | Goal 11 Lexicon Layer + Goal 12 partial-word support: loads `charsets/words/` by domain, normalizes whitespace, ranks exact/full/partial-word matches (prefix/suffix/inner crops, internal-gap penalty) and applies `none`/`prefer`/`strict` modes to the decoded result. |
 | `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms) and the visual DP decoder. This is the production segmentation path. |
+| `src/fixedfontocr/decoder.py` | Goal 13 joint decoder: exact DP (`decode_dp`, lexicon-prefix trie state) + beam-search upgrade (`decode_beam`, `beam_width` 8..32) scoring `visual + geometry + lexicon + word_prior - segmentation_penalty` and returning the best path + alternatives. |
 | `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate; converts raw scores to a shared 0..1 visual score. |
 | `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier` (V1 single-template) and `TemplateV2Classifier` (Goal 9 multi-prototype): coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; Top-K/best/second/margin + winning-prototype metadata for the lattice. |
 | `src/fixedfontocr/cnn.py` | `TinyCNNClassifier` numpy forward pass (stride-2 optimized), `forward_with_activations` for exported test vectors and `classify_batch(glyphs, top_k=2)`. |
@@ -75,7 +76,9 @@ numpy RGB
        cnn:      soft glyphs when model input_mode="soft", binary otherwise
                  sigmoid(top1-top2 margin) -> shared 0..1 visual score
        hybrid:   template gate first, CNN fallback for ambiguous glyphs
-  -> visual DP (max mean visual score path, Goal 8 geometry penalties)
+  -> Goal 13 joint decoder (DP best path + beam alternatives; local
+     visual/geometry/word-prior/segmentation terms, crop-aware lexicon
+     match gated by visual uncertainty)
   -> allowed_chars restriction (postprocess)
   -> lexicon layer (none / prefer / strict, Goal 11)
   -> charset -> string
@@ -348,6 +351,59 @@ Z17    -> Z17
 
 No `stroke_width = 2` special case is needed.
 
+## Joint decoder (Goal 13)
+
+The decoder is the new architecture's core. Its inputs are the scored
+`VisualLattice` (all merge/split candidates with per-character Top-K
+`VisualScores`), the Goal 8 `FontGeometryDatabase`, and an optional
+`Lexicon`; its output is the best `DecodePath` plus `alternatives`. Every
+path is scored with the Goal 13 formula:
+
+```text
+total = visual + geometry + lexicon + word_prior - segmentation_penalty
+```
+
+* `visual` is the classifier-only fused score of the chosen character
+  (template + CNN before the geometry term), so geometry is never
+  double-counted;
+* `geometry` is the candidate's Goal 8 agreement with the chosen
+  character (bbox/aspect/ink/component/baseline plus the pipeline's
+  merge/split penalties);
+* `lexicon` is the Goal 11/12 match of the complete visible string
+  (exact, term-in-text, prefix/suffix/inner crop, gap crop) scaled by
+  `1 - mean(visual)` -- the Goal 15 gate that stops a dictionary substring
+  such as "Z3" inside "ABCXYZ999" from overriding a confident pick;
+* `word_prior` is a per-character unigram support estimated from the
+  lexicon's terms, gated by each character's visual uncertainty;
+* `segmentation_penalty` is a small per-extra-hypothesis cost (default
+  0.005) that only breaks near-ties toward fewer characters. It is
+  deliberately tiny: a genuine multi-character line must never be
+  penalized for its length, and the substantive merge/split costs live in
+  the geometry score.
+
+`decode_dp` is the first-version exact dynamic program. Its DP state is
+`(atom_end, lexicon_trie_node)`, so the current lexicon prefix participates
+in the path while candidate terms are being explored (exact term
+completions and lexicon prefixes receive a small look-ahead bonus). The
+returned path is re-scored with the complete formula, including crop-aware
+lexicon matches.
+
+`decode_beam` is the beam-search upgrade (`beam_width` 8..32, default 16).
+The exact DP stays authoritative for the best path -- ranking complete
+paths by their whole-path mean would let a glyph split into several
+high-scoring look-alike fragments (e.g. the CNN-only `获得金币1000` fixture
+splitting `得` into two `得` pieces) overturn the frozen CPU reference. The
+beam explores complete-path hypotheses and returns the runner-up texts as
+`DecodePath.alternatives`, ranked with the full Goal 13 formula.
+
+The public pipeline passes the lexicon into `segment_line`, which runs the
+joint decoder, and the decoder's chosen characters (`DecodePath.char_ids`)
+are authoritative in `OCRResult`. The model's unknown gate (CNN threshold /
+empty allowed set) still wins, `apply_lexicon` keeps handling strict mode
+and `matched_term`/`matched_span` annotation, and `tests/test_goal13_decoder.py`
+pins the formula, DP/beam agreement, segmentation penalty, lexicon
+tie-breaking, geometry input and the Goal 4/7/11/12 end-to-end regressions.
+
 ## Unified scoring and Top-K
 
 Template confidence is in `[0,1]` while the CNN reports unbounded logits;
@@ -615,6 +671,7 @@ verified:
 | Goal 7 low-res training domain | `tests/test_goal7_low_res.py` (10..18 px coverage, supersampled bilinear/area-like downsample, sub-pixel/scale/blur/alpha/brightness/background/outline augmentation, Z17/巴尔的摩) |
 | Goal 8 font geometry database | `tests/test_goal8_geometry.py` (per-char advance/bbox/aspect/ink/component/baseline, JSON round-trip + model embedding, narrow vs. full-width priors, geometry score and pruning) |
 | Goal 9 Template V2 | `tests/test_goal9_template_v2.py` (11..16 px × sub-pixel × downsample grid, V1/V2 round-trip, prefilter Top-K exactness, low-res confusables 未/末 & Z/2, exact low-res tie routing to CNN, bundled models in V2 format) |
+| Goal 13 joint decoder | `src/fixedfontocr/decoder.py` + `tests/test_goal13_decoder.py` (DP + beam search, `visual + geometry + lexicon + word_prior - segmentation_penalty`, alternatives, Goal 15 visual-uncertainty gate, end-to-end `鲃`/`小`/`潜甲`/`潜乙`/`巴尔的摩`/`Z17` with lexicon) |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
 | Real game regression passes | `tests/test_game_samples.py` (23 samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |

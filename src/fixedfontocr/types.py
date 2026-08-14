@@ -229,6 +229,11 @@ class DecodePath:
     text: str = ""
     confidence: float = 0.0
     alternatives: tuple[str, ...] = field(default_factory=tuple)
+    # Goal 13: the charset id chosen for every candidate (``-1`` = unknown).
+    # This is what makes the decoder authoritative -- a lexicon-aware path
+    # may pick the second-ranked character of a candidate, and the caller
+    # must not silently fall back to Top-1.
+    char_ids: tuple[int, ...] = field(default_factory=tuple)
     lattice: VisualLattice | None = None
 
 

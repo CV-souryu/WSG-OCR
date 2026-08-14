@@ -25,7 +25,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .decoder import DecoderConfig, decode_beam
 from .geometry import FontGeometryDatabase
+from .lexicon import Lexicon, load_lexicon
 from .preprocess import (
     Segment,
     _bbox_segment,
@@ -600,12 +602,21 @@ def segment_line(
     allowed_ids: set[int] | None = None,
     max_merge_components: int = 4,
     soft: np.ndarray | None = None,
+    lexicon: Lexicon | str | None = None,
+    decoder_config: DecoderConfig | None = None,
 ) -> DecodePath:
-    """Segment one line with the candidate lattice + visual DP.
+    """Segment one line with the candidate lattice + joint decoder.
 
     ``soft`` is the Visual Frontend's soft foreground map; when provided it
     is passed to the scorer so the TinyCNN scores soft-normalized glyphs
     while the template path keeps using binary glyphs.
+
+    Goal 13: when ``lexicon`` or ``decoder_config`` is provided the line is
+    decoded with the joint decoder (beam search by default) over the scored
+    lattice, so lexicon/word-prior evidence and the segmentation penalty
+    participate in the path choice and ``DecodePath.alternatives`` is
+    populated. Without either argument the legacy visual DP
+    (:func:`decode`) is kept for callers that only score segmentation.
     """
 
     comps = connected_components(line)
@@ -691,7 +702,24 @@ def segment_line(
             mean_score=0.0,
             lattice=build_lattice(comps, [], line),
         )
-    return decode(build_lattice(comps, candidates, line))
+    lattice = build_lattice(comps, candidates, line)
+    if lexicon is not None or decoder_config is not None:
+        lex = (
+            lexicon
+            if isinstance(lexicon, Lexicon)
+            else load_lexicon(lexicon)
+            if lexicon is not None
+            else None
+        )
+        cfg = decoder_config or DecoderConfig()
+        return decode_beam(
+            lattice,
+            scorer.model.charset,
+            lex,
+            cfg,
+            geometry=getattr(scorer, "geometry", None),
+        )
+    return decode(lattice)
 
 
 def _drop_weak_merges(

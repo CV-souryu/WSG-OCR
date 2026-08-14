@@ -615,6 +615,30 @@ def segment_line(
             mean_score=0.0,
             lattice=build_lattice([], [], line),
         )
+    if allowed_ids is not None and not allowed_ids:
+        # No character is allowed: every connected component is an unknown
+        # glyph. Returning one candidate per component keeps the public
+        # result length aligned with the visible glyph count instead of
+        # letting the zero-score DP merge adjacent unknowns into one "?".
+        candidates = [
+            Candidate(
+                segment=comp,
+                start=i,
+                end=i + 1,
+                components=(i,),
+                atoms=(i, i + 1),
+            )
+            for i, comp in enumerate(comps)
+        ]
+        unknown = SegmentScore(
+            char_id=-1,
+            visual_score=0.0,
+            raw_score=0.0,
+            score_type="template",
+        )
+        for cand in candidates:
+            cand.score = unknown
+        return decode(build_lattice(comps, candidates, line))
     candidates = build_candidates(
         comps,
         profile,
@@ -638,22 +662,27 @@ def segment_line(
     else:
         geometries = [None] * len(candidates)
     scores = scorer.score(segments, allowed_ids, soft=soft, geometries=geometries)
-    for cand, score, geom in zip(candidates, scores, geometries):
-        cand.score = score
-        cand.scores = score.visual_scores
-        cand.geometry = geometry_score(
+    for cand, raw_score, geom in zip(candidates, scores, geometries):
+        geometry = geometry_score(
             cand,
             comps,
             profile,
             geometry=getattr(scorer, "geometry", None),
-            char_id=score.char_id,
+            char_id=raw_score.char_id,
             normalize_geometry=geom,
         )
         # An exact visual match (template distance 0) is authoritative: the
         # candidate *is* a real glyph, so merge/split geometry penalties must
         # not let a fragmented path of weaker look-alikes win the DP.
-        if score.score_type == "template" and score.visual_score >= 1.0 - 1e-9:
-            cand.geometry = 0.0
+        if (
+            raw_score.score_type == "template"
+            and raw_score.template_raw_score >= 1.0 - 1e-9
+        ):
+            geometry = 0.0
+        score = scorer.finalize_score(raw_score, geometry)
+        cand.score = score
+        cand.scores = score.visual_scores
+        cand.geometry = geometry
         cand.normalize_geometry = geom
     candidates = _drop_weak_merges(candidates, scorer, comps, profile)
     if not candidates:
@@ -695,13 +724,19 @@ def _drop_weak_merges(
         if len(cand.components) == 1 and cand.score is not None:
             i = cand.components[0]
             single_visual[i] = max(
-                single_visual.get(i, -1.0), cand.score.visual_score
+                single_visual.get(i, -1.0),
+                getattr(
+                    cand.score, "classifier_visual_score", cand.score.visual_score
+                ),
             )
     out = []
     for cand in candidates:
         start, end = cand.atom_span
         if end - start > 1 and cand.score is not None:
-            if cand.score.visual_score < threshold:
+            visual = getattr(
+                cand.score, "classifier_visual_score", cand.score.visual_score
+            )
+            if visual < threshold:
                 continue
             if not _proximity_merge_ok(cand, comps, profile):
                 continue
@@ -709,7 +744,7 @@ def _drop_weak_merges(
                 single_visual.get(i, threshold)
                 for i in range(cand.components[0], cand.components[-1] + 1)
             ]
-            if any(p > cand.score.visual_score + 0.02 for p in parts):
+            if any(p > visual + 0.02 for p in parts):
                 continue
         out.append(cand)
     return out

@@ -402,6 +402,8 @@ def write_hybrid_model(
     template_threshold: float = 0.90,
     template_margin_threshold: float = 0.04,
     cnn_threshold: float = 0.0,
+    visual_weights: dict[str, float] | None = None,
+    visual_calibration: list[list[float]] | None = None,
     font_path: str | Path | None = None,
     font_sha256: str | None = None,
     input_mode: str = "binary",
@@ -442,6 +444,9 @@ def write_hybrid_model(
         "template_margin_threshold": float(template_margin_threshold),
         "cnn_threshold": float(cnn_threshold),
         "input_mode": input_mode,
+        "visual_weights": visual_weights
+        or {"cnn": 0.45, "template": 0.45, "geometry": 0.10},
+        "visual_calibration": visual_calibration or [],
     }
     if templates_v2 is not None:
         config["template_version"] = 2

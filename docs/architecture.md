@@ -348,27 +348,43 @@ No `stroke_width = 2` special case is needed.
 
 ## Unified scoring and Top-K
 
-Template confidence is in `[0,1]` while the CNN reports an unbounded logit
-margin; the two units are never averaged directly. `SegmentScorer` converts
-every candidate to a `CandidateScore(visual_score, raw_score, score_type)`:
+Template confidence is in `[0,1]` while the CNN reports unbounded logits;
+the two units are never averaged directly. Since Goal 10 every hybrid
+candidate keeps the raw evidence separately and the decoder consumes one
+weighted value:
 
-- template: `visual = confidence` (0..1) when `confidence >= template_threshold`
-  AND (the match is exact — `confidence == 1.0` — OR the normalized
-  top-1/top-2 distance margin is `>= template_margin_threshold`). Exact
-  matches are always trusted because small punctuation glyphs can be
-  pixel-perfect yet have a tiny normalized margin;
-- CNN: `visual = sigmoid(top1 - top2)` — the binary softmax probability that
-  the top-1 class beats the top-2 class.
+```text
+visual_score = a * cnn_score + b * template_score + c * geometry_score
+```
 
-The public `CharResult.confidence` is always mapped to 0..1 as well
-(template confidence stays as-is; CNN margins go through the same sigmoid).
-The CNN classifier API returns `ClassificationBatch(ids, top1, top2,
-margins)` from `classify_batch(glyphs, top_k=2)`, so segmentation and a
-future dictionary decoder get the raw top-2 information instead of a single
-`char + confidence`. `TemplateBatch` now also carries `second_ids`, and both
-classifier paths can be projected into `VisualScores(char_ids, logits,
-top_k, margin, raw_score, score_type)`. Top-2 uses `argmax` + a single
-`argpartition`, i.e. O(C) per glyph rather than a full `argsort`.
+* `template_raw_score` is the template's 0..1 confidence for the chosen
+  character;
+* `cnn_logit` is the raw top-class logit and `cnn_margin` the chosen
+  character's logit margin (relative to the runner-up), normalized through
+  the same sigmoid into `cnn_score`;
+* `geometry_score` is the Goal 8 geometry penalty computed by the
+  segmentation layer;
+* `visual_score` is clipped to `[0,1]` and used by the visual DP.
+
+The weights (`visual_weights`) and a monotone piecewise-linear calibration
+(`visual_calibration`) are stored in `config.json`; the bundled model is
+tuned on the real-screenshot set and `tools/train/tune_visual.py` re-fits
+both from any `collect_real_samples.py` npz (the tuner uses
+`SegmentScorer.score_fused`, the pure weighted fusion without the
+compatibility trust gate). The public
+`CharResult.confidence` is the calibrated value, always in `[0,1]`.
+
+The compatibility trust gate from P6 is still used for *labelling* the
+dominant source (`score_type`): a template match above
+`template_threshold` with a non-trivial top-1/top-2 margin (or an exact
+match) keeps the template character and can only be boosted by the CNN;
+otherwise the CNN evidence chooses the character. Either way
+`VisualScores` stores both classifiers' raw quantities, so no decision is
+collapsed into a single scale before the decoder.
+
+`ClassificationBatch` carries Top-K ids/logits plus the full logit matrix
+for fusion, and Top-2/Top-K use `argmax` + `argpartition` (O(C) per glyph)
+rather than a full `argsort`.
 
 ## Goal 1 data structures
 

@@ -120,6 +120,14 @@ def main() -> None:
         "template match is trusted (P6 margin-aware hybrid gate)",
     )
     parser.add_argument("--cnn-threshold", type=float, default=0.0)
+    parser.add_argument("--visual-cnn-weight", type=float, default=0.45)
+    parser.add_argument("--visual-template-weight", type=float, default=0.45)
+    parser.add_argument("--visual-geometry-weight", type=float, default=0.10)
+    parser.add_argument(
+        "--visual-calibration",
+        help="JSON list of [visual_score, confidence] points, e.g. "
+        '"[[0.0,0.0],[0.7,0.6],[1.0,1.0]]"',
+    )
     parser.add_argument("--samples", help="npz whose x samples become test vectors")
     parser.add_argument("--num-test-samples", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
@@ -172,6 +180,14 @@ def main() -> None:
             template_threshold=args.template_threshold,
             template_margin_threshold=args.template_margin_threshold,
             cnn_threshold=args.cnn_threshold,
+            visual_weights={
+                "cnn": args.visual_cnn_weight,
+                "template": args.visual_template_weight,
+                "geometry": args.visual_geometry_weight,
+            },
+            visual_calibration=json.loads(args.visual_calibration)
+            if args.visual_calibration
+            else None,
             font_sha256=font_sha256,
             input_mode=input_mode,
             normalize_spec=normalize_spec,

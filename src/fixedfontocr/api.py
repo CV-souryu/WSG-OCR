@@ -22,7 +22,7 @@ from .model import load_model
 from .postprocess import allowed_ids as build_allowed_ids
 from .postprocess import pick
 from .preprocess import find_lines, normalize
-from .scorer import SegmentScorer, to_confidence
+from .scorer import SegmentScorer, calibrate_visual, to_confidence
 from .segmentation import segment_line
 from .types import (
     CharResult,
@@ -220,7 +220,10 @@ class FixedFontOCR:
                             (
                                 cand,
                                 self.model.charset[cid],
-                                to_confidence(float(tb.scores[i]), "template"),
+                                calibrate_visual(
+                                    to_confidence(float(tb.scores[i]), "template"),
+                                    self._scorer.calibration,
+                                ),
                             )
                         )
             else:
@@ -242,6 +245,7 @@ class FixedFontOCR:
                         allowed,
                         soft=cnn_soft,
                         geometries=geometries,
+                        geometry_scores=[c.geometry for c in path.candidates],
                     )
                 else:
                     result = self._backend.classify(glyphs)
@@ -332,7 +336,10 @@ class FixedFontOCR:
             if allowed is None or int(char_id) in allowed:
                 pairs[i] = (
                     self.model.charset[int(char_id)],
-                    to_confidence(float(score), "cnn"),
+                    calibrate_visual(
+                        to_confidence(float(score), "cnn"),
+                        self._scorer.calibration,
+                    ),
                 )
             else:
                 remask.append(i)
@@ -342,7 +349,13 @@ class FixedFontOCR:
             logits = forward(x, self.model.weights)
             for k, i in enumerate(remask):
                 char, conf = pick(logits[k], self.model.charset, allowed)
-                pairs[i] = (char, to_confidence(conf, "cnn"))
+                pairs[i] = (
+                    char,
+                    calibrate_visual(
+                        to_confidence(conf, "cnn"),
+                        self._scorer.calibration,
+                    ),
+                )
         return [p for p in pairs if p is not None]
 
     def _classify_hybrid(
@@ -352,6 +365,7 @@ class FixedFontOCR:
         allowed: set[int] | None,
         soft: NDArray[np.uint8] | None = None,
         geometries: list[tuple[float, float] | None] | None = None,
+        geometry_scores: list[float] | None = None,
     ) -> list[tuple[str, float]]:
         """Three-level strategy: template (margin-gated) -> CNN -> unknown."""
         if not candidates:
@@ -362,6 +376,11 @@ class FixedFontOCR:
             soft=soft,
             geometries=geometries,
         )
+        if geometry_scores is not None:
+            scores = [
+                self._scorer.finalize_score(score, geometry_scores[i])
+                for i, score in enumerate(scores)
+            ]
         pairs: list[tuple[str, float]] = []
         for score in scores:
             if score.char_id < 0:
@@ -369,10 +388,10 @@ class FixedFontOCR:
                 conf = 0.0
             elif score.score_type == "cnn" and score.raw_score < self._cnn_threshold:
                 char = UNKNOWN_CHAR  # Level 3: unknown
-                conf = score.visual_score
+                conf = score.public_confidence
             else:
                 char = self.model.charset[int(score.char_id)]
-                conf = score.visual_score
+                conf = score.public_confidence
             pairs.append((char, conf))
         return pairs
 

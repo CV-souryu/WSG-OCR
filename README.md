@@ -471,6 +471,15 @@ spacing, and normalized size. Pass a custom profile to
   V2 format, and `tests/test_goal9_template_v2.py` covers the grid,
   round-trip, prefilter exactness, low-res confusables (未/末, Z/2) and the
   '.'/ '*' low-res tie routing to the CNN.
+- Goal 10 unified visual scoring is implemented: hybrid candidates keep
+  `template_raw_score`, `cnn_logit`, `cnn_margin` and `geometry_score`
+  separately, and the decoder consumes one weighted
+  `visual_score = a*cnn_score + b*template_score + c*geometry_score`
+  (weights + calibration live in `config.json`). The bundled hybrid model
+  is tuned on `data/cn/real_game.npz`, public confidence is calibrated into
+  `[0, 1]`, and `tools/train/tune_visual.py` re-fits the weights on any
+  real-screenshot npz. `tests/test_goal10_unified_scoring.py` pins the
+  evidence fields, formula, geometry integration and calibration.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

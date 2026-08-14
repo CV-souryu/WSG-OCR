@@ -85,7 +85,10 @@ class VisualScores:
     competing glyphs and their raw scores so it can let the lexicon or a
     segmentation hypothesis override a marginally-better classifier pick.
     ``char_ids``/``logits`` are the ranked Top-K lists and ``top_k`` mirrors
-    ``char_ids`` for callers that prefer that name.
+    ``char_ids`` for callers that prefer that name. Since Goal 10 the object
+    also keeps the unified evidence for the chosen character: the raw
+    template score (0..1), the raw CNN logit and margin, the geometry
+    penalty, and the weighted ``visual_score`` used by the decoder.
     """
 
     char_ids: tuple[int, ...] = ()
@@ -94,6 +97,22 @@ class VisualScores:
     margin: float = 0.0
     raw_score: float = 0.0
     score_type: str = ""
+    # Goal 10 unified visual evidence. ``logits`` for the unified scorer are
+    # the combined top-K values; the raw classifier quantities are kept in
+    # these fields so no scale is ever collapsed into a single number.
+    template_raw_score: float = 0.0
+    cnn_logit: float = 0.0
+    cnn_margin: float = 0.0
+    cnn_score: float = 0.0
+    geometry_score: float = 0.0
+    visual_score: float = 0.0
+    confidence: float = 0.0
+    geometry_included: bool = False
+
+    @property
+    def template_score(self) -> float:
+        """Alias for the raw template confidence in [0, 1]."""
+        return self.template_raw_score
 
     def __post_init__(self) -> None:
         if not self.top_k:
@@ -144,11 +163,24 @@ class VisualCandidate:
 
     @property
     def total_score(self) -> float:
-        """Unified candidate score used by the visual DP."""
+        """Unified candidate score used by the visual DP.
+
+        The scorer stores the final weighted visual score (including the
+        geometry term) directly on ``score.visual_score`` for candidates it
+        produced, so the DP must not add ``geometry_score`` a second time.
+        Manually-constructed legacy scores (without ``geometry_included``)
+        keep the old ``visual + geometry`` behaviour.
+        """
         if self.score is not None:
             visual = float(getattr(self.score, "visual_score", self.score))
+            if getattr(self.score, "geometry_included", False):
+                return visual
             return visual + self.geometry_score
         if self.scores is not None:
+            if self.scores.geometry_included:
+                return self.scores.visual_score
+            if self.scores.visual_score:
+                return self.scores.visual_score + self.geometry_score
             return self.scores.margin + self.geometry_score
         return self.geometry_score
 
@@ -257,6 +289,7 @@ class ClassificationBatch:
     second_ids: np.ndarray | None = None  # int32 [N]
     topk_ids: np.ndarray | None = None  # int32 [N, k]
     topk_logits: np.ndarray | None = None  # f32 [N, k]
+    logits: np.ndarray | None = None  # f32 [N, C] full logits (Goal 10)
 
 
 @dataclass(frozen=True)
@@ -266,13 +299,19 @@ class CandidateScore:
     ``visual_score`` lives on a shared 0..1 scale and is what the
     segmentation DP compares across candidates. ``raw_score`` keeps the
     classifier-specific quantity (template Hamming distance or CNN logit
-    margin) and ``score_type`` names the source, so two different units are
-    never averaged directly.
+    margin), ``score_type`` names the dominant source, and the Goal 10
+    fields keep the template/CNN/geometry evidence that produced the
+    weighted ``visual_score``.
     """
 
     visual_score: float
     raw_score: float
     score_type: str
+    template_raw_score: float = 0.0
+    cnn_logit: float = 0.0
+    cnn_margin: float = 0.0
+    cnn_score: float = 0.0
+    geometry_score: float = 0.0
 
 
 @dataclass(frozen=True)

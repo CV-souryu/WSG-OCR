@@ -25,6 +25,12 @@ from .frontend import VisualFrontend, extract_frontend
 from .geometry import FontGeometryDatabase
 from .model import write_hybrid_model
 from .postprocess import pick
+from .scorer import (
+    VisualCalibration,
+    VisualWeights,
+    calibrate_visual,
+    unified_visual_score,
+)
 
 __all__ = [
     "FixedFontOCR",
@@ -49,6 +55,10 @@ __all__ = [
     "benchmark_backends",
     "pick",
     "write_hybrid_model",
+    "VisualWeights",
+    "VisualCalibration",
+    "unified_visual_score",
+    "calibrate_visual",
 ]
 
 __version__ = "0.1.0"

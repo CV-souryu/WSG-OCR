@@ -57,6 +57,13 @@ def main() -> None:
         action="store_true",
         help="reuse an existing synthetic npz instead of regenerating it",
     )
+    parser.add_argument(
+        "--tune-samples",
+        type=Path,
+        default=None,
+        help="real-screenshot npz used to tune Goal 10 visual weights and "
+        "calibration after export",
+    )
     args = parser.parse_args()
 
     font = defaults.resolve_font(args.font)
@@ -132,6 +139,18 @@ def main() -> None:
             "--skip-test-vectors",
         ]
     )
+
+    if args.tune_samples:
+        run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "train" / "tune_visual.py"),
+                "--samples",
+                str(args.tune_samples),
+                "--model",
+                str(args.output),
+            ]
+        )
 
     print(f"\nhybrid recognizer ready: {args.output}")
 

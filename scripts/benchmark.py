@@ -10,6 +10,8 @@ Measures, on this machine:
    plus the vectorization gain of the batched TinyCNN numpy forward.
 4. End-to-end ``recognize()`` on rendered text lines, with a
    segmentation-vs-classification breakdown.
+5. TinyCNN CPU vs WGPU classify() latency/throughput, and end-to-end
+   ``recognize()`` with ``backend="wgpu"`` (skips if no GPU adapter).
 
 Results are medians of several timed runs and are only meaningful relative
 to each other on this machine.
@@ -34,6 +36,8 @@ import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 from fixedfontocr import FixedFontOCR  # noqa: E402
+from fixedfontocr import defaults  # noqa: E402
+from fixedfontocr.backends import CPUBackend, WGPUBackend  # noqa: E402
 from fixedfontocr.classifier import TemplateClassifier  # noqa: E402
 from fixedfontocr.cnn import TinyCNNClassifier, forward  # noqa: E402
 from fixedfontocr.fontgen import build_templates, write_model  # noqa: E402
@@ -41,8 +45,7 @@ from fixedfontocr.model import load_model  # noqa: E402
 from fixedfontocr.preprocess import normalize, preprocess  # noqa: E402
 from fixedfontocr.types import default_profile  # noqa: E402
 
-ARIAL = "/System/Library/Fonts/Supplemental/Arial.ttf"
-STHEITI = "/System/Library/Fonts/STHeiti Medium.ttc"
+BUNDLED_FONT = defaults.resolve_font(defaults.FONT_PATH)
 
 ASCII_CHARSET = (
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -50,14 +53,16 @@ ASCII_CHARSET = (
 )
 CJK_CHARSET = "获得金币消耗数量提示确定取消返回攻击防御生命法力0123456789+-×÷%.,:;!?()[]{}「」"
 E2E_LINES = [
-    ("template-ascii", ARIAL, "HELLO WORLD 1234567890"),
-    ("template-cjk", STHEITI, "获得金币1000 数量提示"),
-    ("tinycnn-digits", ARIAL, "1234567890 4242"),
-    ("tinycnn-cjk", STHEITI, "获得金币1000"),
+    ("template-ascii", BUNDLED_FONT, "HELLO WORLD 1234567890"),
+    ("template-cjk", BUNDLED_FONT, "获得金币1000 数量提示"),
+    ("tinycnn-digits", BUNDLED_FONT, "1234567890 4242"),
+    ("tinycnn-cjk", BUNDLED_FONT, "获得金币1000"),
+    ("tinycnn-game-cn", BUNDLED_FONT, "俾斯麦提尔比茨大型单装炮"),
 ]
 FIXTURES = {
-    "tinycnn-digits": ("tests/fixtures/cnn_digits", ARIAL),
-    "tinycnn-cjk": ("tests/fixtures/cnn_cjk", STHEITI),
+    "tinycnn-digits": ("tests/fixtures/cnn_digits", BUNDLED_FONT),
+    "tinycnn-cjk": ("tests/fixtures/cnn_cjk", BUNDLED_FONT),
+    "tinycnn-game-cn": (str(defaults.MODEL_PATH), BUNDLED_FONT),
 }
 
 
@@ -67,7 +72,7 @@ FIXTURES = {
 
 
 def render_text(
-    text: str, font_path: Path | str, font_size: int = 28
+    text: str, font_path: Path | str, font_size: int = 32
 ) -> np.ndarray:
     """Render text on black; return an RGB uint8 array."""
     font = ImageFont.truetype(str(font_path), font_size)
@@ -144,11 +149,16 @@ def bench_model_load(repeat: int) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         for name, font, charset in (
-            ("template ascii", ARIAL, ASCII_CHARSET),
-            ("template cjk", STHEITI, CJK_CHARSET),
+            ("template ascii", BUNDLED_FONT, ASCII_CHARSET),
+            ("template cjk", BUNDLED_FONT, CJK_CHARSET),
         ):
-            chars, templates = build_templates(font, list(charset), render_size=28)
-            write_model(tmp / name.replace(" ", "_"), chars, templates)
+            chars, templates = build_templates(font, list(charset), render_size=32)
+            write_model(
+                tmp / name.replace(" ", "_"),
+                chars,
+                templates,
+                font_path=BUNDLED_FONT,
+            )
             t = median_time(
                 lambda p=tmp / name.replace(" ", "_"): load_model(p), repeat, 5
             )
@@ -164,14 +174,14 @@ def bench_engine_construction(repeat: int) -> None:
     print("\n== engine construction (FixedFontOCR(...)) ==")
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        chars, templates = build_templates(ARIAL, list(ASCII_CHARSET))
-        write_model(tmp / "ascii", chars, templates)
+        chars, templates = build_templates(BUNDLED_FONT, list(ASCII_CHARSET), render_size=32)
+        write_model(tmp / "ascii", chars, templates, font_path=BUNDLED_FONT)
         t = median_time(
             lambda: FixedFontOCR(model_path=tmp / "ascii", backend="cpu"), repeat, 5
         )
         print(f"  template ({len(chars):3d} classes)          {t * 1e3:7.2f} ms")
-        chars, templates = build_templates(STHEITI, list(CJK_CHARSET))
-        write_model(tmp / "cjk", chars, templates)
+        chars, templates = build_templates(BUNDLED_FONT, list(CJK_CHARSET), render_size=32)
+        write_model(tmp / "cjk", chars, templates, font_path=BUNDLED_FONT)
         t = median_time(
             lambda: FixedFontOCR(model_path=tmp / "cjk", backend="cpu"), repeat, 5
         )
@@ -201,10 +211,10 @@ def bench_classifiers(repeat: int, iters: int) -> None:
 
     # Template baseline: ASCII and CJK charsets.
     for name, font, charset in (
-        ("template ascii", ARIAL, ASCII_CHARSET),
-        ("template cjk", STHEITI, CJK_CHARSET),
+        ("template ascii", BUNDLED_FONT, ASCII_CHARSET),
+        ("template cjk", BUNDLED_FONT, CJK_CHARSET),
     ):
-        chars, templates = build_templates(font, list(charset), render_size=28)
+        chars, templates = build_templates(font, list(charset), render_size=32)
         clf = TemplateClassifier(templates, chars)
         masks = [glyph_mask(font, c) for c in chars]
         t = median_time(cycle(clf, masks), repeat, iters)
@@ -225,7 +235,7 @@ def bench_classifiers(repeat: int, iters: int) -> None:
     print(f"  {'batch':>8s} {'latency':>12s} {'throughput':>12s} {'gain vs N=1':>12s}")
     model = load_model(Path(FIXTURES["tinycnn-digits"][0]))
     glyphs = [
-        normalize(glyph_mask(ARIAL, c), 24).astype(np.float32) / 255.0
+        normalize(glyph_mask(BUNDLED_FONT, c), 24).astype(np.float32) / 255.0
         for c in model.charset
     ]
     x1 = np.stack([glyphs[0]])[:, None]
@@ -252,12 +262,17 @@ def bench_end_to_end(repeat: int, iters: int) -> None:
         # Template models (ascii + cjk), keyed by scenario name.
         model_dirs: dict[str, Path] = {}
         for scenario, font, charset in (
-            ("template-ascii", ARIAL, ASCII_CHARSET),
-            ("template-cjk", STHEITI, CJK_CHARSET),
+            ("template-ascii", BUNDLED_FONT, ASCII_CHARSET),
+            ("template-cjk", BUNDLED_FONT, CJK_CHARSET),
         ):
-            chars, templates = build_templates(font, list(charset), render_size=28)
+            chars, templates = build_templates(font, list(charset), render_size=32)
             model_dirs[scenario] = tmp / scenario
-            write_model(model_dirs[scenario], chars, templates)
+            write_model(
+                model_dirs[scenario],
+                chars,
+                templates,
+                font_path=BUNDLED_FONT,
+            )
 
         for scenario, font, text in E2E_LINES:
             if scenario.startswith("tinycnn"):
@@ -283,6 +298,64 @@ def bench_end_to_end(repeat: int, iters: int) -> None:
             )
 
 
+def bench_wgpu_backends(repeat: int, iters: int) -> None:
+    """Compare the numpy and WGPU TinyCNN backends (batched classify)."""
+    print("\n== TinyCNN backend: CPU vs WGPU (classify) ==")
+    model = load_model(Path(FIXTURES["tinycnn-digits"][0]))
+    cpu = CPUBackend(model.weights, model.input_size)
+    try:
+        gpu = WGPUBackend(model.weights, model.input_size)
+    except Exception as exc:
+        print(f"  WGPU unavailable: {exc}")
+        return
+    glyphs = [
+        normalize(glyph_mask(BUNDLED_FONT, c), model.input_size)
+        for c in model.charset
+    ]
+    print(
+        f"  {'batch':>8s} {'cpu latency':>12s} {'gpu latency':>12s} "
+        f"{'cpu rate':>12s} {'gpu rate':>12s} {'speedup':>8s}"
+    )
+    for batch in (1, 8, 16, 64, 256):
+        g = np.stack([glyphs[i % len(glyphs)] for i in range(batch)])
+        tc = median_time(lambda: cpu.classify(g), repeat, max(1, iters // 4))
+        tg = median_time(lambda: gpu.classify(g), repeat, max(1, iters // 4))
+        print(
+            f"  {batch:>8d} {fmt_us(tc):>12s} {fmt_us(tg):>12s} "
+            f"{fmt_rate(batch / tc):>12s} {fmt_rate(batch / tg):>12s} "
+            f"{tc / tg:>7.1f}x"
+        )
+
+
+def bench_wgpu_end_to_end(repeat: int, iters: int) -> None:
+    """End-to-end recognize() with backend='cpu' vs backend='wgpu'."""
+    print("\n== end-to-end recognize(): cpu vs wgpu ==")
+    print(
+        f"  {'scenario':20s} {'cpu latency':>12s} {'gpu latency':>12s} "
+        f"{'cpu rate':>12s} {'gpu rate':>12s} {'speedup':>8s}"
+    )
+    for scenario, font, text in E2E_LINES:
+        if not scenario.startswith("tinycnn"):
+            continue
+        model_dir, font = FIXTURES[scenario]
+        ocr_cpu = FixedFontOCR(model_path=model_dir, backend="cpu")
+        try:
+            ocr_gpu = FixedFontOCR(model_path=model_dir, backend="wgpu")
+        except Exception as exc:
+            print(f"  {scenario:20s} WGPU unavailable: {exc}")
+            continue
+        image = render_text(text, font)
+        result = ocr_cpu.recognize(image)
+        n_chars = len(result.text)
+        t_cpu = median_time(lambda: ocr_cpu.recognize(image), repeat, max(1, iters // 2))
+        t_gpu = median_time(lambda: ocr_gpu.recognize(image), repeat, max(1, iters // 2))
+        print(
+            f"  {scenario:20s} {fmt_us(t_cpu):>12s} {fmt_us(t_gpu):>12s} "
+            f"{fmt_rate(n_chars / t_cpu):>12s} {fmt_rate(n_chars / t_gpu):>12s} "
+            f"{t_cpu / t_gpu:>7.1f}x"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repeat", type=int, default=7, help="timed runs per measurement")
@@ -296,6 +369,8 @@ def main() -> None:
     bench_engine_construction(args.repeat)
     bench_classifiers(args.repeat, args.iters)
     bench_end_to_end(args.repeat, args.iters)
+    bench_wgpu_backends(args.repeat, args.iters)
+    bench_wgpu_end_to_end(args.repeat, args.iters)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .defaults import compute_font_sha256
+
 
 @dataclass
 class OCRModel:
@@ -17,6 +19,7 @@ class OCRModel:
     input_size: int
     classifier: str = "template"
     weights: dict[str, np.ndarray] | None = None
+    font_sha256: str | None = None
 
 
 CNN_TENSORS: list[tuple[str, tuple[int, ...]]] = [
@@ -93,14 +96,21 @@ def load_model(model_path: Path) -> OCRModel:
         )
 
     classifier = config.get("classifier", "template")
-    if classifier not in ("template", "tinycnn"):
+    if classifier not in ("template", "tinycnn", "hybrid"):
         raise ValueError(f"unsupported classifier {classifier!r}")
-    if classifier == "tinycnn":
+    if classifier in ("tinycnn", "hybrid"):
         weights = _load_cnn_weights(weights_path, num_classes)
-        templates = None
     else:
-        templates = _load_template_weights(weights_path, num_classes, input_size)
         weights = None
+    if classifier == "hybrid":
+        templates_path = model_path / "templates.bin"
+        if not templates_path.exists():
+            raise FileNotFoundError(f"hybrid model requires {templates_path}")
+        templates = _load_template_weights(templates_path, num_classes, input_size)
+    elif classifier == "template":
+        templates = _load_template_weights(weights_path, num_classes, input_size)
+    else:
+        templates = None
     return OCRModel(
         config=config,
         charset=charset,
@@ -108,6 +118,7 @@ def load_model(model_path: Path) -> OCRModel:
         input_size=input_size,
         classifier=classifier,
         weights=weights,
+        font_sha256=config.get("font_sha256"),
     )
 
 
@@ -183,10 +194,18 @@ def write_cnn_model(
     chars: list[str],
     weights: dict[str, np.ndarray],
     input_size: int = 24,
+    font_path: str | Path | None = None,
+    font_sha256: str | None = None,
 ) -> None:
-    """Write ``config.json`` + ``charset.txt`` + CNN ``weights.bin``."""
+    """Write ``config.json`` + ``charset.txt`` + CNN ``weights.bin``.
+
+    When ``font_path`` is provided its SHA256 is stored in the model
+    metadata, unless an explicit ``font_sha256`` is given.
+    """
 
     model_dir.mkdir(parents=True, exist_ok=True)
+    if font_path is not None and font_sha256 is None:
+        font_sha256 = compute_font_sha256(font_path)
     config = {
         "input_width": input_size,
         "input_height": input_size,
@@ -195,6 +214,8 @@ def write_cnn_model(
         "dtype": "f32",
         "classifier": "tinycnn",
     }
+    if font_sha256:
+        config["font_sha256"] = font_sha256
     (model_dir / "config.json").write_text(
         json.dumps(config, indent=4) + "\n",
         encoding="utf-8",
@@ -203,4 +224,58 @@ def write_cnn_model(
         "".join(chars) + "\n",
         encoding="utf-8",
     )
+    write_cnn_weights(model_dir / "weights.bin", weights, len(chars))
+
+
+def write_hybrid_model(
+    model_dir: Path,
+    chars: list[str],
+    templates: np.ndarray,
+    weights: dict[str, np.ndarray],
+    input_size: int = 24,
+    template_threshold: float = 0.90,
+    cnn_threshold: float = 0.0,
+    font_path: str | Path | None = None,
+    font_sha256: str | None = None,
+) -> None:
+    """Write a hybrid model: template level-1 + TinyCNN level-2.
+
+    Layout: ``config.json`` (``classifier: "hybrid"``), ``charset.txt``,
+    ``templates.bin`` (bitset templates, same payload as a template model's
+    ``weights.bin``) and ``weights.bin`` (f32 CNN tensors). The runtime
+    pipeline tries the template first and only runs the CNN on glyphs whose
+    template confidence is below ``template_threshold``.
+    """
+
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    if font_path is not None and font_sha256 is None:
+        font_sha256 = compute_font_sha256(font_path)
+    config = {
+        "input_width": input_size,
+        "input_height": input_size,
+        "classes": len(chars),
+        "version": 1,
+        "dtype": "f32",
+        "classifier": "hybrid",
+        "template_threshold": float(template_threshold),
+        "cnn_threshold": float(cnn_threshold),
+    }
+    if font_sha256:
+        config["font_sha256"] = font_sha256
+    (model_dir / "config.json").write_text(
+        json.dumps(config, indent=4) + "\n",
+        encoding="utf-8",
+    )
+    (model_dir / "charset.txt").write_text(
+        "".join(chars) + "\n",
+        encoding="utf-8",
+    )
+    if templates.shape[1] != (input_size * input_size + 7) // 8:
+        raise ValueError("template byte width does not match input_size")
+    if templates.shape[0] != len(chars):
+        raise ValueError("templates and charset must have the same length")
+    header = np.array([len(chars), templates.shape[1]], dtype="<u4")
+    payload = np.concatenate([header.view(np.uint8), np.asarray(templates).reshape(-1)])
+    (model_dir / "templates.bin").write_bytes(payload.tobytes())
     write_cnn_weights(model_dir / "weights.bin", weights, len(chars))

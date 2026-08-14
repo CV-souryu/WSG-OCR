@@ -25,6 +25,7 @@ def preprocess(
     image: NDArray[np.uint8],
     profile: Profile,
     classify,
+    allowed_ids: set[int] | None = None,
 ) -> tuple[list[CharResult], str]:
     """Run the full CPU pipeline and return (char results, recognized text)."""
 
@@ -35,7 +36,7 @@ def preprocess(
     for line in _find_lines(mask, profile):
         line_chars = _segment_line(line, profile)
         for seg in line_chars:
-            char_id, conf = classify(seg.mask, profile)
+            char_id, conf = classify(seg.mask, profile, allowed_ids)
             chars.append(
                 CharResult(
                     char=char_id,
@@ -49,6 +50,32 @@ def preprocess(
             text_parts.append(char_id)
 
     return chars, "".join(text_parts)
+
+
+def collect_glyphs(
+    image: NDArray[np.uint8],
+    profile: Profile,
+) -> tuple[list[Segment], NDArray[np.uint8]]:
+    """Segment one image into characters and normalize them as a batch.
+
+    Phase-1 WGPU pipeline boundary: character segmentation, merging and the
+    ``24x24`` resize/normalize all stay on the CPU. Returns the segments (for
+    bounding boxes) and an ``uint8 [N, target_size, target_size]`` batch with
+    0/255 values, ready for ``Backend.classify``.
+    """
+
+    mask = profile.color_mask(image)
+    segments: list[Segment] = []
+    glyphs: list[NDArray[np.uint8]] = []
+    for line in _find_lines(mask, profile):
+        for seg in _segment_line(line, profile):
+            segments.append(seg)
+            glyphs.append(normalize(seg.mask, profile.target_size))
+    if not glyphs:
+        return segments, np.empty(
+            (0, profile.target_size, profile.target_size), dtype=np.uint8
+        )
+    return segments, np.stack(glyphs)
 
 
 def _find_lines(mask: NDArray[np.bool_], profile: Profile) -> list[Segment]:

@@ -27,10 +27,33 @@ def test_recognize_alphanumeric(font_path, model_dir):
     assert result.text == "Ab3Zz9"
 
 
+def test_recognize_decimal_point(font_path, model_dir):
+    """A '.' must be recognized when the model charset contains it."""
+    ocr = FixedFontOCR(model_path=model_dir, backend="cpu")
+    for text in ("3.14", "0.5", ".5", "5.", "3..14", "."):
+        result = ocr.recognize(render_text(text, font_path))
+        assert result.text == text, f"{text!r} -> {result.text!r}"
+        assert all(c.confidence >= 0.9 for c in result.chars)
+
+
+def test_recognize_distinguishes_decimal_and_middle_dot(font_path, tmp_path):
+    """'.' (baseline) and '·' (vertical center) must stay distinct in a line."""
+    from fixedfontocr.fontgen import build_templates, write_model
+
+    charset = "0123456789·."
+    chars, templates = build_templates(font_path, list(charset), render_size=32)
+    out = tmp_path / "dot_model"
+    write_model(out, chars, templates, font_path=font_path)
+    ocr = FixedFontOCR(model_path=out, backend="cpu")
+    for text in ("3.14", "3·14", "3.14·5", "12·3.4", "3.14·5.2"):
+        result = ocr.recognize(render_text(text, font_path))
+        assert result.text == text, f"{text!r} -> {result.text!r}"
+
+
 def test_template_classifier_distinguishes_chars(font_path, model_dir):
     ocr = FixedFontOCR(model_path=model_dir, backend="cpu")
-    # 'l' is excluded: in Arial its bitmap is identical to 'I', so any
-    # pixel-exact baseline is allowed to map them together.
+    # 'l' is excluded: in the bundled font its bitmap is identical to 'I',
+    # so any pixel-exact baseline is allowed to map them together.
     for ch in "O01I1":
         image = render_text(ch, font_path)
         result = ocr.recognize(image)
@@ -57,13 +80,14 @@ def test_empty_image_returns_empty_result(font_path, model_dir):
     assert result.confidence == 0.0
 
 
-def test_wgpu_backend_not_implemented_yet(font_path, model_dir):
+def test_wgpu_backend_requires_tinycnn_model(font_path, model_dir):
+    """Template models stay on CPU; 'wgpu' must reject them clearly."""
     try:
         FixedFontOCR(model_path=model_dir, backend="wgpu")
     except ValueError:
         pass
     else:
-        raise AssertionError("expected ValueError for unimplemented wgpu backend")
+        raise AssertionError("expected ValueError for template model + wgpu backend")
 
 
 def test_custom_profile_is_used(font_path, model_dir):

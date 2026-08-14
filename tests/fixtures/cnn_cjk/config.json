@@ -4,5 +4,6 @@
     "classes": 8,
     "version": 1,
     "dtype": "f32",
-    "classifier": "tinycnn"
+    "classifier": "tinycnn",
+    "font_sha256": "b9806d1f0557eb3e9f5bbb2cfb466a2f96b165e41657a5c20ddea5cd67c09e9a"
 }

@@ -27,12 +27,14 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from fixedfontocr import defaults  # noqa: E402
+from fixedfontocr.defaults import resolve_font  # noqa: E402
 from fixedfontocr.model import write_cnn_model  # noqa: E402
 from fixedfontocr.preprocess import normalize  # noqa: E402
 from fixedfontocr.types import Profile  # noqa: E402
 
 
-def read_charset(path: str | None, font: str, default: str) -> list[str]:
+def read_charset(path: str | None, default: str) -> list[str]:
     if path:
         chars: list[str] = []
         for line in Path(path).read_text(encoding="utf-8").splitlines():
@@ -45,10 +47,9 @@ def read_charset(path: str | None, font: str, default: str) -> list[str]:
         if not chars:
             raise SystemExit(f"charset file {path} contains no characters")
         return chars
-    from PIL import ImageFont
-
-    font_obj = ImageFont.truetype(font, 24)
-    return [ch for ch in default if font_obj.getlength(ch) > 0]
+    # Missing glyphs are reported by make_dataset instead of being silently
+    # filtered out here.
+    return list(default)
 
 
 def make_dataset(
@@ -87,7 +88,9 @@ def make_dataset(
             mask = gray >= threshold
             ys, xs = np.where(mask)
             if ys.size == 0:
-                continue
+                raise ValueError(
+                    f"font {font} cannot render {char!r}: no ink rendered"
+                )
             tight = mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
             glyph = normalize(tight, 24).astype(np.float32) / 255.0
             # Random sub-pixel segmentation jitter: shift by -1..1 px.
@@ -152,9 +155,19 @@ def export_weights(model: nn.Module) -> dict[str, np.ndarray]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("font", help="path to a .ttf/.otf/.ttc font")
+    parser.add_argument(
+        "font",
+        nargs="?",
+        default=str(defaults.FONT_PATH),
+        help="path to a registered .ttf/.otf font under fonts/ "
+        "(default: bundled game font)",
+    )
     parser.add_argument("output", help="output model directory")
-    parser.add_argument("--charset", help="text file listing characters")
+    parser.add_argument(
+        "--charset",
+        default=str(defaults.CHARSET_PATH),
+        help="text file listing characters (default: charsets/sets/combined.txt)",
+    )
     parser.add_argument("--samples-per-char", type=int, default=300)
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -167,19 +180,14 @@ def main() -> None:
     parser.add_argument("--val-split", type=float, default=0.1)
     args = parser.parse_args()
 
-    default_charset = (
-        "0123456789"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "获得金币消耗数量提示确定取消返回攻击防御生命法力"
-        "+-×÷%.,:;!?()[]{}「」"
-    )
-    charset = read_charset(args.charset, args.font, default_charset)
+    default_charset = defaults.read_charset()
+    font = resolve_font(args.font)
+    charset = read_charset(args.charset, default_charset)
 
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     x, y = make_dataset(
-        args.font,
+        font,
         charset,
         args.samples_per_char,
         rng,
@@ -227,7 +235,7 @@ def main() -> None:
         print(f"epoch {epoch + 1:>2}: loss {total / steps:.4f}  val_acc {acc:.3f}")
 
     out = Path(args.output)
-    write_cnn_model(out, charset, export_weights(model))
+    write_cnn_model(out, charset, export_weights(model), font_path=font)
     print(f"wrote TinyCNN model ({len(charset)} classes) to {out}")
 
 

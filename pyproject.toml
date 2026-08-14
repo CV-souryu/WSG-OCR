@@ -15,12 +15,14 @@ wgpu = [
 train = [
     "torch>=2.0",
     "pillow>=10.0",
+    "fonttools>=4.0",
 ]
 
 dev = [
     "pytest>=8.0",
     "torch>=2.0",
     "pillow>=10.0",
+    "fonttools>=4.0",
 ]
 
 [project.scripts]

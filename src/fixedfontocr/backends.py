@@ -1,0 +1,791 @@
+"""Batch classifier backends: numpy CPU and WGPU compute.
+
+The OCR pipeline segments and normalizes on the CPU, then feeds an
+``[N, 24, 24]`` uint8 glyph batch to a backend. Both backends share the same
+``Backend.classify(glyphs)`` contract and return the same ``BackendResult``:
+
+    char_ids:  int32 ``[N]``  index into the model charset
+    scores:    f32   ``[N]``  confidence = top1_logit - top2_logit
+
+The GPU backend uses NHWC storage with channels padded to multiples of 4
+(``vec4<f32>`` per pixel) and a fixed TinyCNN pipeline:
+
+    normalize -> conv3x3(stride 2) -> dwconv3x3 -> pointwise(stride 2)
+              -> dwconv3x3 -> pointwise(stride 2) -> GAP
+              -> fused linear + argmax
+
+Every WGSL shader lives in ``src/fixedfontocr/shaders/`` so each layer can be
+verified independently against the numpy reference (see ``tests/test_wgpu.py``).
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from importlib import resources
+
+import numpy as np
+from numpy.typing import NDArray
+
+from .cnn import forward
+
+
+@dataclass(frozen=True)
+class BackendResult:
+    """Batch classification result.
+
+    ``scores`` is the top-1/top-2 logit margin, so no softmax is needed and
+    the WGPU path only has to read back ``3 x 4`` bytes per glyph.
+    """
+
+    char_ids: NDArray[np.int32]
+    scores: NDArray[np.float32]
+
+
+class Backend(ABC):
+    """Unified batch classifier interface used by the OCR pipeline."""
+
+    @abstractmethod
+    def classify(self, glyphs: NDArray[np.uint8]) -> BackendResult:
+        """Classify a batch of normalized glyphs.
+
+        Parameters
+        ----------
+        glyphs:
+            ``uint8 [N, H, W]``, values 0/255 (already normalized by the CPU).
+
+        Returns
+        -------
+        BackendResult with ``char_ids`` (int32 ``[N]``) and ``scores``
+        (f32 ``[N]``, top1-top2 logit margin).
+        """
+
+
+def _check_glyphs(glyphs: NDArray[np.uint8]) -> tuple[np.ndarray, int, int, int]:
+    arr = np.asarray(glyphs)
+    if arr.ndim != 3:
+        raise ValueError(f"glyphs must be [N, H, W], got shape {arr.shape}")
+    if arr.size and arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+    n, h, w = arr.shape
+    return np.ascontiguousarray(arr), n, h, w
+
+
+def _margin_from_logits(
+    logits: NDArray[np.float32],
+) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+    """Top-1 id and top1-top2 margin from an ``[N, C]`` logit matrix."""
+    n, c = logits.shape
+    order = np.argsort(-logits, axis=1, kind="stable")
+    top1 = order[:, 0]
+    best = logits[np.arange(n), top1]
+    if c >= 2:
+        second = logits[np.arange(n), order[:, 1]]
+        scores = best - second
+    else:
+        scores = np.full(n, np.inf, dtype=np.float32)
+    return top1.astype(np.int32), scores.astype(np.float32)
+
+
+class CPUBackend(Backend):
+    """Numpy TinyCNN backend; the reference every GPU layer is checked against."""
+
+    def __init__(self, weights: dict[str, NDArray[np.float32]], input_size: int = 24):
+        self.weights = weights
+        self.input_size = input_size
+
+    def classify(self, glyphs: NDArray[np.uint8]) -> BackendResult:
+        arr, n, h, w = _check_glyphs(glyphs)
+        if h != self.input_size or w != self.input_size:
+            raise ValueError(
+                f"expected {self.input_size}x{self.input_size} glyphs, got {h}x{w}"
+            )
+        if n == 0:
+            return BackendResult(
+                char_ids=np.empty(0, dtype=np.int32),
+                scores=np.empty(0, dtype=np.float32),
+            )
+        x = arr.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
+        logits = forward(x, self.weights)
+        char_ids, scores = _margin_from_logits(logits)
+        return BackendResult(char_ids=char_ids, scores=scores)
+
+
+class WGPUBackend(Backend):
+    """WGPU TinyCNN backend.
+
+    All network storage is NHWC with channel counts padded to multiples of
+    four, so every pixel is one or more ``vec4<f32>``. The final
+    ``linear_argmax`` shader runs the dense layer and the top-1/top-2
+    reduction in one dispatch and reads back only ``12 bytes`` per glyph.
+    """
+
+    # Fixed TinyCNN spatial sizes.
+    _H = 24
+    _W = 24
+    _C1 = 8
+    _C2 = 16
+    _C3 = 32
+    _SHADER_FILES = {
+        "normalize": "normalize",
+        "conv1": "conv3x3",
+        "dw1": "dwconv3x3",
+        "pw1": "pointwise",
+        "dw2": "dwconv3x3",
+        "pw2": "pointwise",
+        "gap": "gap",
+        "linear": "linear",
+        "argmax": "argmax",
+        "fused": "linear_argmax",
+    }
+
+    def __init__(
+        self,
+        weights: dict[str, NDArray[np.float32]],
+        input_size: int = 24,
+        device=None,
+    ):
+        if input_size != self._H:
+            raise ValueError(f"WGPU backend supports {self._H}x{self._H} glyphs")
+        if weights["fc.weight"].shape[1] != self._C3:
+            raise ValueError("WGPU backend requires the fixed 32-feature TinyCNN")
+        import wgpu
+
+        self._wgpu = wgpu
+        self.weights = weights
+        self.input_size = input_size
+        self.num_classes = int(weights["fc.weight"].shape[0])
+
+        if device is None:
+            adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+            device = adapter.request_device_sync()
+        self.device = device
+
+        self._weight_bufs = self._upload_weights()
+        self._pipelines: dict[str, object] = {}
+        self._layouts: dict[str, object] = {}
+        self._build_pipelines()
+        self._cap = 0
+        self._bufs: dict[str, object] = {}
+        self._uniform_bufs: dict[tuple, object] = {}
+        self._bg_cache: dict[tuple, object] = {}
+        self._readback = None
+        self.last_timing: dict[str, float] | None = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def classify(
+        self, glyphs: NDArray[np.uint8], *, profile: bool = False
+    ) -> BackendResult:
+        arr, n, h, w = _check_glyphs(glyphs)
+        if h != self._H or w != self._W:
+            raise ValueError(f"expected {self._H}x{self._W} glyphs, got {h}x{w}")
+        if n == 0:
+            if profile:
+                self.last_timing = {
+                    "upload": 0.0,
+                    "compute": 0.0,
+                    "readback": 0.0,
+                    "total": 0.0,
+                }
+            return BackendResult(
+                char_ids=np.empty(0, dtype=np.int32),
+                scores=np.empty(0, dtype=np.float32),
+            )
+        self._ensure_buffers(n)
+        t0 = time.perf_counter()
+        self.device.queue.write_buffer(self._bufs["input"], 0, arr, 0, arr.nbytes)
+        t1 = time.perf_counter()
+
+        enc = self.device.create_command_encoder()
+        self._dispatch(
+            enc, "normalize", self._classify_bind(
+                "normalize", [self._bufs["input"], self._bufs["norm"]], n
+            ), n * h * w
+        )
+        self._dispatch(
+            enc, "conv1", self._classify_bind(
+                "conv1",
+                [self._bufs["norm"], self._weight_bufs["conv1_w"], self._weight_bufs["conv1_b"], self._bufs["c1"]],
+                n,
+            ), n * 12 * 12 * (self._C1 // 4)
+        )
+        self._dispatch(
+            enc, "dw1", self._classify_bind(
+                "dw1",
+                [self._bufs["c1"], self._weight_bufs["dw1_w"], self._weight_bufs["dw1_b"], self._bufs["d1"]],
+                n,
+            ), n * 12 * 12 * (self._C1 // 4)
+        )
+        self._dispatch(
+            enc, "pw1", self._classify_bind(
+                "pw1",
+                [self._bufs["d1"], self._weight_bufs["pw1_w"], self._weight_bufs["pw1_b"], self._bufs["p1"]],
+                n,
+            ), n * 6 * 6 * (self._C2 // 4)
+        )
+        self._dispatch(
+            enc, "dw2", self._classify_bind(
+                "dw2",
+                [self._bufs["p1"], self._weight_bufs["dw2_w"], self._weight_bufs["dw2_b"], self._bufs["d2"]],
+                n,
+            ), n * 6 * 6 * (self._C2 // 4)
+        )
+        self._dispatch(
+            enc, "pw2", self._classify_bind(
+                "pw2",
+                [self._bufs["d2"], self._weight_bufs["pw2_w"], self._weight_bufs["pw2_b"], self._bufs["p2"]],
+                n,
+            ), n * 3 * 3 * (self._C3 // 4)
+        )
+        self._dispatch(
+            enc, "gap", self._classify_bind("gap", [self._bufs["p2"], self._bufs["gap"]], n), n * (self._C3 // 4)
+        )
+        self._dispatch(
+            enc, "fused", self._classify_bind(
+                "fused",
+                [self._bufs["gap"], self._weight_bufs["fc_w"], self._weight_bufs["fc_b"], self._bufs["result"]],
+                n,
+            ), n, workgroups=n
+        )
+        enc.copy_buffer_to_buffer(self._bufs["result"], 0, self._readback, 0, n * 12)
+        self.device.queue.submit([enc.finish()])
+        t2 = time.perf_counter()
+        self._readback.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(
+            self._readback.read_mapped(size=n * 12), dtype=np.uint8
+        ).copy()
+        self._readback.unmap()
+        t3 = time.perf_counter()
+        if profile:
+            self.last_timing = {
+                "upload": t1 - t0,
+                "compute": t2 - t1,
+                "readback": t3 - t2,
+                "total": t3 - t0,
+            }
+        char_ids, scores = self._parse_results(raw)
+        return BackendResult(char_ids=char_ids, scores=scores)
+
+    # ------------------------------------------------------------------
+    # Per-layer entry points (used by the CPU/GPU consistency tests)
+    # ------------------------------------------------------------------
+
+    def normalize(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
+        arr, n, h, w = _check_glyphs(glyphs)
+        buf_in = self._device_create_buffer(data=arr.tobytes(), usage=self._U_STORAGE)
+        buf_out = self._device_create_buffer(
+            size=n * h * w * 4 * 4, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._run_one("normalize", self._bind("normalize", [buf_in, buf_out], n), n * h * w)
+        return self._read(buf_out, n * h * w * 4 * 4).view("<f4")
+
+    def conv1(self, x: NDArray[np.float32]) -> NDArray[np.float32]:
+        return self._run_conv_layer("conv1", x, 12, 12, self._C1 // 4)
+
+    def dw1(self, x: NDArray[np.float32]) -> NDArray[np.float32]:
+        return self._run_dw_layer("dw1", x, 12, 12, self._C1 // 4)
+
+    def pw1(self, x: NDArray[np.float32]) -> NDArray[np.float32]:
+        return self._run_pw_layer("pw1", x, 6, 6, self._C2 // 4)
+
+    def dw2(self, x: NDArray[np.float32]) -> NDArray[np.float32]:
+        return self._run_dw_layer("dw2", x, 6, 6, self._C2 // 4)
+
+    def pw2(self, x: NDArray[np.float32]) -> NDArray[np.float32]:
+        return self._run_pw_layer("pw2", x, 3, 3, self._C3 // 4)
+
+    def gap(self, x: NDArray[np.float32]) -> NDArray[np.float32]:
+        n = x.shape[0]
+        vec4_count = x.shape[-1] // 4
+        buf_in = self._device_create_buffer(data=x.astype(np.float32).tobytes(), usage=self._U_STORAGE)
+        buf_out = self._device_create_buffer(
+            size=n * vec4_count * 4 * 4, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._run_one("gap", self._bind("gap", [buf_in, buf_out], n), n * vec4_count)
+        return self._read(buf_out, n * vec4_count * 4 * 4).view("<f4")
+
+    def linear(self, features: NDArray[np.float32]) -> NDArray[np.float32]:
+        n, in_c = features.shape
+        buf_in = self._device_create_buffer(
+            data=features.astype(np.float32).tobytes(), usage=self._U_STORAGE
+        )
+        buf_out = self._device_create_buffer(
+            size=n * self.num_classes * 4, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._run_one(
+            "linear",
+            self._bind(
+                "linear",
+                [buf_in, self._weight_bufs["fc_w"], self._weight_bufs["fc_b"], buf_out],
+                n,
+            ),
+            n * self.num_classes,
+        )
+        return self._read(buf_out, n * self.num_classes * 4).view("<f4")
+
+    def argmax(self, logits: NDArray[np.float32]) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+        n, c = logits.shape
+        buf_in = self._device_create_buffer(
+            data=logits.astype(np.float32).tobytes(), usage=self._U_STORAGE
+        )
+        buf_out = self._device_create_buffer(
+            size=n * 12, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._run_one(
+            "argmax", self._bind("argmax", [buf_in, buf_out], n, out_c=c), n,
+            workgroups=n,
+        )
+        return self._parse_results(self._read(buf_out, n * 12))
+
+    def fused(self, features: NDArray[np.float32]) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+        n, in_c = features.shape
+        buf_in = self._device_create_buffer(
+            data=features.astype(np.float32).tobytes(), usage=self._U_STORAGE
+        )
+        buf_out = self._device_create_buffer(
+            size=n * 12, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._run_one(
+            "fused",
+            self._bind(
+                "fused",
+                [buf_in, self._weight_bufs["fc_w"], self._weight_bufs["fc_b"], buf_out],
+                n,
+            ),
+            n,
+            workgroups=n,
+        )
+        return self._parse_results(self._read(buf_out, n * 12))
+
+    # ------------------------------------------------------------------
+    # WGPU plumbing
+    # ------------------------------------------------------------------
+
+    @property
+    def _U_STORAGE(self):
+        return self._wgpu.BufferUsage.STORAGE
+
+    @property
+    def _U_COPY_SRC(self):
+        return self._wgpu.BufferUsage.COPY_SRC
+
+    @property
+    def _U_COPY_DST(self):
+        return self._wgpu.BufferUsage.COPY_DST
+
+    @property
+    def _U_MAP_READ(self):
+        return self._wgpu.BufferUsage.MAP_READ
+
+    def _device_create_buffer(self, size=None, data=None, usage=None):
+        if data is not None:
+            return self.device.create_buffer_with_data(data=data, usage=usage)
+        return self.device.create_buffer(size=size, usage=usage)
+
+    def _shader(self, name: str) -> str:
+        return (
+            resources.files("fixedfontocr")
+            .joinpath("shaders", f"{name}.wgsl")
+            .read_text(encoding="utf-8")
+        )
+
+    def _upload_weights(self) -> dict[str, object]:
+        w = self.weights
+        tensors = {
+            # conv1 is specialized to the single real input channel: [oc][3][3].
+            "conv1": w["conv1.weight"].reshape(-1),
+            "dw1": w["dw1.weight"].reshape(-1),
+            "pw1": w["pw1.weight"].reshape(-1),
+            "dw2": w["dw2.weight"].reshape(-1),
+            "pw2": w["pw2.weight"].reshape(-1),
+            "fc": w["fc.weight"].reshape(-1),
+        }
+        biases = {
+            "conv1": w["conv1.bias"],
+            "dw1": w["dw1.bias"],
+            "pw1": w["pw1.bias"],
+            "dw2": w["dw2.bias"],
+            "pw2": w["pw2.bias"],
+            "fc": w["fc.bias"],
+        }
+        bufs: dict[str, object] = {}
+        for name, arr in tensors.items():
+            bufs[f"{name}_w"] = self._device_create_buffer(
+                data=arr.astype(np.float32).tobytes(), usage=self._U_STORAGE
+            )
+        for name, arr in biases.items():
+            bufs[f"{name}_b"] = self._device_create_buffer(
+                data=arr.astype(np.float32).tobytes(), usage=self._U_STORAGE
+            )
+        return bufs
+
+    def _uniform(self, *values: int) -> NDArray[np.uint8]:
+        n_vec = math.ceil(len(values) / 4)
+        buf = np.zeros(n_vec * 16, dtype=np.uint8)
+        for i, v in enumerate(values):
+            buf[i * 4 : i * 4 + 4] = np.asarray([v], dtype="<u4").view(np.uint8)
+        return buf
+
+    def _build_pipelines(self) -> None:
+        w = self._wgpu
+        stage = w.ShaderStage.COMPUTE
+
+        def uniform_buf() -> dict:
+            return {"type": "uniform"}
+
+        def storage_ro() -> dict:
+            return {"type": "read-only-storage"}
+
+        def storage_rw() -> dict:
+            return {"type": "storage"}
+
+        specs: dict[str, list[dict]] = {
+            "normalize": [uniform_buf(), storage_ro(), storage_rw()],
+            "conv1": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
+            "dw1": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
+            "pw1": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
+            "dw2": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
+            "pw2": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
+            "gap": [uniform_buf(), storage_ro(), storage_rw()],
+            "linear": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
+            "argmax": [uniform_buf(), storage_ro(), storage_rw()],
+            "fused": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
+        }
+        for name, entries in specs.items():
+            bgl_entries = [
+                {"binding": i, "visibility": stage, "buffer": b}
+                for i, b in enumerate(entries)
+            ]
+            layout = self.device.create_bind_group_layout(entries=bgl_entries)
+            pl = self.device.create_pipeline_layout(bind_group_layouts=[layout])
+            shader = self.device.create_shader_module(
+                code=self._shader(self._SHADER_FILES[name])
+            )
+            self._pipelines[name] = self.device.create_compute_pipeline(
+                layout=pl, compute={"module": shader, "entry_point": "main"}
+            )
+            self._layouts[name] = layout
+
+    def _bind(
+        self, name: str, buffers: list[object], n: int, out_c: int | None = None
+    ) -> object:
+        key = (name, n, out_c)
+        uniform = self._uniform_bufs.get(key)
+        if uniform is None:
+            uniform = self._device_create_buffer(
+                data=self._uniform(*self._layer_params(name, n, out_c=out_c)).tobytes(),
+                usage=self._wgpu.BufferUsage.UNIFORM,
+            )
+            self._uniform_bufs[key] = uniform
+        entries = [{"binding": 0, "resource": {"buffer": uniform}}]
+        for i, b in enumerate(buffers, start=1):
+            entries.append(
+                {"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}}
+            )
+        return self.device.create_bind_group(layout=self._layouts[name], entries=entries)
+
+    def _classify_bind(self, name: str, buffers: list[object], n: int) -> object:
+        """Bind group for the persistent classify buffers, cached per capacity."""
+        key = ("classify", name, self._cap, n)
+        bg = self._bg_cache.get(key)
+        if bg is None:
+            bg = self._bind(name, buffers, n)
+            self._bg_cache[key] = bg
+        return bg
+
+    def _dispatch(
+        self, enc, name: str, bind_group: object, total: int, workgroups: int | None = None
+    ) -> None:
+        p = enc.begin_compute_pass()
+        p.set_pipeline(self._pipelines[name])
+        p.set_bind_group(0, bind_group, [], 0, 99)
+        wgs = workgroups if workgroups is not None else (total + 63) // 64
+        p.dispatch_workgroups(wgs, 1, 1)
+        p.end()
+
+    def _run_one(
+        self, name: str, bind_group: object, total: int, workgroups: int | None = None
+    ) -> None:
+        enc = self.device.create_command_encoder()
+        self._dispatch(enc, name, bind_group, total, workgroups=workgroups)
+        self.device.queue.submit([enc.finish()])
+
+    def _read(self, buf: object, size: int) -> NDArray[np.uint8]:
+        staging = self._device_create_buffer(
+            size=size, usage=self._U_MAP_READ | self._U_COPY_DST
+        )
+        enc = self.device.create_command_encoder()
+        enc.copy_buffer_to_buffer(buf, 0, staging, 0, size)
+        self.device.queue.submit([enc.finish()])
+        staging.map_sync(self._wgpu.MapMode.READ)
+        out = np.frombuffer(staging.read_mapped(), dtype=np.uint8).copy()
+        staging.unmap()
+        return out
+
+    def _parse_results(
+        self, raw: NDArray[np.uint8]
+    ) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+        recs = raw.view(
+            np.dtype([("best_id", "<u4"), ("best_score", "<f4"), ("second_score", "<f4")])
+        )
+        ids = recs["best_id"].astype(np.int32)
+        # The shaders use -FLT_MAX as the "no second class" sentinel (C == 1);
+        # normalize it to +inf so the margin matches the numpy reference.
+        second = recs["second_score"]
+        scores = np.where(
+            second <= -3.4e38,
+            np.inf,
+            recs["best_score"] - second,
+        ).astype(np.float32)
+        return ids, scores
+
+    # ------------------------------------------------------------------
+    # Persistent per-call buffers
+    # ------------------------------------------------------------------
+
+    def _ensure_buffers(self, n: int) -> None:
+        if n <= self._cap:
+            return
+        self._cap = n
+        u = self._U_STORAGE | self._U_COPY_SRC
+        self._bufs = {
+            "input": self._device_create_buffer(
+                size=n * self._H * self._W,
+                usage=self._U_STORAGE | self._U_COPY_DST,
+            ),
+            "norm": self._device_create_buffer(
+                size=n * self._H * self._W * 4 * 4, usage=u
+            ),
+            "c1": self._device_create_buffer(size=n * 12 * 12 * self._C1 * 4, usage=u),
+            "d1": self._device_create_buffer(size=n * 12 * 12 * self._C1 * 4, usage=u),
+            "p1": self._device_create_buffer(size=n * 6 * 6 * self._C2 * 4, usage=u),
+            "d2": self._device_create_buffer(size=n * 6 * 6 * self._C2 * 4, usage=u),
+            "p2": self._device_create_buffer(size=n * 3 * 3 * self._C3 * 4, usage=u),
+            "gap": self._device_create_buffer(size=n * self._C3 * 4, usage=u),
+            "result": self._device_create_buffer(
+                size=n * 12, usage=self._U_STORAGE | self._U_COPY_SRC
+            ),
+        }
+        self._readback = self._device_create_buffer(
+            size=n * 12, usage=self._U_MAP_READ | self._U_COPY_DST
+        )
+
+    def _layer_params(
+        self, name: str, n: int, out_c: int | None = None
+    ) -> tuple[int, ...]:
+        if name == "normalize":
+            return (n, self._H, self._W, 0)
+        if name in ("conv1", "pw1", "pw2"):
+            if name == "conv1":
+                ih = iw = 24
+                oh = ow = 12
+                stride = 2
+                iv = 1
+                ov = self._C1 // 4
+            elif name == "pw1":
+                ih = iw = 12
+                oh = ow = 6
+                stride = 2
+                iv = self._C1 // 4
+                ov = self._C2 // 4
+            else:
+                ih = iw = 6
+                oh = ow = 3
+                stride = 2
+                iv = self._C2 // 4
+                ov = self._C3 // 4
+            return (n, ih, iw, oh, ow, stride, iv, ov)
+        if name in ("dw1", "dw2"):
+            if name == "dw1":
+                ih = iw = 12
+                oh = ow = 12
+                stride = 1
+                v = self._C1 // 4
+            else:
+                ih = iw = 6
+                oh = ow = 6
+                stride = 1
+                v = self._C2 // 4
+            return (n, ih, iw, oh, ow, stride, v, 0)
+        if name == "gap":
+            return (n, 3, 3, self._C3 // 4, 0, 0, 0, 0)
+        if name == "linear":
+            return (n, self._C3, self.num_classes, 0)
+        if name == "argmax":
+            return (n, self.num_classes if out_c is None else out_c, 0, 0)
+        if name == "fused":
+            return (n, self._C3, self.num_classes, 0)
+        raise KeyError(name)
+
+    def _run_conv_layer(
+        self, name: str, x: NDArray[np.float32], oh: int, ow: int, ov: int
+    ) -> NDArray[np.float32]:
+        n = x.shape[0]
+        buf_in = self._device_create_buffer(
+            data=x.astype(np.float32).tobytes(), usage=self._U_STORAGE
+        )
+        buf_out = self._device_create_buffer(
+            size=n * oh * ow * ov * 4 * 4, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._run_one(
+            name,
+            self._bind(
+                name,
+                [buf_in, self._weight_bufs[f"{name}_w"], self._weight_bufs[f"{name}_b"], buf_out],
+                n,
+            ),
+            n * oh * ow * ov,
+        )
+        return self._read(buf_out, n * oh * ow * ov * 16).view("<f4")
+
+    def _run_dw_layer(
+        self, name: str, x: NDArray[np.float32], oh: int, ow: int, v: int
+    ) -> NDArray[np.float32]:
+        n = x.shape[0]
+        buf_in = self._device_create_buffer(
+            data=x.astype(np.float32).tobytes(), usage=self._U_STORAGE
+        )
+        buf_out = self._device_create_buffer(
+            size=n * oh * ow * v * 4 * 4, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._run_one(
+            name,
+            self._bind(
+                name,
+                [buf_in, self._weight_bufs[f"{name}_w"], self._weight_bufs[f"{name}_b"], buf_out],
+                n,
+            ),
+            n * oh * ow * v,
+        )
+        return self._read(buf_out, n * oh * ow * v * 16).view("<f4")
+
+    def _run_pw_layer(
+        self, name: str, x: NDArray[np.float32], oh: int, ow: int, ov: int
+    ) -> NDArray[np.float32]:
+        n = x.shape[0]
+        buf_in = self._device_create_buffer(
+            data=x.astype(np.float32).tobytes(), usage=self._U_STORAGE
+        )
+        buf_out = self._device_create_buffer(
+            size=n * oh * ow * ov * 4 * 4, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._run_one(
+            name,
+            self._bind(
+                name,
+                [buf_in, self._weight_bufs[f"{name}_w"], self._weight_bufs[f"{name}_b"], buf_out],
+                n,
+            ),
+            n * oh * ow * ov,
+        )
+        return self._read(buf_out, n * oh * ow * ov * 16).view("<f4")
+
+
+def median_time(fn, repeat: int, iters: int) -> float:
+    """Median per-call wall time in seconds (warm-up + repeated runs)."""
+    fn()
+    samples: list[float] = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        samples.append((time.perf_counter() - t0) / iters)
+    samples.sort()
+    return samples[len(samples) // 2]
+
+
+def benchmark_backends(
+    cpu: CPUBackend,
+    gpu: WGPUBackend,
+    batch_sizes: tuple[int, ...] = (1, 8, 16, 32, 64, 128),
+    repeat: int = 3,
+    iters: int = 5,
+    seed: int = 0,
+) -> dict[int, dict[str, float]]:
+    """Time both backends on synthetic glyph batches.
+
+    Returns ``{batch: {"cpu": seconds, "gpu": seconds}}``. The GPU's
+    per-call synchronization floor usually makes it slower for small lines,
+    so the crossover recorded here is what ``backend="auto"`` uses at
+    runtime instead of guessing.
+    """
+
+    rng = np.random.default_rng(seed)
+    measurements: dict[int, dict[str, float]] = {}
+    for batch in batch_sizes:
+        glyphs = (rng.random((batch, cpu.input_size, cpu.input_size)) > 0.5).astype(
+            np.uint8
+        ) * 255
+        tc = median_time(lambda: cpu.classify(glyphs), repeat, max(1, iters))
+        tg = median_time(lambda: gpu.classify(glyphs), repeat, max(1, iters))
+        measurements[int(batch)] = {"cpu": tc, "gpu": tg}
+    return measurements
+
+
+class AutoBackend(Backend):
+    """Runtime backend selection from a measured CPU/GPU crossover table.
+
+    ``backend="auto"`` runs :func:`benchmark_backends` once during engine
+    construction, then every ``classify()`` call picks the faster measured
+    backend for the actual batch size. Unmeasured sizes use linear
+    interpolation inside the table and the last segment's marginal cost for
+    extrapolation.
+    """
+
+    def __init__(
+        self,
+        cpu: CPUBackend,
+        gpu: WGPUBackend,
+        measurements: dict[int, dict[str, float]],
+    ):
+        self.cpu = cpu
+        self.gpu = gpu
+        self.measurements = dict(measurements)
+        self.batch_sizes = tuple(sorted(self.measurements))
+
+    @property
+    def crossover(self) -> tuple[int, str] | None:
+        """Smallest batch where the GPU is faster (if any)."""
+        if self.gpu is None:
+            return None
+        for batch in self.batch_sizes:
+            m = self.measurements[batch]
+            if m["gpu"] < m["cpu"]:
+                return batch, "wgpu"
+        return None
+
+    def _estimate(self, table: dict[int, float], n: int) -> float:
+        sizes = self.batch_sizes
+        if len(sizes) == 1:
+            return table[sizes[0]]
+        if n <= sizes[0]:
+            return table[sizes[0]]
+        if n >= sizes[-1]:
+            a, b = sizes[-2], sizes[-1]
+            marginal = (table[b] - table[a]) / (b - a)
+            return max(0.0, table[b] + marginal * (n - b))
+        for a, b in zip(sizes, sizes[1:]):
+            if a <= n <= b:
+                t = (n - a) / (b - a)
+                return table[a] + t * (table[b] - table[a])
+        raise AssertionError("unreachable")
+
+    def pick(self, n: int) -> Backend:
+        if n <= 0 or self.gpu is None:
+            return self.cpu
+        cpu_t = self._estimate(
+            {b: m["cpu"] for b, m in self.measurements.items()}, n
+        )
+        gpu_t = self._estimate(
+            {b: m["gpu"] for b, m in self.measurements.items()}, n
+        )
+        return self.gpu if gpu_t < cpu_t else self.cpu
+
+    def classify(self, glyphs: NDArray[np.uint8]) -> BackendResult:
+        arr, n, _, _ = _check_glyphs(glyphs)
+        return self.pick(n).classify(arr)

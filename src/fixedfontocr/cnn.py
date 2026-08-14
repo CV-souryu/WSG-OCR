@@ -24,6 +24,7 @@ from numpy.typing import NDArray
 
 from .classifier import Classifier
 from .preprocess import normalize
+from .postprocess import pick
 from .types import Profile
 
 
@@ -111,14 +112,19 @@ def softmax(logits: NDArray[np.float32]) -> NDArray[np.float32]:
     return (e / np.sum(e, axis=-1, keepdims=True)).astype(np.float32)
 
 
-def forward(
+def forward_with_activations(
     x: NDArray[np.float32],
     weights: dict[str, NDArray[np.float32]],
-) -> NDArray[np.float32]:
-    """Run the fixed TinyCNN and return logits ``(N, num_chars)``.
+) -> dict[str, NDArray[np.float32]]:
+    """Run the fixed TinyCNN and return every stage's activations.
 
     ``weights`` must contain: conv1.weight/bias, dw1.weight/bias,
     pw1.weight/bias, dw2.weight/bias, pw2.weight/bias, fc.weight/bias.
+
+    Returns a dict with ``conv1``, ``dw1``, ``pw1``, ``dw2``, ``pw2``,
+    ``gap`` and ``logits``; all activations are in NCHW except ``gap``
+    (``(N, C)``) and ``logits`` (``(N, classes)``). This is the reference
+    used by ``tools/train/export_model.py`` to emit per-layer test vectors.
     """
 
     x = x.astype(np.float32)
@@ -129,13 +135,29 @@ def forward(
     if x.shape[1] != 1:
         x = x[:, :1, :, :]
 
-    a = relu(conv3x3(x, weights["conv1.weight"], weights["conv1.bias"], stride=2))
-    a = relu(dwconv3x3(a, weights["dw1.weight"], weights["dw1.bias"]))
-    a = relu(pointwise(a, weights["pw1.weight"], weights["pw1.bias"], stride=2))
-    a = relu(dwconv3x3(a, weights["dw2.weight"], weights["dw2.bias"]))
-    a = relu(pointwise(a, weights["pw2.weight"], weights["pw2.bias"], stride=2))
-    v = gap(a)
-    return linear(v, weights["fc.weight"], weights["fc.bias"])
+    c1 = relu(conv3x3(x, weights["conv1.weight"], weights["conv1.bias"], stride=2))
+    d1 = relu(dwconv3x3(c1, weights["dw1.weight"], weights["dw1.bias"]))
+    p1 = relu(pointwise(d1, weights["pw1.weight"], weights["pw1.bias"], stride=2))
+    d2 = relu(dwconv3x3(p1, weights["dw2.weight"], weights["dw2.bias"]))
+    p2 = relu(pointwise(d2, weights["pw2.weight"], weights["pw2.bias"], stride=2))
+    v = gap(p2)
+    return {
+        "conv1": c1,
+        "dw1": d1,
+        "pw1": p1,
+        "dw2": d2,
+        "pw2": p2,
+        "gap": v,
+        "logits": linear(v, weights["fc.weight"], weights["fc.bias"]),
+    }
+
+
+def forward(
+    x: NDArray[np.float32],
+    weights: dict[str, NDArray[np.float32]],
+) -> NDArray[np.float32]:
+    """Run the fixed TinyCNN and return logits ``(N, num_chars)``."""
+    return forward_with_activations(x, weights)["logits"]
 
 
 class TinyCNNClassifier(Classifier):
@@ -157,8 +179,11 @@ class TinyCNNClassifier(Classifier):
         glyph = normalize(mask, self.input_size).astype(np.float32) / 255.0
         return forward(glyph, self.weights)[0]
 
-    def __call__(self, mask: NDArray[np.bool_], profile: Profile) -> tuple[str, float]:
+    def __call__(
+        self,
+        mask: NDArray[np.bool_],
+        profile: Profile,
+        allowed_ids: set[int] | None = None,
+    ) -> tuple[str, float]:
         logits = self.logits(mask)
-        probs = softmax(logits[None, :])[0]
-        best = int(np.argmax(probs))
-        return self.charset[best], float(probs[best])
+        return pick(logits, self.charset, allowed_ids)

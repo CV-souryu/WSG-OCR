@@ -2,14 +2,31 @@
 
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
+from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
 
+from .defaults import (
+    compute_font_sha256,
+    ensure_font_path,
+    resolve_font,
+)
 from .preprocess import normalize
+
+
+@functools.lru_cache(maxsize=16)
+def _cmap_codepoints(font_path: str) -> frozenset[int]:
+    """Return the set of Unicode code points covered by a font's cmap."""
+    font = TTFont(font_path)
+    try:
+        return frozenset(font.getBestCmap() or {})
+    finally:
+        font.close()
 
 
 def render_glyph(
@@ -20,6 +37,9 @@ def render_glyph(
 ) -> NDArray[np.bool_]:
     """Render one character to a tight boolean ink mask."""
 
+    font_path = ensure_font_path(font_path)
+    if ord(char) not in _cmap_codepoints(str(font_path)):
+        raise ValueError(f"font {font_path} cannot render {char!r}: missing glyph")
     font = ImageFont.truetype(str(font_path), render_size)
     # Use a generous canvas; the ink bbox below gives the tight mask.
     canvas = Image.new("L", (render_size * 2, render_size * 2), 0)
@@ -47,16 +67,16 @@ def build_templates(
 
     Returns ``(chars, templates)`` where each template row is a uint8 bit
     field of ``target_size * target_size`` bits, little-endian bit order.
-    Characters the font cannot render are skipped with a warning.
+    A character missing from the font is an explicit error.
     """
 
+    font_path = resolve_font(font_path)
     chars: list[str] = []
     rows: list[NDArray[np.uint8]] = []
     for char in charset:
         ink = render_glyph(font_path, char, render_size, threshold)
         if ink.size == 0:
-            print(f"skip {char!r}: no ink rendered")
-            continue
+            raise ValueError(f"font {font_path} cannot render {char!r}: no ink")
         normalized = normalize(ink, target_size)
         rows.append(np.packbits(normalized.reshape(-1), bitorder="little"))
         chars.append(char)
@@ -71,11 +91,19 @@ def write_model(
     templates: NDArray[np.uint8],
     target_size: int = 24,
     version: int = 1,
+    font_path: str | Path | None = None,
+    font_sha256: str | None = None,
 ) -> None:
-    """Write ``config.json``, ``charset.txt`` and ``weights.bin``."""
+    """Write ``config.json``, ``charset.txt`` and ``weights.bin``.
+
+    ``font_path`` is resolved against ``fonts/`` and its SHA256 is stored in
+    the model metadata unless an explicit ``font_sha256`` is given.
+    """
 
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
+    if font_path is not None and font_sha256 is None:
+        font_sha256 = compute_font_sha256(font_path)
 
     config = {
         "input_width": target_size,
@@ -84,6 +112,8 @@ def write_model(
         "version": version,
         "dtype": "f32",
     }
+    if font_sha256:
+        config["font_sha256"] = font_sha256
     (model_dir / "config.json").write_text(
         json.dumps(config, indent=4) + "\n",
         encoding="utf-8",

@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .codegraph/
 model/
+data/
 out/
-fonts/
+fonts/*
+!fonts/registry.json
 .DS_Store

@@ -7,27 +7,18 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
+from fixedfontocr import defaults
 from fixedfontocr.fontgen import build_templates, write_model
-
-
-def _find_font() -> Path:
-    candidates = [
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Supplemental/Verdana.ttf",
-        "/System/Library/Fonts/Geneva.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/HelveticaNeue.ttc",
-        "/System/Library/Fonts/Courier.ttc",
-    ]
-    for path in candidates:
-        if Path(path).exists():
-            return Path(path)
-    raise pytest.skip("no suitable system font found for tests")
 
 
 @pytest.fixture(scope="session")
 def font_path() -> Path:
-    return _find_font()
+    if not defaults.FONT_PATH.exists():
+        pytest.skip(
+            "fonts/SourceHanSansSC/SourceHanSansSC-Bold.otf not found — "
+            "drop the registered font into fonts/ to run these tests"
+        )
+    return defaults.resolve_font(defaults.FONT_PATH)
 
 
 @pytest.fixture(scope="session")
@@ -39,15 +30,15 @@ def model_dir(font_path: Path, tmp_path_factory: pytest.TempPathFactory) -> Path
         "+-×÷%.,:;!?()[]"
     )
     out = tmp_path_factory.mktemp("model")
-    chars, templates = build_templates(font_path, list(charset), render_size=28)
-    write_model(out, chars, templates)
+    chars, templates = build_templates(font_path, list(charset), render_size=32)
+    write_model(out, chars, templates, font_path=font_path)
     return out
 
 
 def render_text(
     text: str,
     font_path: Path,
-    font_size: int = 28,
+    font_size: int = 32,
     color: tuple[int, int, int] = (255, 255, 255),
 ) -> np.ndarray:
     """Render text on black and return an RGB uint8 array."""

@@ -1,9 +1,10 @@
-"""Chinese recognition tests driven by the project's custom font.
+"""Recognition tests driven by the project's bundled game font and charset.
 
-The template model is generated from ``fonts/SourceHanSansSC-Bold.otf``
-(Source Han Sans SC Bold) — the game-UI font this project ships with. The
-font file itself is gitignored (see ``.gitignore``), so these tests skip
-cleanly when it is not present on disk.
+The template model is generated from
+``fonts/SourceHanSansSC/SourceHanSansSC-Bold.otf`` (Source Han Sans SC Bold)
+with ``charsets/sets/combined.txt`` — the game-UI font and CN charset this project
+ships with. The font file itself is gitignored (see ``.gitignore``), so these
+tests skip cleanly when it is not present on disk.
 """
 
 from __future__ import annotations
@@ -13,32 +14,27 @@ from pathlib import Path
 import pytest
 
 from fixedfontocr import FixedFontOCR
+from fixedfontocr import defaults
 from fixedfontocr.fontgen import build_templates, write_model
 
 from conftest import render_text
 
-CUSTOM_FONT = (
-    Path(__file__).resolve().parents[1] / "fonts" / "SourceHanSansSC-Bold.otf"
-)
+CUSTOM_FONT = defaults.FONT_PATH
 
-# Every character appearing in TEST_STRINGS must be listed here: the
-# template baseline can only recognize characters it has a template for.
-CHARSET = "获得金币消耗数量提示确定取消返回攻击防御生命法力值力量点要吗主菜单0123456789"
+# The full CN config charset: ship names, equipment names, Chinese UI copy,
+# and the ASCII letters/digits/punctuation set.
+CHARSET = defaults.read_charset()
 
 TEST_STRINGS = [
+    "俾斯麦",
+    "提尔比茨",
+    "威尔士亲王",
+    "大型单装炮",
     "获得金币1000",
-    "数量提示",
-    "确定取消返回",
-    "确定要取消吗",
-    "攻击防御生命法力",
-    "生命值1000",
     "返回主菜单",
-    "消耗法力10点",
-    "金币500",
-    "攻击力15",
-    "获得10金币",
-    "防御力50",
-    "获得金币1000数量提示确定取消返回攻击防御生命法力",  # long single line
+    "生命值1000",
+    "装备名称",
+    "港区出击",
     "0123456789",
 ]
 
@@ -51,10 +47,10 @@ RENDER_SIZE = 32
 def custom_font() -> Path:
     if not CUSTOM_FONT.exists():
         pytest.skip(
-            "fonts/SourceHanSansSC-Bold.otf not found — the font is gitignored; "
-            "drop it into fonts/ to run these tests"
+            "fonts/SourceHanSansSC/SourceHanSansSC-Bold.otf not found — the "
+            "font is gitignored; drop it into fonts/ to run these tests"
         )
-    return CUSTOM_FONT
+    return defaults.resolve_font(CUSTOM_FONT)
 
 
 @pytest.fixture(scope="session")
@@ -63,7 +59,7 @@ def custom_model_dir(custom_font: Path, tmp_path_factory: pytest.TempPathFactory
     chars, templates = build_templates(
         custom_font, list(CHARSET), render_size=RENDER_SIZE
     )
-    write_model(out, chars, templates)
+    write_model(out, chars, templates, font_path=custom_font)
     return out
 
 

@@ -109,13 +109,9 @@ def test_cnn_recognize_chinese(font_path):
     model_dir = Path(__file__).parent / "fixtures" / "cnn_cjk"
     if not (model_dir / "config.json").exists():
         pytest.skip("cnn_cjk fixture not generated; run scripts/train_tinycnn.py")
-    # The fixture was trained on STHeiti; render with the same face.
-    cjk_path = Path("/System/Library/Fonts/STHeiti Medium.ttc")
-    if not cjk_path.exists():
-        pytest.skip("STHeiti not available")
     ocr = FixedFontOCR(model_path=model_dir, backend="cpu")
     for text in ("获得金币1000", "金币", "1000", "获得"):
-        result = ocr.recognize(render_text(text, cjk_path))
+        result = ocr.recognize(render_text(text, font_path))
         assert result.text == text
 
 

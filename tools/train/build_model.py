@@ -48,6 +48,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--device", default="auto", help="cpu, mps, cuda, or auto")
     parser.add_argument(
+        "--soft",
+        action="store_true",
+        help="train the CNN on soft foreground glyphs (Goal 7 low-res domain)",
+    )
+    parser.add_argument(
         "--skip-dataset",
         action="store_true",
         help="reuse an existing synthetic npz instead of regenerating it",
@@ -59,18 +64,29 @@ def main() -> None:
         parser.error(f"charset not found: {args.charset}")
 
     if not args.skip_dataset:
-        run(
-            [
-                sys.executable,
-                str(ROOT / "tools" / "dataset" / "generate_font_dataset.py"),
-                str(font),
-                str(args.synthetic),
-                "--charset",
-                str(args.charset),
-                "--samples-per-char",
-                str(args.samples_per_char),
-            ]
-        )
+        gen_cmd = [
+            sys.executable,
+            str(ROOT / "tools" / "dataset" / "generate_font_dataset.py"),
+            str(font),
+            str(args.synthetic),
+            "--charset",
+            str(args.charset),
+            "--samples-per-char",
+            str(args.samples_per_char),
+            # Goal 7: train on the real 10-18 px UI domain instead of a
+            # single clean 32 px render.
+            "--render-size-min",
+            "10",
+            "--render-size-max",
+            "18",
+            "--supersample-min",
+            "2",
+            "--supersample-max",
+            "3",
+        ]
+        if args.soft:
+            gen_cmd.append("--soft")
+        run(gen_cmd)
 
     run(
         [

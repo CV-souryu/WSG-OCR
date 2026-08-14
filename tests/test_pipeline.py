@@ -3,7 +3,8 @@ from __future__ import annotations
 import numpy as np
 
 from fixedfontocr import FixedFontOCR
-from fixedfontocr.types import Profile
+from fixedfontocr.preprocess import find_lines
+from fixedfontocr.types import Profile, default_profile
 
 from conftest import render_text
 
@@ -120,3 +121,19 @@ def test_hsl_profile_keeps_white_text_and_drops_colored_ui():
     assert not mask[0, :].any()  # colored noise row dropped
     assert not mask[1:10, :].any()  # blue background dropped
     assert not mask[26:, :].any()
+
+
+def test_line_detector_drops_padded_one_pixel_noise_rows():
+    """A 1px bright UI border must not be padded into a fake text line."""
+
+    mask = np.zeros((40, 128), dtype=bool)
+    mask[0, ::5] = True  # one-pixel border/noise row
+    mask[12:26, 20:108] = True  # real text band
+    lines = find_lines(mask, default_profile())
+
+    assert len(lines) == 1
+    assert lines[0].y == 12
+    assert lines[0].h == 14
+
+    # Noise alone produces no line at all.
+    assert find_lines(mask[:1, :], default_profile()) == []

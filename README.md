@@ -206,6 +206,29 @@ Generate a soft training dataset with
 the npz, propagated through training/export, and written to the model
 config.
 
+## Low-resolution training domain (Goal 7)
+
+Training data is no longer dominated by a clean 32 px render. The dataset
+generator now simulates the full game pipeline:
+
+```text
+fonts/ font
+  -> supersampled render (2-3x)
+  -> random 10..18 px final size
+  -> bilinear / area-like downsampling
+  -> sub-pixel x/y offset, scale variation, blur, alpha, brightness,
+     background blend, outline and shadow
+  -> Goal 3 24x24 normalized glyph
+```
+
+`tools/dataset/generate_font_dataset.py` records `render_sizes`,
+`source_sizes`, `downsample_modes` and per-sample `augmentations` in the
+npz, so a training run can prove it covered every Goal 7 size (10, 11,
+12, 13, 14, 15, 16, 17, 18 px). `tools/train/build_model.py` and
+`scripts/train_tinycnn.py` default to this low-res domain, and the
+`Z17` / `巴尔的摩` characters are part of the regression charset
+(`tests/test_goal7_low_res.py`).
+
 ## CPU benchmark suite and game regression set
 
 ```bash
@@ -243,8 +266,9 @@ Development dependencies (`torch`, `pillow`, `fonttools`, `numpy`) live in
 the `train` extra; runtime inference has no PyTorch dependency.
 
 ```bash
-# 1. Synthetic data: font + random size/offset/outline/shadow/blur/
-#    scale/alpha/background/threshold perturbations -> 24x24 glyphs
+# 1. Synthetic data: Goal 7 low-res domain (10..18 px supersampled render,
+#    bilinear/area-like downsample, sub-pixel offset, scale, blur, alpha,
+#    brightness, background blend, outline/shadow) -> 24x24 glyphs
 python tools/dataset/generate_font_dataset.py \
     fonts/SourceHanSansSC/SourceHanSansSC-Bold.otf synth.npz \
     --charset charsets/sets/combined.txt --samples-per-char 300
@@ -375,6 +399,12 @@ spacing, and normalized size. Pass a custom profile to
   argsort. NumPy vs PyTorch parity (`max error < 1e-5`, identical argmax)
   is covered by `tests/test_goal5_tinycnn.py` and
   `tests/test_goal6_tinycnn.py`.
+- Goal 7 low-resolution training domain is implemented: synthetic data is
+  generated from `fonts/` at 10..18 px through supersampled rendering +
+  bilinear/area-like downsampling with sub-pixel offset, scale, blur, alpha,
+  brightness, background blend, outline and shadow augmentation. The
+  training entry points default to this domain and
+  `tests/test_goal7_low_res.py` covers every size plus `Z17`/`巴尔的摩`.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

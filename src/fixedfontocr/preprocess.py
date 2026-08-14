@@ -126,7 +126,14 @@ def _find_lines(mask: NDArray[np.bool_], profile: Profile) -> list[Segment]:
         if y1 - y0 >= profile.char_height_min:
             row_slice = slice(y0, y1 + 1)
             line_mask = mask[row_slice, :]
-            lines.append(_bbox_segment(line_mask, y0))
+            seg = _bbox_segment(line_mask, y0)
+            # The padded span can include blank gap rows; only keep lines
+            # whose actual ink height looks like text (filters 1px UI border
+            # noise that would otherwise be padded into a "tall" line).
+            # Small punctuation (".", "·", "!", "i") is still text: use a
+            # much lower floor than the full char-height minimum.
+            if seg.h >= max(2, profile.char_height_min // 2):
+                lines.append(seg)
         start = None
 
     for y in range(height):

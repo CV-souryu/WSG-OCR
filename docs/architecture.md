@@ -143,6 +143,31 @@ mode is the default, so pre-existing models keep their 0/255 training
 domain; soft-mode models (e.g. the checked-in `cnn_digits`/`cnn_cjk`
 fixtures) are scored with soft glyphs end to end.
 
+## Low-resolution training domain (Goal 7)
+
+The synthetic generator renders every glyph through the low-resolution
+game pipeline instead of a single clean 32 px raster:
+
+```
+fonts/ font
+  -> supersampled render (2-3x)
+  -> random final font size in 10..18 px
+  -> bilinear / area-like downsampling (GPU-sampling / UI-scale
+     degradation)
+  -> sub-pixel x/y offset, different scale ratios, slight blur (pre- and
+     post-downsample), alpha, brightness, background blending, outline and
+     shadow changes
+  -> Goal 3 baseline-aligned 24x24 glyph (binary or soft)
+```
+
+`tools/dataset/generate_font_dataset.py` stores `render_sizes`,
+`source_sizes`, `downsample_modes` and per-sample `augmentation` tags in
+the npz so the training provenance is explicit. `tools/train/build_model.py`
+passes the 10..18 px supersampled range to the generator by default, and the
+legacy `scripts/train_tinycnn.py` delegates to the same generator. The
+`Z17` and `巴尔的摩` glyphs are exercised at every size by
+`tests/test_goal7_low_res.py`.
+
 TinyCNN models use a unified batch backend; both implementations return the
 same `BackendResult(char_ids, scores)` where `scores` is the top1-top2 logit
 margin. See [`docs/wgpu.md`](wgpu.md) for the WGPU architecture.
@@ -403,9 +428,11 @@ WGPU backend would read, keeping both backends bit-identical.
 
 `tools/` contains the dev-only pipeline:
 
-1. `dataset/generate_font_dataset.py` renders a registered font with random
-   size ±2 px, x/y offset, outline, shadow, blur, scale, alpha, background
-   and threshold into 24×24 glyphs, recording the font SHA256 in the npz;
+1. `dataset/generate_font_dataset.py` renders a registered font through the
+   Goal 7 low-res domain (10..18 px supersampled render, bilinear/area-like
+   downsample, sub-pixel offset, scale, blur, alpha, brightness, background
+   blend, outline and shadow) into 24×24 glyphs, recording the font SHA256,
+   per-sample render sizes and augmentation tags in the npz;
 2. `dataset/collect_real_samples.py` converts label-named screenshot directories
    into glyph samples (single-character images or full lines segmented by
    the production pipeline); `--font` records the matching font SHA256;
@@ -468,6 +495,7 @@ verified:
 | Top-2 without full sort | `postprocess.top2` (argmax + argpartition), `tests/test_segmentation.py::test_top2_matches_argsort_reference` |
 | Stride-2 forward has no useless work | optimized conv/pw + `tests/test_cnn.py` parity tests, benchmark max_error 0.0 |
 | Goal 6 CPU TinyCNN optimization | `tests/test_goal6_tinycnn.py` (strided im2col, no activation-dict forward, prepared weights, batch, Top-K via partition) |
+| Goal 7 low-res training domain | `tests/test_goal7_low_res.py` (10..18 px coverage, supersampled bilinear/area-like downsample, sub-pixel/scale/blur/alpha/brightness/background/outline augmentation, Z17/巴尔的摩) |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
 | Real game regression passes | `tests/test_game_samples.py` (23 samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |

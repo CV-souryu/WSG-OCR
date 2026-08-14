@@ -204,7 +204,7 @@ def _split_atoms(
     if (
         max_splits < 1
         or comp.h < max(2, profile.char_height_min)
-        or comp.w <= max(expected_width * 1.8, comp.h * 1.4)
+        or comp.w <= max(expected_width * 1.5, comp.h * 1.4)
     ):
         return whole
     cuts = _valley_cuts(comp.mask, expected_width, profile, max_splits)

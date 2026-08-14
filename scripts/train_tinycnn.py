@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -26,18 +27,14 @@ except ImportError:
     sys.exit("PyTorch is required for training: pip install torch")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 from fixedfontocr import defaults  # noqa: E402
 from fixedfontocr.defaults import resolve_font  # noqa: E402
 from fixedfontocr.model import write_cnn_model  # noqa: E402
-from fixedfontocr.preprocess import (  # noqa: E402
-    Component,
-    compute_normalize_spec,
-    glyph_normalize_geometry,
-    normalize,
-    normalize_grayscale,
-)
-from fixedfontocr.types import Profile  # noqa: E402
+from fixedfontocr.preprocess import compute_normalize_spec  # noqa: E402
+from tools.dataset.generate_font_dataset import generate_dataset  # noqa: E402
 
 
 def read_charset(path: str | None, default: str) -> list[str]:
@@ -68,77 +65,40 @@ def make_dataset(
     threshold_min: int = 100,
     threshold_max: int = 180,
     soft: bool = False,
+    supersample_min: int = 2,
+    supersample_max: int = 3,
+    downsample: str = "random",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Render ``charset`` at random sizes/thresholds into 24x24 float tensors."""
+    """Render ``charset`` through the Goal 7 low-res domain into float tensors.
 
-    from PIL import Image, ImageDraw, ImageFont
+    Delegates to :func:`tools.dataset.generate_font_dataset.generate_dataset`
+    so this legacy training entry point gets the same 10-18 px supersampled
+    render, bilinear/area-like downsample, sub-pixel offset, alpha,
+    brightness, background blend, blur, outline and scale augmentation as
+    the primary pipeline.
+    """
 
-    profile = Profile(name="train", use_grayscale=True, grayscale_threshold=140)
-    spec = compute_normalize_spec(font, charset, 24, None)
-    x_list: list[np.ndarray] = []
-    y_list: list[int] = []
-    for label, char in enumerate(charset):
-        for _ in range(samples_per_char):
-            size = int(rng.integers(size_min, size_max + 1))
-            font_obj = ImageFont.truetype(font, size)
-            bbox = font_obj.getbbox(char)
-            pad = 8
-            w = bbox[2] - bbox[0] + pad * 2
-            h = bbox[3] - bbox[1] + pad * 2
-            img = Image.new("RGB", (max(1, w), max(1, h)), (0, 0, 0))
-            ImageDraw.Draw(img).text(
-                (pad - bbox[0], pad - bbox[1]), char, font=font_obj, fill=(255, 255, 255)
-            )
-            gray = np.asarray(img).astype(np.float32) @ np.array(
-                [0.299, 0.587, 0.114], dtype=np.float32
-            )
-            threshold = float(rng.integers(threshold_min, threshold_max + 1))
-            mask = gray >= threshold
-            ys, xs = np.where(mask)
-            if ys.size == 0:
-                raise ValueError(
-                    f"font {font} cannot render {char!r}: no ink rendered"
-                )
-            y0, y1 = ys.min(), ys.max() + 1
-            x0, x1 = xs.min(), xs.max() + 1
-            tight = mask[y0:y1, x0:x1]
-            tight_gray = gray[y0:y1, x0:x1].astype(np.uint8)
-            th, tw = tight.shape
-            candidate = Component(mask=tight, x=0, y=0, w=tw, h=th)
-            baseline_offset, scale = glyph_normalize_geometry(candidate, spec, 24)
-            glyph = (
-                normalize_grayscale(
-                    tight_gray,
-                    24,
-                    baseline_offset=baseline_offset,
-                    scale=scale,
-                    baseline_row=spec.baseline_row,
-                )
-                if soft
-                else normalize(
-                    tight,
-                    24,
-                    baseline_offset=baseline_offset,
-                    scale=scale,
-                    baseline_row=spec.baseline_row,
-                )
-            ).astype(np.float32) / 255.0
-            # Random sub-pixel segmentation jitter: shift by -1..1 px.
-            dx = int(rng.integers(-1, 2))
-            dy = int(rng.integers(-1, 2))
-            if dx or dy:
-                shifted = np.zeros_like(glyph)
-                y0, y1 = max(0, dy), min(24, 24 + dy)
-                x0, x1 = max(0, dx), min(24, 24 + dx)
-                sy0, sy1 = max(0, -dy), min(24, 24 - dy)
-                sx0, sx1 = max(0, -dx), min(24, 24 - dx)
-                shifted[y0:y1, x0:x1] = glyph[sy0:sy1, sx0:sx1]
-                glyph = shifted
-            x_list.append(glyph[None, :, :])
-            y_list.append(label)
-    x = np.stack(x_list).astype(np.float32)
-    y = np.asarray(y_list, dtype=np.int64)
-    return x, y
+    with tempfile.TemporaryDirectory() as td:
+        npz_path = Path(td) / "synthetic.npz"
+        generate_dataset(
+            font,
+            charset,
+            samples_per_char,
+            npz_path,
+            seed=int(rng.integers(0, 2**31 - 1)),
+            threshold_min=threshold_min,
+            threshold_max=threshold_max,
+            soft=soft,
+            render_size_min=size_min,
+            render_size_max=size_max,
+            supersample_min=supersample_min,
+            supersample_max=supersample_max,
+            downsample=downsample,
+        )
+        data = np.load(npz_path)
+        x = data["x"].astype(np.float32)[:, None, :, :] / 255.0
+        y = data["y"]
+        return x, y
 
 
 class TinyCNN(nn.Module):
@@ -202,8 +162,16 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=2e-3)
-    parser.add_argument("--render-size-min", type=int, default=24)
-    parser.add_argument("--render-size-max", type=int, default=36)
+    parser.add_argument("--render-size-min", type=int, default=10)
+    parser.add_argument("--render-size-max", type=int, default=18)
+    parser.add_argument("--supersample-min", type=int, default=2)
+    parser.add_argument("--supersample-max", type=int, default=3)
+    parser.add_argument(
+        "--downsample",
+        choices=("bilinear", "area", "random"),
+        default="random",
+        help="degradation used when resizing to the final screenshot size",
+    )
     parser.add_argument("--threshold-min", type=int, default=100)
     parser.add_argument("--threshold-max", type=int, default=180)
     parser.add_argument(
@@ -231,6 +199,9 @@ def main() -> None:
         args.threshold_min,
         args.threshold_max,
         soft=args.soft,
+        supersample_min=args.supersample_min,
+        supersample_max=args.supersample_max,
+        downsample=args.downsample,
     )
     n = x.shape[0]
     perm = rng.permutation(n)

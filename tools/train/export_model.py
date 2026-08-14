@@ -165,8 +165,9 @@ def main() -> None:
         write_hybrid_model(
             out,
             charset,
-            tmpl.templates,
-            weights,
+            templates=(None if tmpl.templates_v2 is not None else tmpl.templates),
+            templates_v2=tmpl.templates_v2,
+            weights=weights,
             input_size=24,
             template_threshold=args.template_threshold,
             template_margin_threshold=args.template_margin_threshold,

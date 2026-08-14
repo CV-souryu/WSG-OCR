@@ -15,7 +15,7 @@ from .backends import (
     WGPUBackend,
     benchmark_backends,
 )
-from .classifier import Classifier, TemplateClassifier
+from .classifier import Classifier, TemplateClassifier, TemplateV2Classifier
 from .cnn import forward
 from .frontend import extract_frontend
 from .model import load_model
@@ -88,25 +88,33 @@ class FixedFontOCR:
                 raise ValueError(
                     "WGPU backend requires a tinycnn model; template models run on CPU"
                 )
-            self._classifier: Classifier = TemplateClassifier(
-                templates=self.model.templates,
-                charset=self.model.charset,
-                input_size=self.model.input_size,
-                normalize_spec=self.model.normalize_spec,
-            )
+            self._classifier: Classifier = self._make_template_classifier()
         if self.model.classifier == "hybrid":
-            self._template_classifier = TemplateClassifier(
-                templates=self.model.templates,
-                charset=self.model.charset,
-                input_size=self.model.input_size,
-                normalize_spec=self.model.normalize_spec,
-            )
+            self._template_classifier = self._make_template_classifier()
             self._template_threshold = float(
                 self.model.config.get("template_threshold", 0.90)
             )
             self._cnn_threshold = float(
                 self.model.config.get("cnn_threshold", 0.0)
             )
+
+    def _make_template_classifier(self) -> Classifier:
+        """Goal 9: V2 multi-prototype matcher when present, V1 otherwise."""
+        if self.model.templates_v2 is not None:
+            return TemplateV2Classifier(
+                data=self.model.templates_v2,
+                charset=self.model.charset,
+                input_size=self.model.input_size,
+                normalize_spec=self.model.normalize_spec,
+            )
+        if self.model.templates is None:
+            raise ValueError("model has no template half")
+        return TemplateClassifier(
+            templates=self.model.templates,
+            charset=self.model.charset,
+            input_size=self.model.input_size,
+            normalize_spec=self.model.normalize_spec,
+        )
 
     # ------------------------------------------------------------------
     # Backend selection

@@ -6,8 +6,13 @@ Measured on a 3000-char CJK template model:
     disk:   216 KB weights.bin + ~9 KB charset.txt + ~0.9 MB
             geometry.json (Goal 8) (~1.1 MB total)
     memory: 216 KB template bits + 24 KB coarse features + 0 popcount table
-             (numpy >= 2.0 vectorized bit_count; 64 KB fallback table on
-             older numpy)
+            (numpy >= 2.0 vectorized bit_count; 64 KB fallback table on
+            older numpy)
+
+Goal 9 Template V2 models replace the single bitset per character with a
+prototype grid (default 49 per character: 6 sizes × 4 sub-pixel phases × 2
+downsample modes + 1 clean high-res render), so the same 3000-char model
+stores ~10.3 MB of bitsets plus ~0.6 MB of metadata and coarse features.
 
 A 3000-class TinyCNN stores 4032 bytes of conv weights + 33*C*4 bytes of
 linear weights (C = classes), e.g. ~391 KB. Hybrid models store both.
@@ -98,6 +103,21 @@ def main() -> None:
         print(f"  coarse features:  {fmt_bytes(features_bytes)}")
         print(f"  popcount table:   {fmt_bytes(popcount_bytes)} (0 with numpy>=2.0)")
         memory += template_bytes + features_bytes + popcount_bytes
+    if model.templates_v2 is not None:
+        p = model.templates_v2.prototypes_per_char
+        bytes_per = model.templates_v2.bytes_per_template
+        template_bytes = n * p * bytes_per
+        meta_bytes = n * p * 4  # render size + dx/dy + downsample mode
+        features_bytes = n * p * 8  # per-prototype coarse features
+        popcount_bytes = 0 if hasattr(np, "bitwise_count") else 65536
+        print(
+            f"  template V2 bitset: {fmt_bytes(template_bytes)} "
+            f"({n} chars × {p} prototypes)"
+        )
+        print(f"  prototype metadata: {fmt_bytes(meta_bytes)}")
+        print(f"  coarse features:    {fmt_bytes(features_bytes)}")
+        print(f"  popcount table:     {fmt_bytes(popcount_bytes)} (0 with numpy>=2.0)")
+        memory += template_bytes + meta_bytes + features_bytes + popcount_bytes
     if model.weights is not None:
         cnn_bytes = sum(int(a.nbytes) for a in model.weights.values())
         print(f"  cnn weights:      {fmt_bytes(cnn_bytes)}")

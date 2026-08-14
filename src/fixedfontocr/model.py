@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from .classifier import TemplateV2Data
 from .cnn import (
     TINYCNN_V1_NAME,
     cnn_tensor_shapes,
@@ -16,6 +18,11 @@ from .cnn import (
 from .defaults import compute_font_sha256
 from .geometry import FontGeometryDatabase, write_geometry_json
 from .preprocess import NormalizeSpec, compute_normalize_spec
+
+# Goal 9 ``templates.bin`` V2 magic ("TPL2" little-endian). V1 template
+# files start with ``uint32 count`` and are detected by the absence of this
+# magic.
+TEMPLATE_V2_MAGIC = 0x32504C54
 
 
 @dataclass
@@ -30,6 +37,7 @@ class OCRModel:
     input_mode: str = "binary"
     normalize_spec: NormalizeSpec | None = None
     geometry: FontGeometryDatabase | None = None
+    templates_v2: TemplateV2Data | None = None
 
 
 # The tensor shape table (formerly CNN_TENSORS / cnn_tensor_shapes) now
@@ -106,15 +114,33 @@ def load_model(model_path: Path) -> OCRModel:
         weights = _load_cnn_weights(weights_path, num_classes)
     else:
         weights = None
+    templates = None
+    templates_v2 = None
     if classifier == "hybrid":
         templates_path = model_path / "templates.bin"
         if not templates_path.exists():
             raise FileNotFoundError(f"hybrid model requires {templates_path}")
-        templates = _load_template_weights(templates_path, num_classes, input_size)
+        if _is_template_v2(templates_path):
+            if config.get("template_version", 1) != 2:
+                raise ValueError(
+                    "templates.bin is V2 but config.json does not declare "
+                    "template_version 2"
+                )
+            templates_v2 = load_template_v2(
+                templates_path, num_classes, input_size
+            )
+        else:
+            templates = _load_template_weights(templates_path, num_classes, input_size)
     elif classifier == "template":
-        templates = _load_template_weights(weights_path, num_classes, input_size)
-    else:
-        templates = None
+        if _is_template_v2(weights_path):
+            if config.get("template_version", 1) != 2:
+                raise ValueError(
+                    "weights.bin is a V2 template file but config.json does "
+                    "not declare template_version 2"
+                )
+            templates_v2 = load_template_v2(weights_path, num_classes, input_size)
+        else:
+            templates = _load_template_weights(weights_path, num_classes, input_size)
     geometry = None
     geometry_path = model_path / "geometry.json"
     if geometry_path.exists():
@@ -142,6 +168,84 @@ def load_model(model_path: Path) -> OCRModel:
         input_mode=input_mode,
         normalize_spec=NormalizeSpec.from_dict(config.get("normalize")),
         geometry=geometry,
+        templates_v2=templates_v2,
+    )
+
+
+def _is_template_v2(path: Path) -> bool:
+    """True when ``templates.bin``/``weights.bin`` starts with the V2 magic."""
+    with open(path, "rb") as fh:
+        head = fh.read(4)
+    return len(head) == 4 and struct.unpack("<I", head)[0] == TEMPLATE_V2_MAGIC
+
+
+def save_template_v2(path: Path, data: TemplateV2Data) -> None:
+    """Write a Goal 9 template set: header + per-prototype metadata + bits."""
+
+    path = Path(path)
+    count = data.num_classes
+    p = data.prototypes_per_char
+    bytes_per = data.bytes_per_template
+    header = np.array(
+        [TEMPLATE_V2_MAGIC, count, p, bytes_per], dtype="<u4"
+    )
+    meta = np.stack(
+        [
+            data.render_sizes.reshape(-1),
+            data.dx.reshape(-1),
+            data.dy.reshape(-1),
+            data.downsample_modes.reshape(-1),
+        ],
+        axis=1,
+    ).astype(np.uint8).reshape(-1)
+    payload = np.ascontiguousarray(data.bits).reshape(-1)
+    path.write_bytes(
+        b"".join([header.tobytes(), meta.tobytes(), payload.tobytes()])
+    )
+
+
+def load_template_v2(
+    path: Path,
+    num_classes: int,
+    input_size: int,
+) -> TemplateV2Data:
+    """Load a Goal 9 ``templates.bin`` into a :class:`TemplateV2Data`."""
+
+    raw = Path(path).read_bytes()
+    if len(raw) < 16:
+        raise ValueError(f"template V2 file too small: {path}")
+    magic, count, p, bytes_per = struct.unpack("<IIII", raw[:16])
+    if magic != TEMPLATE_V2_MAGIC:
+        raise ValueError(f"not a Template V2 file: {path}")
+    if count != num_classes:
+        raise ValueError(
+            f"templates.bin has {count} classes but config declares {num_classes}"
+        )
+    expected_bytes = (input_size * input_size + 7) // 8
+    if bytes_per != expected_bytes:
+        raise ValueError(
+            f"templates.bin bytes_per_template={bytes_per} does not match "
+            f"{input_size}x{input_size} bits"
+        )
+    meta_bytes = count * p * 4
+    payload_bytes = count * p * bytes_per
+    if len(raw) != 16 + meta_bytes + payload_bytes:
+        raise ValueError(
+            f"templates.bin payload is {len(raw) - 16 - meta_bytes} bytes, "
+            f"expected {payload_bytes}"
+        )
+    meta = np.frombuffer(raw[16 : 16 + meta_bytes], dtype=np.uint8).reshape(
+        count, p, 4
+    )
+    bits = np.frombuffer(
+        raw[16 + meta_bytes :], dtype=np.uint8
+    ).reshape(count, p, bytes_per)
+    return TemplateV2Data(
+        bits=bits,
+        render_sizes=meta[:, :, 0],
+        dx=meta[:, :, 1],
+        dy=meta[:, :, 2],
+        downsample_modes=meta[:, :, 3],
     )
 
 
@@ -291,8 +395,9 @@ def write_cnn_model(
 def write_hybrid_model(
     model_dir: Path,
     chars: list[str],
-    templates: np.ndarray,
+    templates: np.ndarray | None,
     weights: dict[str, np.ndarray],
+    templates_v2: TemplateV2Data | None = None,
     input_size: int = 24,
     template_threshold: float = 0.90,
     template_margin_threshold: float = 0.04,
@@ -308,13 +413,17 @@ def write_hybrid_model(
     """Write a hybrid model: template level-1 + TinyCNN level-2.
 
     Layout: ``config.json`` (``classifier: "hybrid"``), ``charset.txt``,
-    ``templates.bin`` (bitset templates, same payload as a template model's
-    ``weights.bin``), ``weights.bin`` (f32 CNN tensors) and, when a font or
-    prebuilt database is available, ``geometry.json`` (Goal 8). The runtime
-    pipeline tries the template first and only runs the CNN on glyphs whose
-    template confidence is below ``template_threshold``.
+    ``templates.bin`` (V1 bitset templates or a Goal 9 V2 multi-prototype
+    set), ``weights.bin`` (f32 CNN tensors) and, when a font or prebuilt
+    database is available, ``geometry.json`` (Goal 8). The runtime pipeline
+    tries the template first and only runs the CNN on glyphs whose template
+    confidence is below ``template_threshold``.
     """
 
+    if (templates is None) == (templates_v2 is None):
+        raise ValueError(
+            "write_hybrid_model needs exactly one of templates / templates_v2"
+        )
     if input_mode not in ("binary", "soft"):
         raise ValueError(f"unsupported input_mode {input_mode!r}")
     model_dir = Path(model_dir)
@@ -334,6 +443,8 @@ def write_hybrid_model(
         "cnn_threshold": float(cnn_threshold),
         "input_mode": input_mode,
     }
+    if templates_v2 is not None:
+        config["template_version"] = 2
     if font_sha256:
         config["font_sha256"] = font_sha256
     if normalize_spec is None and font_path is not None:
@@ -361,11 +472,19 @@ def write_hybrid_model(
         "".join(chars) + "\n",
         encoding="utf-8",
     )
-    if templates.shape[1] != (input_size * input_size + 7) // 8:
-        raise ValueError("template byte width does not match input_size")
-    if templates.shape[0] != len(chars):
-        raise ValueError("templates and charset must have the same length")
-    header = np.array([len(chars), templates.shape[1]], dtype="<u4")
-    payload = np.concatenate([header.view(np.uint8), np.asarray(templates).reshape(-1)])
-    (model_dir / "templates.bin").write_bytes(payload.tobytes())
+    if templates_v2 is not None:
+        if templates_v2.num_classes != len(chars):
+            raise ValueError("templates_v2 and charset must have the same length")
+        save_template_v2(model_dir / "templates.bin", templates_v2)
+    else:
+        assert templates is not None
+        if templates.shape[1] != (input_size * input_size + 7) // 8:
+            raise ValueError("template byte width does not match input_size")
+        if templates.shape[0] != len(chars):
+            raise ValueError("templates and charset must have the same length")
+        header = np.array([len(chars), templates.shape[1]], dtype="<u4")
+        payload = np.concatenate(
+            [header.view(np.uint8), np.asarray(templates).reshape(-1)]
+        )
+        (model_dir / "templates.bin").write_bytes(payload.tobytes())
     write_cnn_weights(model_dir / "weights.bin", weights, len(chars))

@@ -6,7 +6,14 @@ import argparse
 from pathlib import Path
 
 from . import defaults
-from .fontgen import build_templates, write_model
+from .fontgen import (
+    TEMPLATE_V2_DOWNSAMPLE_MODES,
+    TEMPLATE_V2_SIZES,
+    build_template_v2,
+    build_templates,
+    write_model,
+    write_template_v2_model,
+)
 
 
 def _read_charset(path: str | None, default: str) -> list[str]:
@@ -61,20 +68,74 @@ def main() -> None:
         default=140,
         help="anti-aliased alpha threshold for binarization (default 140)",
     )
+    parser.add_argument(
+        "--template-v1",
+        action="store_true",
+        help="write the legacy one-template-per-character format "
+        "(default is Goal 9 Template V2 multi-prototype)",
+    )
+    parser.add_argument(
+        "--render-sizes",
+        default=",".join(str(s) for s in TEMPLATE_V2_SIZES),
+        help="comma-separated prototype render sizes in px "
+        f"(default {','.join(str(s) for s in TEMPLATE_V2_SIZES)})",
+    )
+    parser.add_argument(
+        "--downsample",
+        default=",".join(TEMPLATE_V2_DOWNSAMPLE_MODES),
+        help="comma-separated downsample modes: bilinear,area",
+    )
+    parser.add_argument(
+        "--supersample",
+        type=int,
+        default=3,
+        help="supersampling factor used before downsampling prototypes",
+    )
     args = parser.parse_args()
 
     default_charset = defaults.read_charset()
     font = defaults.resolve_font(args.font)
     chars = _read_charset(args.charset, default_charset)
-    used, templates = build_templates(
+    if args.template_v1:
+        used, templates = build_templates(
+            font,
+            chars,
+            target_size=args.size,
+            render_size=args.render_size,
+            threshold=args.threshold,
+        )
+        write_model(args.output, used, templates, target_size=args.size, font_path=font)
+        print(f"wrote {len(used)} templates to {args.output}")
+        return
+    sizes = tuple(int(v) for v in args.render_sizes.split(",") if v.strip())
+    modes = tuple(m for m in args.downsample.split(",") if m.strip())
+    for mode in modes:
+        if mode not in TEMPLATE_V2_DOWNSAMPLE_MODES:
+            parser.error(
+                f"unknown downsample mode {mode!r}; use bilinear/area"
+            )
+    used, data = build_template_v2(
         font,
         chars,
         target_size=args.size,
+        render_sizes=sizes,
+        downsample_modes=modes,
+        supersample=args.supersample,
+        threshold=args.threshold,
+    )
+    write_template_v2_model(
+        args.output,
+        used,
+        data,
+        target_size=args.size,
+        font_path=font,
         render_size=args.render_size,
         threshold=args.threshold,
     )
-    write_model(args.output, used, templates, target_size=args.size, font_path=font)
-    print(f"wrote {len(used)} templates to {args.output}")
+    print(
+        f"wrote {len(used)} characters × {data.prototypes_per_char} "
+        f"prototypes (Template V2) to {args.output}"
+    )
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 ├── src/fixedfontocr/    # the package
 │   ├── api.py           # FixedFontOCR engine (auto backend, hybrid, allowed_chars)
 │   ├── backends.py      # CPUBackend / WGPUBackend / AutoBackend + benchmark
-│   ├── classifier.py    # template matcher (with coarse candidate filtering)
+│   ├── classifier.py    # template matcher V1/V2 (coarse filter + XOR/popcount)
 │   ├── cnn.py           # numpy TinyCNN reference (Conv + ReLU only)
 │   ├── frontend.py      # Goal 2 Visual Frontend: binary mask + soft
 │   │                    #   foreground from one RGB pass
@@ -90,16 +90,22 @@ lexicon-inferred `matched_term`/`matched_span`.
 
 Three classifier types are supported in the same model directory format:
 
-- **Template** (default): `fixedfontocr-generate` renders every character
-  to a bitset; recognition is XOR + popcount over a coarse-feature-filtered
-  candidate set.
+- **Template** (default): `fixedfontocr-generate` writes a Goal 9
+  multi-prototype set -- every character owns 49 prototypes (11..16 px
+  renders × sub-pixel phases × bilinear/area-like downsample, plus one
+  clean high-res render). Recognition is XOR + popcount over a
+  coarse-feature-filtered candidate set, aggregated per character into
+  Top-K / best / second / margin.
 - **TinyCNN**: the small fixed network (Conv3x3 stride-2, DWConv3x3,
   Pointwise1x1 stride-2, GAP, Linear). Runtime inference is pure numpy or
   WGSL; training uses PyTorch.
 - **Hybrid**: template level-1 + TinyCNN level-2 + unknown. Only glyphs
   whose template confidence *or* top-1/top-2 margin is low (the 未/末,
   日/曰, 0/O cases) reach the CNN — a high score with a tiny margin is
-  treated as ambiguous (P6).
+  treated as ambiguous (P6). With Template V2 an exact match on a
+  low-res prototype with a zero margin is also routed to the CNN: at
+  11 px, '.' and '*' rasterize to the same blob, so the template reports
+  the tie as Top-K instead of deciding.
 
 ## Automatic backend selection (`backend="auto"`)
 
@@ -348,9 +354,11 @@ footprint of any model. Measured numbers for a 3000-char CJK template model:
 | item | size |
 | --- | --- |
 | template weights on disk | ~211 KiB (`N × 72 B` bitsets + 8 B header) |
+| template V2 weights on disk | ~10.3 MiB for 3000 chars (`N × 49 × 72 B` bitsets + per-prototype metadata; Goal 9) |
 | charset.txt | ~9 KiB (3000 CJK chars) |
 | geometry.json | ~0.9 MiB for 3000 chars (per-char Goal 8 metrics, ~300 B/char) |
 | template bits in RAM | ~211 KiB (shared with the loaded model, no copy) |
+| template V2 bits in RAM | ~10.3 MiB + ~0.6 MiB prototype metadata/coarse features |
 | coarse candidate features | ~23 KiB (`8 B/char`: uint16 ink + uint8 bbox/margins) |
 | popcount table | 0 B with numpy ≥ 2.0 (`bitwise_count`), 64 KiB fallback |
 
@@ -375,7 +383,8 @@ numpy RGB
   -> connected components -> candidate lattice (merge + split(Cx))
   -> 24x24 normalization (CPU, Goal 3 baseline frame)
   -> backend:
-       template: coarse feature filter -> XOR + popcount
+       template: coarse feature filter -> XOR + popcount over 49
+                 prototypes/char -> per-char Top-K / best / second / margin
        tinycnn:  CPUBackend / WGPUBackend / AutoBackend
        hybrid:   template first, CNN fallback, unknown
   -> allowed_chars restriction (postprocess)
@@ -395,6 +404,14 @@ model/
 └── weights.bin    # template: uint32 count + packed bits;
                    # tinycnn/hybrid: f32 tensors in fixed order
                    # hybrid also has templates.bin
+
+Template models written since Goal 9 use the V2 format instead:
+``weights.bin`` (or ``templates.bin`` for hybrid) starts with the magic
+``TPL2``, then ``uint32 count / prototypes_per_char / bytes_per_template``,
+then a per-prototype metadata block (render size, sub-pixel phase in 1/8 px,
+downsample mode) and finally the packed bitset payload. Legacy V1 files
+are detected by the absence of the magic and keep loading unchanged.
+``config.json`` records ``"template_version": 2``.
 ```
 
 ## Profiles
@@ -445,6 +462,15 @@ spacing, and normalized size. Pass a custom profile to
   candidate pruning, the geometry score and split/merge width priors.
   `tests/test_goal8_geometry.py` covers generation, round-trip, narrow vs.
   full-width priors and the regression set.
+- Goal 9 Template V2 is implemented: `fixedfontocr-generate` defaults to a
+  49-prototype-per-character grid (11..16 px × sub-pixel phases ×
+  bilinear/area-like downsample + clean high-res render); matching keeps
+  the geometry prefilter + XOR/popcount cascade and returns Top-K / best /
+  second / margin with winning-prototype metadata. The bundled
+  `model/game_cn_template` and hybrid `model/game_cn` are shipped in the
+  V2 format, and `tests/test_goal9_template_v2.py` covers the grid,
+  round-trip, prefilter exactness, low-res confusables (未/末, Z/2) and the
+  '.'/ '*' low-res tie routing to the CNN.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

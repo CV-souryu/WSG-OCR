@@ -18,7 +18,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .classifier import TemplateClassifier
+from .classifier import (
+    DOWNSAMPLE_CLEAN,
+    TemplateClassifier,
+    TemplateV2Classifier,
+)
 from .cnn import prepare_weights
 from .model import OCRModel
 from .postprocess import second_ids as topk_second_ids
@@ -142,16 +146,22 @@ class SegmentScorer:
         self.model = model
         self.input_size = model.input_size
         self.normalize_spec = model.normalize_spec
-        self.template = (
-            TemplateClassifier(
+        if model.templates_v2 is not None:
+            self.template = TemplateV2Classifier(
+                data=model.templates_v2,
+                charset=model.charset,
+                input_size=model.input_size,
+                normalize_spec=model.normalize_spec,
+            )
+        elif model.templates is not None:
+            self.template = TemplateClassifier(
                 templates=model.templates,
                 charset=model.charset,
                 input_size=model.input_size,
                 normalize_spec=model.normalize_spec,
             )
-            if model.templates is not None
-            else None
-        )
+        else:
+            self.template = None
         self.weights = prepare_weights(model.weights) if model.weights else None
         self.template_threshold = float(model.config.get("template_threshold", 0.90))
         self.template_margin_threshold = float(
@@ -246,6 +256,17 @@ class SegmentScorer:
                 (tb.scores < 1.0)
                 & (tb.margins < self.template_margin_threshold)
             )
+            if isinstance(self.template, TemplateV2Classifier):
+                # A pixel-exact low-res prototype can be shared by two
+                # different characters (e.g. '.' and '*' both rasterize to
+                # the same tiny blob at 11 px), so an exact match with zero
+                # margin is only trustworthy when it came from the clean
+                # high-res prototype; everything else goes to the CNN.
+                needs_cnn = needs_cnn | (
+                    (tb.scores >= 1.0)
+                    & (tb.margins <= 0.0)
+                    & (tb.prototype_downsample_modes != DOWNSAMPLE_CLEAN)
+                )
             if np.any(needs_cnn):
                 cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch)
             out: list[SegmentScore] = []

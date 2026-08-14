@@ -48,12 +48,12 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/geometry.py` | Goal 8 font geometry database: offline generation from a registered font (`advance`, bbox, aspect, ink, component count, baseline) plus the runtime JSON lookup table used by pruning and geometry scoring. |
 | `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms) and the visual DP decoder. This is the production segmentation path. |
 | `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate; converts raw scores to a shared 0..1 visual score. |
-| `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier`: coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; `match_batch` for the lattice. |
+| `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier` (V1 single-template) and `TemplateV2Classifier` (Goal 9 multi-prototype): coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; Top-K/best/second/margin + winning-prototype metadata for the lattice. |
 | `src/fixedfontocr/cnn.py` | `TinyCNNClassifier` numpy forward pass (stride-2 optimized), `forward_with_activations` for exported test vectors and `classify_batch(glyphs, top_k=2)`. |
 | `src/fixedfontocr/reference_cnn.py` | Full-then-slice reference forward used by tests to prove the optimized forward matches (P2 acceptance). |
 | `src/fixedfontocr/postprocess.py` | `allowed_chars` → charset-index restriction and O(C) top-1/top-2 scoring (no full argsort). |
-| `src/fixedfontocr/fontgen.py` | Renders font glyphs into normalized bitset templates; writes model directories. |
-| `src/fixedfontocr/model.py` | Model format I/O: `config.json` + `charset.txt` + `weights.bin` (+ `templates.bin` for hybrid). |
+| `src/fixedfontocr/fontgen.py` | Renders font glyphs into normalized bitset templates (V1 and Goal 9 V2 prototype grids); writes model directories. |
+| `src/fixedfontocr/model.py` | Model format I/O: `config.json` + `charset.txt` + `weights.bin` (+ `templates.bin` for hybrid); V1/V2 template detection and `template_version`. |
 | `src/fixedfontocr/cli.py` | `fixedfontocr-generate` command-line entry point. |
 | `tools/register_font.py` | Adds a font under `fonts/` to `fonts/registry.json` with its SHA256. |
 
@@ -165,6 +165,55 @@ At runtime the database is used in three places:
 
 The Goal 4/Goal 7 regression strings are unchanged with the database
 enabled (`tests/test_goal8_geometry.py`).
+
+## Template V2 (Goal 9)
+
+Goal 9 upgrades the template layer from one bitmap per character to a
+multi-prototype grid generated offline from the registered font:
+
+```text
+Z
+├─ 11 px   (4 sub-pixel phases × bilinear/area-like downsample)
+├─ 12 px   (4 sub-pixel phases × bilinear/area-like downsample)
+├─ 13 px   (4 sub-pixel phases × bilinear/area-like downsample)
+├─ 14 px   (4 sub-pixel phases × bilinear/area-like downsample)
+├─ 15 px   (4 sub-pixel phases × bilinear/area-like downsample)
+├─ 16 px   (4 sub-pixel phases × bilinear/area-like downsample)
+└─ 32 px clean render (the legacy V1 prototype, kept so V2 is never worse
+                       on clean screenshots)
+```
+
+Each prototype is rendered on a supersampled canvas (`render_size × 3`),
+shifted by a fractional sub-pixel phase, downsampled with bilinear or
+area-like (BOX) resampling, binarized, and normalized into the same Goal 3
+24×24 baseline frame used at runtime. Missing ink at the configured
+threshold is retried at lower thresholds before an explicit error, and the
+data layer rejects all-zero prototypes (Font Policy: missing glyphs are
+hard errors).
+
+`TemplateV2Classifier` keeps the V1 cascade -- geometry prefilter (ink,
+bbox, margins) then XOR + popcount -- but runs it per prototype and
+aggregates by character:
+
+* best character = argmin over characters of their best-prototype distance;
+* second score = the second-ranked character's best-prototype distance;
+* margin = normalized best/second gap;
+* Top-K = the top `K` characters, each with the winning prototype's render
+  size, sub-pixel phase and downsample mode.
+
+The prefilter is exact for the returned Top-K: after scanning the
+geometrically close prototypes, every prototype whose ink-count delta is no
+larger than the current K-th character distance is scanned too (Hamming
+distance >= |ink delta|), so no contender can be missed. The matcher never
+decides the final character; it only feeds the scorer/decoder with ranked
+visual evidence.
+
+The hybrid gate treats an exact low-res match with a zero margin as
+ambiguous (e.g. '.' and '*' rasterize to the same blob at 11 px) and routes
+it to the CNN, while an exact clean-prototype match keeps the V1 exact-match
+semantics. `templates.bin`/`weights.bin` for V2 models start with the magic
+`TPL2` and carry per-prototype metadata; V1 files are detected by the
+absence of the magic and keep loading (`tests/test_goal9_template_v2.py`).
 
 ## Visual Frontend (Goal 2)
 
@@ -428,14 +477,16 @@ forward against the full-then-slice reference on every run.
 ## Hybrid models
 
 The model format adds `"classifier": "hybrid"`: `templates.bin` (bitset
-templates, same payload as a template model's `weights.bin`) plus
-`weights.bin` (f32 CNN tensors), both over one shared `charset.txt`.
+templates, V1 or Goal 9 V2) plus `weights.bin` (f32 CNN tensors), both over
+one shared `charset.txt`.
 `config.json` carries `template_threshold`, `template_margin_threshold` and
 `cnn_threshold`. The template level runs on every candidate; a match is only
 trusted when both its confidence and its top-1/top-2 margin are high (P6).
 A template with `best=0.96 / second=0.95` is treated as ambiguous and falls
 back to the CNN, while `best=0.92 / second=0.71` is trusted. Below
-`cnn_threshold` a glyph is reported as `"?"`.
+`cnn_threshold` a glyph is reported as `"?"`. With V2 templates, an exact
+match (`best=1.0`) that comes from a low-res prototype with zero margin is
+also treated as ambiguous and falls back to the CNN.
 
 ## allowed_chars
 
@@ -463,10 +514,14 @@ model/
                    # hybrid also has templates.bin
 ```
 
-Template entries are `input_width * input_height` bits packed little-endian
-(72 bytes per 24×24 glyph). TinyCNN models store the f32 tensors in fixed
-order `(conv1, dw1, pw1, dw2, pw2, fc)`. The same `weights.bin` is what a
-WGPU backend would read, keeping both backends bit-identical.
+Template V1 entries are `input_width * input_height` bits packed
+little-endian (72 bytes per 24×24 glyph). Goal 9 V2 files replace the
+`uint32 count` header with the `TPL2` magic plus
+`count / prototypes_per_char / bytes_per_template`, a per-prototype
+metadata block (render size, sub-pixel phase in 1/8 px, downsample mode)
+and the packed bitset payload. TinyCNN models store the f32 tensors in
+fixed order `(conv1, dw1, pw1, dw2, pw2, fc)`. The same `weights.bin` is
+what a WGPU backend would read, keeping both backends bit-identical.
 
 ## Training and export
 
@@ -541,6 +596,7 @@ verified:
 | Goal 6 CPU TinyCNN optimization | `tests/test_goal6_tinycnn.py` (strided im2col, no activation-dict forward, prepared weights, batch, Top-K via partition) |
 | Goal 7 low-res training domain | `tests/test_goal7_low_res.py` (10..18 px coverage, supersampled bilinear/area-like downsample, sub-pixel/scale/blur/alpha/brightness/background/outline augmentation, Z17/巴尔的摩) |
 | Goal 8 font geometry database | `tests/test_goal8_geometry.py` (per-char advance/bbox/aspect/ink/component/baseline, JSON round-trip + model embedding, narrow vs. full-width priors, geometry score and pruning) |
+| Goal 9 Template V2 | `tests/test_goal9_template_v2.py` (11..16 px × sub-pixel × downsample grid, V1/V2 round-trip, prefilter Top-K exactness, low-res confusables 未/末 & Z/2, exact low-res tie routing to CNN, bundled models in V2 format) |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
 | Real game regression passes | `tests/test_game_samples.py` (23 samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |

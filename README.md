@@ -368,6 +368,13 @@ spacing, and normalized size. Pass a custom profile to
   numpy/torch/WGPU layer maps. Only single-channel (binary or soft) and the
   experimental two-channel soft+binary input variants are allowed; no
   Transformer/LSTM/Attention/complex normalization may be added.
+- Goal 6 CPU TinyCNN optimization is complete: stride-2 layers compute only
+  target output positions, the hot forward skips activation-dict and
+  same-dtype copies, weights are prepared as contiguous float32 once, batch
+  inference is vectorized, and Top-K uses argpartition without a full
+  argsort. NumPy vs PyTorch parity (`max error < 1e-5`, identical argmax)
+  is covered by `tests/test_goal5_tinycnn.py` and
+  `tests/test_goal6_tinycnn.py`.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

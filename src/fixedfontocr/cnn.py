@@ -31,7 +31,7 @@ from numpy.typing import NDArray
 from .classifier import Classifier
 from .preprocess import normalize
 from .postprocess import second_ids as topk_second_ids
-from .postprocess import top2
+from .postprocess import top2, topk
 from .types import ClassificationBatch, Profile
 
 
@@ -221,11 +221,11 @@ def conv3x3(
         patches = _im2col_stride2(x, 3, 3, pad=1)
         out = np.einsum("nihwab,o iab->nohw", patches, w, optimize=True)
         out += b.reshape(1, -1, 1, 1)
-        return out.astype(np.float32)
+        return np.asarray(out, dtype=np.float32)
     patches = _im2col(x, 3, 3, pad=1)
     out = np.einsum("nihwab,o iab->nohw", patches, w, optimize=True)
     out += b.reshape(1, -1, 1, 1)
-    return out.astype(np.float32)
+    return np.asarray(out, dtype=np.float32)
 
 
 def dwconv3x3(
@@ -236,12 +236,14 @@ def dwconv3x3(
 ) -> NDArray[np.float32]:
     """Depthwise 3x3 convolution, SAME padding. ``w`` is ``(C, 3, 3)``."""
     if stride == 2:
-        full = dwconv3x3(x, w, b, stride=1)
-        return full[:, :, ::2, ::2]
+        patches = _im2col_stride2(x, 3, 3, pad=1)
+        out = np.einsum("nchwab,cab->nchw", patches, w, optimize=True)
+        out += b.reshape(1, -1, 1, 1)
+        return np.asarray(out, dtype=np.float32)
     patches = _im2col(x, 3, 3, pad=1)
     out = np.einsum("nchwab,cab->nchw", patches, w, optimize=True)
     out += b.reshape(1, -1, 1, 1)
-    return out.astype(np.float32)
+    return np.asarray(out, dtype=np.float32)
 
 
 def pointwise(
@@ -257,59 +259,47 @@ def pointwise(
         x = x[:, :, ::2, ::2]
         out = np.einsum("nchw,oc->nohw", x, w, optimize=True)
         out += b.reshape(1, -1, 1, 1)
-        return out.astype(np.float32)
+        return np.asarray(out, dtype=np.float32)
     out = np.einsum("nchw,oc->nohw", x, w, optimize=True)
     out += b.reshape(1, -1, 1, 1)
-    return out.astype(np.float32)
+    return np.asarray(out, dtype=np.float32)
 
 
 def relu(x: NDArray[np.float32]) -> NDArray[np.float32]:
-    return np.maximum(x, 0.0).astype(np.float32)
+    return np.asarray(np.maximum(x, 0.0), dtype=np.float32)
 
 
 def gap(x: NDArray[np.float32]) -> NDArray[np.float32]:
     """Global average pool: ``(N, C, H, W) -> (N, C)``."""
-    return np.mean(x, axis=(2, 3)).astype(np.float32)
+    return np.asarray(np.mean(x, axis=(2, 3)), dtype=np.float32)
 
 
 def linear(
     x: NDArray[np.float32], w: NDArray[np.float32], b: NDArray[np.float32]
 ) -> NDArray[np.float32]:
     """Dense layer. ``x`` is ``(N, C)``, ``w`` is ``(OC, C)``."""
-    return (x @ w.T + b).astype(np.float32)
+    return np.asarray(x @ w.T + b, dtype=np.float32)
 
 
 def softmax(logits: NDArray[np.float32]) -> NDArray[np.float32]:
     z = logits - np.max(logits, axis=-1, keepdims=True)
     e = np.exp(z)
-    return (e / np.sum(e, axis=-1, keepdims=True)).astype(np.float32)
+    return np.asarray(e / np.sum(e, axis=-1, keepdims=True), dtype=np.float32)
 
 
-def forward_with_activations(
+def _forward(
     x: NDArray[np.float32],
     weights: dict[str, NDArray[np.float32]],
-) -> dict[str, NDArray[np.float32]]:
-    """Run the frozen TinyCNN V1 and return every stage's activations.
-
-    ``weights`` must contain: conv1.weight/bias, dw1.weight/bias,
-    pw1.weight/bias, dw2.weight/bias, pw2.weight/bias, fc.weight/bias.
-    The input must be ``[N, C, 24, 24]`` with ``C`` in the frozen V1 range
-    (1 or 2) and must match ``conv1.weight``'s in-channel count; other
-    spatial sizes, channel counts, or weight layouts are rejected.
-
-    Returns a dict with ``conv1``, ``dw1``, ``pw1``, ``dw2``, ``pw2``,
-    ``gap`` and ``logits``; all activations are in NCHW except ``gap``
-    (``(N, C)``) and ``logits`` (``(N, classes)``). This is the reference
-    used by ``tools/train/export_model.py`` to emit per-layer test vectors.
-    """
-
+    keep_activations: bool,
+) -> tuple[NDArray[np.float32], dict[str, NDArray[np.float32]] | None]:
+    """Shared V1 forward; returns ``(logits, activations_or_None)``."""
     validate_v1_weights(weights)
     if any(
         arr.dtype != np.float32 or not arr.flags.c_contiguous
         for arr in weights.values()
     ):
         weights = prepare_weights(weights)
-    x = x.astype(np.float32)
+    x = np.asarray(x, dtype=np.float32)
     if x.ndim == 2:
         x = x[None, None, :, :]
     elif x.ndim == 3:
@@ -340,15 +330,41 @@ def forward_with_activations(
     d2 = relu(dwconv3x3(p1, weights["dw2.weight"], weights["dw2.bias"]))
     p2 = relu(pointwise(d2, weights["pw2.weight"], weights["pw2.bias"], stride=2))
     v = gap(p2)
-    return {
+    logits = linear(v, weights["fc.weight"], weights["fc.bias"])
+    if not keep_activations:
+        return logits, None
+    return logits, {
         "conv1": c1,
         "dw1": d1,
         "pw1": p1,
         "dw2": d2,
         "pw2": p2,
         "gap": v,
-        "logits": linear(v, weights["fc.weight"], weights["fc.bias"]),
     }
+
+
+def forward_with_activations(
+    x: NDArray[np.float32],
+    weights: dict[str, NDArray[np.float32]],
+) -> dict[str, NDArray[np.float32]]:
+    """Run the frozen TinyCNN V1 and return every stage's activations.
+
+    ``weights`` must contain: conv1.weight/bias, dw1.weight/bias,
+    pw1.weight/bias, dw2.weight/bias, pw2.weight/bias, fc.weight/bias.
+    The input must be ``[N, C, 24, 24]`` with ``C`` in the frozen V1 range
+    (1 or 2) and must match ``conv1.weight``'s in-channel count; other
+    spatial sizes, channel counts, or weight layouts are rejected.
+
+    Returns a dict with ``conv1``, ``dw1``, ``pw1``, ``dw2``, ``pw2``,
+    ``gap`` and ``logits``; all activations are in NCHW except ``gap``
+    (``(N, C)``) and ``logits`` (``(N, classes)``). This is the reference
+    used by ``tools/train/export_model.py`` to emit per-layer test vectors.
+    """
+
+    logits, acts = _forward(x, weights, keep_activations=True)
+    assert acts is not None
+    acts["logits"] = logits
+    return acts
 
 
 def forward(
@@ -356,7 +372,8 @@ def forward(
     weights: dict[str, NDArray[np.float32]],
 ) -> NDArray[np.float32]:
     """Run the fixed TinyCNN and return logits ``(N, num_chars)``."""
-    return forward_with_activations(x, weights)["logits"]
+    logits, _ = _forward(x, weights, keep_activations=False)
+    return logits
 
 
 class TinyCNNClassifier(Classifier):
@@ -391,10 +408,11 @@ class TinyCNNClassifier(Classifier):
     ) -> ClassificationBatch:
         """Classify an ``uint8 [N, H, W]`` batch and return Top-K info.
 
-        ``top_k`` is the public API knob for future dictionary decoding
-        (e.g. ``top_k=5``); V1 returns the first two candidates in
-        :class:`ClassificationBatch`. ``allowed_ids`` restricts the argmax
-        to a UI-limited subset.
+        ``top_k`` is the public API knob for dictionary decoding: V1 always
+        reports the first two candidates in the scalar fields, and for
+        ``top_k > 2`` it also returns the ranked ``topk_ids``/
+        ``topk_logits`` arrays. ``allowed_ids`` restricts the ranking to a
+        UI-limited subset.
         """
 
         if top_k < 1:
@@ -424,20 +442,34 @@ class TinyCNNClassifier(Classifier):
                 margins=np.full(n, 0.0, dtype=np.float32),
                 second_ids=np.full(n, -1, dtype=np.int32),
             )
-        x = glyphs.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
+        x = np.asarray(glyphs, dtype=np.float32)[:, None, :, :] * (1.0 / 255.0)
         logits = forward(x, self.weights)
         if allowed_ids is not None:
             masked = np.full_like(logits, -np.inf)
             idx = np.fromiter(sorted(allowed_ids), dtype=np.int64)
             masked[:, idx] = logits[:, idx]
             logits = masked
-        ids, top1, top2v, margins = top2(logits)
+        k = min(top_k, logits.shape[1])
+        if k > 2:
+            topk_ids, topk_logits = topk(logits, k)
+            ids = topk_ids[:, 0].copy()
+            top1 = topk_logits[:, 0].copy()
+            top2v = topk_logits[:, 1].copy()
+            margins = top1 - top2v
+            second_ids = topk_ids[:, 1].copy()
+        else:
+            ids, top1, top2v, margins = top2(logits)
+            second_ids = topk_second_ids(logits, ids)
+            topk_ids = None
+            topk_logits = None
         return ClassificationBatch(
             ids=ids,
             top1=top1,
             top2=top2v,
             margins=margins,
-            second_ids=topk_second_ids(logits, ids),
+            second_ids=second_ids,
+            topk_ids=topk_ids,
+            topk_logits=topk_logits,
         )
 
     def __call__(

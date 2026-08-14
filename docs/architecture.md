@@ -324,6 +324,38 @@ Enforcement points:
 * `tests/test_goal5_tinycnn.py` pins the spec, torch parity, training-mirror
   shapes, the WGPU layer map, and every model-format gate above.
 
+## Goal 6 CPU TinyCNN optimization
+
+Goal 6 is the NumPy-runtime optimization pass over the frozen V1 network.
+Every item from the goal file is enforced by `tests/test_goal6_tinycnn.py`:
+
+* **Stride-2 computes target positions directly.** `_im2col_stride2` builds
+  strided patches (the im2col view advances by two input pixels per output
+  pixel) for `conv3x3`/`dwconv3x3`, and pointwise layers slice before the
+  1×1 matmul. The old full-feature-map-then-`::2` pattern is gone.
+* **No meaningless copies in the hot path.** Layer outputs use
+  `np.asarray(..., dtype=np.float32)` instead of `astype`, so an already
+  float32 result is returned without a copy; `forward()` runs through a
+  shared private helper with `keep_activations=False`, so inference never
+  builds the activation dict that `forward_with_activations` returns.
+* **Weights are prepared once.** `prepare_weights` validates the frozen
+  tensor set at construction and converts any non-f32/non-contiguous array
+  into a C-contiguous float32 copy; already-prepared arrays are reused
+  identity-wise.
+* **Batched inference.** The forward pass is `[N, C, 24, 24]` end-to-end
+  (no per-glyph Python loop), and the benchmark measures batch sizes
+  1/8/16/32/64/128.
+* **Top-K via partition.** `postprocess.topk` uses `argpartition` to select
+  the top-K columns, then orders only those K elements (ties by original
+  column index). The runtime never calls a full `argsort` over the charset;
+  `top2` is the specialized two-column fast path. `classify_batch(top_k=k)`
+  exposes ranked `topk_ids`/`topk_logits` arrays for `k > 2`.
+
+The NumPy vs PyTorch gate stays the same: `tests/test_cnn.py` and
+`tests/test_goal5_tinycnn.py` assert `max error < 1e-5` and identical
+argmax, and `tools/benchmark/cpu_benchmark.py` re-checks the optimized
+forward against the full-then-slice reference on every run.
+
 ## Hybrid models
 
 The model format adds `"classifier": "hybrid"`: `templates.bin` (bitset
@@ -435,6 +467,7 @@ verified:
 | 3K/7K charset usable | `tools/benchmark/cpu_benchmark.py` charsets 10/100/3000/7000 |
 | Top-2 without full sort | `postprocess.top2` (argmax + argpartition), `tests/test_segmentation.py::test_top2_matches_argsort_reference` |
 | Stride-2 forward has no useless work | optimized conv/pw + `tests/test_cnn.py` parity tests, benchmark max_error 0.0 |
+| Goal 6 CPU TinyCNN optimization | `tests/test_goal6_tinycnn.py` (strided im2col, no activation-dict forward, prepared weights, batch, Top-K via partition) |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
 | Real game regression passes | `tests/test_game_samples.py` (23 samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |

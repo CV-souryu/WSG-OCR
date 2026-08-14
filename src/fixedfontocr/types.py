@@ -245,8 +245,9 @@ class ClassificationBatch:
     classifier scores of the first two candidates and ``margins`` is
     ``top1 - top2``. ``second_ids`` carries the second-ranked id so callers
     can build a real Top-K :class:`VisualScores` (never only Top-1).
-    The API supports ``top_k`` > 2 for future dictionary decoding without
-    changing the CNN itself.
+    When a caller asks for ``top_k`` > 2, ``topk_ids``/``topk_logits``
+    carry the full ranked Top-K lists as ``[N, k]`` arrays; the first two
+    columns are the same values as the scalar fields.
     """
 
     ids: np.ndarray  # int32 [N]
@@ -254,6 +255,8 @@ class ClassificationBatch:
     top2: np.ndarray  # f32 [N]
     margins: np.ndarray  # f32 [N]
     second_ids: np.ndarray | None = None  # int32 [N]
+    topk_ids: np.ndarray | None = None  # int32 [N, k]
+    topk_logits: np.ndarray | None = None  # f32 [N, k]
 
 
 @dataclass(frozen=True)

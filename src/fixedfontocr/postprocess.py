@@ -44,7 +44,53 @@ def top2(
         v = logits[np.arange(n)[:, None], idx]
         second = np.minimum(v[:, 0], v[:, 1])
     margins = best - second
-    return top1.astype(np.int32), best.astype(np.float32), second.astype(np.float32), margins.astype(np.float32)
+    return (
+        np.asarray(top1, dtype=np.int32),
+        np.asarray(best, dtype=np.float32),
+        np.asarray(second, dtype=np.float32),
+        np.asarray(margins, dtype=np.float32),
+    )
+
+
+def topk(
+    logits: NDArray[np.float32],
+    k: int,
+) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+    """Ranked Top-K ids and values from an ``[N, C]`` logit matrix.
+
+    ``argpartition`` selects the top ``k`` columns in O(C) per row; only the
+    selected ``k`` elements are then ordered (by descending logit, then by
+    original column index for ties), so no full ``argsort`` over the charset
+    is ever performed. Returns ``(ids, values)`` as ``[N, k]`` arrays.
+    """
+
+    logits = np.asarray(logits, dtype=np.float32)
+    if logits.ndim == 1:
+        logits = logits.reshape(1, -1)
+    n, c = logits.shape
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    k = min(k, c)
+    if n == 0:
+        return (
+            np.empty((0, k), dtype=np.int32),
+            np.empty((0, k), dtype=np.float32),
+        )
+    if k == 1:
+        ids = np.argmax(logits, axis=-1)
+        values = logits[np.arange(n), ids]
+        return (
+            np.asarray(ids[:, None], dtype=np.int32),
+            np.asarray(values[:, None], dtype=np.float32),
+        )
+    idx = np.argpartition(-logits, k - 1, axis=-1)[:, :k]
+    values = logits[np.arange(n)[:, None], idx]
+    cols = np.broadcast_to(np.arange(c), logits.shape)
+    selected_cols = np.take_along_axis(cols, idx, axis=-1)
+    order = np.lexsort((selected_cols, -values), axis=-1)
+    ids = np.take_along_axis(idx, order, axis=-1)
+    values = np.take_along_axis(values, order, axis=-1)
+    return np.asarray(ids, dtype=np.int32), np.asarray(values, dtype=np.float32)
 
 
 def second_ids(
@@ -64,7 +110,7 @@ def second_ids(
     row = np.arange(n)
     second_logits = logits[row, second_idx]
     out = np.where(np.isneginf(second_logits), -1, second_idx)
-    return out.astype(np.int32)
+    return np.asarray(out, dtype=np.int32)
 
 
 def allowed_ids(charset: list[str], allowed_chars: str | None) -> set[int] | None:

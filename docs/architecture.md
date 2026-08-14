@@ -284,6 +284,46 @@ implementation; `tests/test_cnn.py` verifies `max error < 1e-5` and
 identical argmax, and `tools/benchmark/cpu_benchmark.py` re-checks it on
 every run (measured bit-identical: max error 0.0).
 
+## TinyCNN V1 freeze (Goal 5)
+
+Goal 5 freezes the network. `fixedfontocr/cnn.py` owns the canonical spec
+(`TINYCNN_V1_LAYERS`, `TINYCNN_V1_INPUT_SIZE`, `TINYCNN_V1_INPUT_CHANNELS`,
+`TINYCNN_V1_HEAD`, `TINYCNN_V1_TAIL`):
+
+| Layer | Kind | Kernel | Stride | Channels | Groups | Activation |
+| --- | --- | --- | --- | --- | --- | --- |
+| conv1 | Conv3x3 SAME | 3 | 2 | 1 → 8 (or 2 → 8) | 1 | ReLU |
+| dw1 | DWConv3x3 SAME | 3 | 1 | 8 → 8 | 8 | ReLU |
+| pw1 | Pointwise | 1 | 2 | 8 → 16 | 1 | ReLU |
+| dw2 | DWConv3x3 SAME | 3 | 1 | 16 → 16 | 16 | ReLU |
+| pw2 | Pointwise | 1 | 2 | 16 → 32 | 1 | ReLU |
+| gap | GlobalAvgPool | — | — | 32 → 32 | — | — |
+| fc | Linear | — | — | 32 → charset | — | — |
+
+Input is 24×24. The allowed input variations are exactly: one channel
+(binary or soft, recorded by `config.json["input_mode"]`) and the
+experimental two-channel `soft + binary` stack (`conv1` widened to 2 input
+channels). The on-disk model format is frozen to the single-channel
+variant. Transformer, LSTM, Attention and normalization layers beyond the
+ReLUs are forbidden; BatchNorm exists only in the training mirror and is
+folded into the convolution weights at export, so runtime stays Conv + ReLU.
+
+Enforcement points:
+
+* `validate_v1_weights` rejects any weight set that is not the exact 12
+  tensor V1 set: extra tensors (e.g. BN/attention weights), missing
+  tensors, wrong shapes, and `conv1` input channels outside `(1, 2)` all
+  raise;
+* `forward`/`forward_with_activations` reject non-24×24 inputs and channel
+  counts outside `{1, 2}` instead of silently truncating;
+* runtime model configs carry `"architecture": "tinycnn_v1"`; `load_model`
+  rejects unknown architectures, while legacy configs without the key
+  default to V1;
+* `write_cnn_weights` rejects non-V1 tensor sets and refuses to serialize
+  the experimental two-channel variant;
+* `tests/test_goal5_tinycnn.py` pins the spec, torch parity, training-mirror
+  shapes, the WGPU layer map, and every model-format gate above.
+
 ## Hybrid models
 
 The model format adds `"classifier": "hybrid"`: `templates.bin` (bitset
@@ -314,7 +354,8 @@ subset (1.0 when only one class is allowed).
 ```
 model/
 ├── config.json    # input_width, input_height, classes, version, dtype,
-│                  # classifier (template|tinycnn|hybrid) + thresholds
+│                  # classifier (template|tinycnn|hybrid), architecture
+│                  # (tinycnn_v1) + thresholds
 ├── charset.txt    # one character per line / one string
 └── weights.bin    # template: uint32 count + packed bits;
                    # tinycnn/hybrid: f32 tensors in fixed order

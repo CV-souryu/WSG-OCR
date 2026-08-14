@@ -1,7 +1,7 @@
-"""TinyCNN CPU forward pass.
+"""TinyCNN V1 CPU forward pass (Goal 5: frozen architecture).
 
-The network is fixed per the design doc and uses only the primitives a WGPU
-backend can implement trivially:
+The network is frozen per ``fonts/goal`` and uses only the primitives a
+WGPU backend can implement trivially:
 
     Input           1 x 24 x 24
     Conv 3x3        1 -> 8   stride 2, ReLU
@@ -12,6 +12,12 @@ backend can implement trivially:
     GlobalAvgPool   32
     Linear          32 -> num_chars
     Argmax
+
+The only allowed input variation is the number of channels fed into
+``conv1``: one channel (binary or soft) is the frozen model format, and the
+two-channel ``soft + binary`` stack is an explicitly allowed experiment
+(``TINYCNN_V1_INPUT_CHANNELS``). Nothing else may grow: no Transformer,
+LSTM, attention, or normalization layers beyond the ReLUs below.
 
 All convolutions use SAME (zero) padding and channels-last-free numpy
 vectorization via einsum - no per-pixel Python loops.
@@ -29,6 +35,124 @@ from .postprocess import top2
 from .types import ClassificationBatch, Profile
 
 
+TINYCNN_V1_NAME = "tinycnn_v1"
+"""Metadata value that marks a frozen V1 model in ``config.json``."""
+
+TINYCNN_V1_INPUT_SIZE = 24
+"""Frozen spatial input size (the design doc fixes the input at 24x24)."""
+
+TINYCNN_V1_INPUT_CHANNELS = (1, 2)
+"""Allowed ``conv1`` input channel counts.
+
+1 = single-channel binary or soft foreground (the frozen model format);
+2 = the explicitly allowed ``soft + binary`` experiment.
+"""
+
+# (name, kind, kernel, stride, in_channels, out_channels, groups, activation)
+# conv1's in_channels is fixed to the value in TINYCNN_V1_INPUT_CHANNELS,
+# which is why the table records the allowed range instead of a single int.
+TINYCNN_V1_LAYERS: tuple[
+    tuple[str, str, int, int, int | tuple[int, ...], int, int, str],
+    ...,
+] = (
+    ("conv1", "conv3x3", 3, 2, TINYCNN_V1_INPUT_CHANNELS, 8, 1, "relu"),
+    ("dw1", "dwconv3x3", 3, 1, 8, 8, 8, "relu"),
+    ("pw1", "pointwise", 1, 2, 8, 16, 1, "relu"),
+    ("dw2", "dwconv3x3", 3, 1, 16, 16, 16, "relu"),
+    ("pw2", "pointwise", 1, 2, 16, 32, 1, "relu"),
+)
+
+TINYCNN_V1_HEAD = ("gap", 32)
+"""Fixed head: global average pool over the 32-channel feature map."""
+
+TINYCNN_V1_TAIL = ("linear", 32)
+"""Fixed tail: linear projection from 32 features to the charset."""
+
+
+def cnn_tensor_shapes(
+    num_classes: int,
+    input_channels: int = 1,
+) -> list[tuple[str, tuple[int, ...]]]:
+    """Canonical V1 weight shapes for ``weights.bin`` serialization.
+
+    This is the single source of truth shared by the model loader/exporter
+    and the validation gate. ``input_channels`` must be one of the frozen
+    allowed values (1 or 2); the on-disk model format is frozen to 1.
+    """
+
+    if input_channels not in TINYCNN_V1_INPUT_CHANNELS:
+        raise ValueError(
+            f"TinyCNN V1 allows input_channels in {TINYCNN_V1_INPUT_CHANNELS}, "
+            f"got {input_channels}"
+        )
+    if num_classes <= 0:
+        raise ValueError(f"num_classes must be positive, got {num_classes}")
+    return [
+        ("conv1.weight", (8, input_channels, 3, 3)),
+        ("conv1.bias", (8,)),
+        ("dw1.weight", (8, 3, 3)),
+        ("dw1.bias", (8,)),
+        ("pw1.weight", (16, 8)),
+        ("pw1.bias", (16,)),
+        ("dw2.weight", (16, 3, 3)),
+        ("dw2.bias", (16,)),
+        ("pw2.weight", (32, 16)),
+        ("pw2.bias", (32,)),
+        ("fc.weight", (num_classes, 32)),
+        ("fc.bias", (num_classes,)),
+    ]
+
+
+def validate_v1_weights(
+    weights: dict[str, NDArray[np.float32]],
+    num_classes: int | None = None,
+) -> dict[str, tuple[int, ...]]:
+    """Reject any weight set that is not the frozen TinyCNN V1.
+
+    The exact tensor set and every tensor shape must match the V1 spec:
+    conv1 -> dw1 -> pw1 -> dw2 -> pw2 -> fc, with no extra tensors (e.g.
+    BatchNorm, attention, or embedding weights) and no missing tensors.
+    ``conv1`` may have 1 or 2 input channels per the frozen experiment
+    range. Returns the validated name -> shape mapping.
+    """
+
+    if not isinstance(weights, dict) or not weights:
+        raise ValueError("TinyCNN V1 weights must be a non-empty dict")
+    arrays = {name: np.asarray(arr) for name, arr in weights.items()}
+    if "fc.weight" not in arrays:
+        raise ValueError("missing fc.weight: TinyCNN V1 requires the 12 fixed tensors")
+    fc_out = int(arrays["fc.weight"].shape[0])
+    if num_classes is None:
+        num_classes = fc_out
+    if num_classes != fc_out:
+        raise ValueError(
+            f"num_classes={num_classes} does not match fc.weight rows {fc_out}"
+        )
+    if "conv1.weight" not in arrays:
+        raise ValueError("missing conv1.weight: TinyCNN V1 requires the 12 fixed tensors")
+    input_channels = int(arrays["conv1.weight"].shape[1])
+    if input_channels not in TINYCNN_V1_INPUT_CHANNELS:
+        raise ValueError(
+            f"conv1 input channels {input_channels} are outside the frozen "
+            f"V1 experiment range {TINYCNN_V1_INPUT_CHANNELS}"
+        )
+    expected = dict(cnn_tensor_shapes(num_classes, input_channels))
+    missing = sorted(set(expected) - set(arrays))
+    extra = sorted(set(arrays) - set(expected))
+    if missing or extra:
+        raise ValueError(
+            "TinyCNN V1 weight set is frozen to exactly "
+            f"{list(expected)}; missing={missing}, extra={extra}"
+        )
+    for name, shape in expected.items():
+        if arrays[name].shape != shape:
+            raise ValueError(
+                f"tensor {name} has shape {arrays[name].shape}, "
+                f"but frozen TinyCNN V1 requires {shape}"
+            )
+    return expected
+
+
 def prepare_weights(
     weights: dict[str, NDArray[np.float32]],
 ) -> dict[str, NDArray[np.float32]]:
@@ -38,6 +162,7 @@ def prepare_weights(
     hot forward path never pays for ``astype``/``ascontiguousarray``.
     """
 
+    validate_v1_weights(weights)
     prepared: dict[str, NDArray[np.float32]] = {}
     for name, arr in weights.items():
         arr = np.asarray(arr)
@@ -164,10 +289,13 @@ def forward_with_activations(
     x: NDArray[np.float32],
     weights: dict[str, NDArray[np.float32]],
 ) -> dict[str, NDArray[np.float32]]:
-    """Run the fixed TinyCNN and return every stage's activations.
+    """Run the frozen TinyCNN V1 and return every stage's activations.
 
     ``weights`` must contain: conv1.weight/bias, dw1.weight/bias,
     pw1.weight/bias, dw2.weight/bias, pw2.weight/bias, fc.weight/bias.
+    The input must be ``[N, C, 24, 24]`` with ``C`` in the frozen V1 range
+    (1 or 2) and must match ``conv1.weight``'s in-channel count; other
+    spatial sizes, channel counts, or weight layouts are rejected.
 
     Returns a dict with ``conv1``, ``dw1``, ``pw1``, ``dw2``, ``pw2``,
     ``gap`` and ``logits``; all activations are in NCHW except ``gap``
@@ -175,6 +303,7 @@ def forward_with_activations(
     used by ``tools/train/export_model.py`` to emit per-layer test vectors.
     """
 
+    validate_v1_weights(weights)
     if any(
         arr.dtype != np.float32 or not arr.flags.c_contiguous
         for arr in weights.values()
@@ -183,10 +312,27 @@ def forward_with_activations(
     x = x.astype(np.float32)
     if x.ndim == 2:
         x = x[None, None, :, :]
-    if x.ndim == 3:
+    elif x.ndim == 3:
         x = x[None, :, :, :]
-    if x.shape[1] != 1:
-        x = x[:, :1, :, :]
+    elif x.ndim != 4:
+        raise ValueError(
+            f"input must be [N, C, H, W], got {x.ndim} dimensions"
+        )
+    if x.shape[2:] != (TINYCNN_V1_INPUT_SIZE, TINYCNN_V1_INPUT_SIZE):
+        raise ValueError(
+            f"TinyCNN V1 input is frozen to {TINYCNN_V1_INPUT_SIZE}x"
+            f"{TINYCNN_V1_INPUT_SIZE}, got {x.shape[2:]}"
+        )
+    if x.shape[1] not in TINYCNN_V1_INPUT_CHANNELS:
+        raise ValueError(
+            f"TinyCNN V1 input channels must be in "
+            f"{TINYCNN_V1_INPUT_CHANNELS}, got {x.shape[1]}"
+        )
+    if x.shape[1] != weights["conv1.weight"].shape[1]:
+        raise ValueError(
+            f"input has {x.shape[1]} channels but conv1.weight expects "
+            f"{weights['conv1.weight'].shape[1]}"
+        )
 
     c1 = relu(conv3x3(x, weights["conv1.weight"], weights["conv1.bias"], stride=2))
     d1 = relu(dwconv3x3(c1, weights["dw1.weight"], weights["dw1.bias"]))
@@ -222,7 +368,11 @@ class TinyCNNClassifier(Classifier):
         charset: list[str],
         input_size: int = 24,
     ):
-        self.weights = weights
+        if input_size != TINYCNN_V1_INPUT_SIZE:
+            raise ValueError(
+                f"TinyCNN V1 input is frozen to {TINYCNN_V1_INPUT_SIZE}x"
+                f"{TINYCNN_V1_INPUT_SIZE}, got {input_size}"
+            )
         self.charset = list(charset)
         self.input_size = input_size
         if weights["fc.weight"].shape[0] != len(charset):

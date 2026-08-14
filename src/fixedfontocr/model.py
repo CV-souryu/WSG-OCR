@@ -8,6 +8,11 @@ from pathlib import Path
 
 import numpy as np
 
+from .cnn import (
+    TINYCNN_V1_NAME,
+    cnn_tensor_shapes,
+    validate_v1_weights,
+)
 from .defaults import compute_font_sha256
 from .preprocess import NormalizeSpec, compute_normalize_spec
 
@@ -25,30 +30,9 @@ class OCRModel:
     normalize_spec: NormalizeSpec | None = None
 
 
-CNN_TENSORS: list[tuple[str, tuple[int, ...]]] = [
-    ("conv1.weight", (8, 1, 3, 3)),
-    ("conv1.bias", (8,)),
-    ("dw1.weight", (8, 3, 3)),
-    ("dw1.bias", (8,)),
-    ("pw1.weight", (16, 8)),
-    ("pw1.bias", (16,)),
-    ("dw2.weight", (16, 3, 3)),
-    ("dw2.bias", (16,)),
-    ("pw2.weight", (32, 16)),
-    ("pw2.bias", (32,)),
-    ("fc.weight", (None, 32)),  # (classes, 32)
-    ("fc.bias", (None,)),       # (classes,)
-]
-
-
-def cnn_tensor_shapes(num_classes: int) -> list[tuple[str, tuple[int, ...]]]:
-    shapes: list[tuple[str, tuple[int, ...]]] = []
-    for name, shape in CNN_TENSORS:
-        if None in shape:
-            shapes.append((name, tuple(num_classes if v is None else v for v in shape)))
-        else:
-            shapes.append((name, shape))
-    return shapes
+# The tensor shape table (formerly CNN_TENSORS / cnn_tensor_shapes) now
+# lives in fixedfontocr.cnn as the frozen Goal 5 V1 spec and is imported
+# above so model loading/export can never drift from the forward pass.
 
 
 def _load_charset(path: Path) -> list[str]:
@@ -101,6 +85,12 @@ def load_model(model_path: Path) -> OCRModel:
     classifier = config.get("classifier", "template")
     if classifier not in ("template", "tinycnn", "hybrid"):
         raise ValueError(f"unsupported classifier {classifier!r}")
+    architecture = config.get("architecture", TINYCNN_V1_NAME)
+    if classifier in ("tinycnn", "hybrid") and architecture != TINYCNN_V1_NAME:
+        raise ValueError(
+            f"unsupported TinyCNN architecture {architecture!r}: only "
+            f"{TINYCNN_V1_NAME} is frozen (Goal 5)"
+        )
     input_mode = config.get("input_mode", "binary")
     if input_mode not in ("binary", "soft"):
         raise ValueError(f"unsupported input_mode {input_mode!r}")
@@ -176,6 +166,7 @@ def _load_cnn_weights(path: Path, num_classes: int) -> dict[str, np.ndarray]:
         size = int(np.prod(shape))
         weights[name] = data[offset : offset + size].reshape(shape)
         offset += size
+    validate_v1_weights(weights, num_classes)
     return weights
 
 
@@ -184,6 +175,13 @@ def write_cnn_weights(
 ) -> None:
     """Write CNN weights in the fixed tensor order expected by the loader."""
 
+    validate_v1_weights(weights, num_classes)
+    input_channels = int(np.asarray(weights["conv1.weight"]).shape[1])
+    if input_channels != 1:
+        raise ValueError(
+            "the TinyCNN V1 model format is frozen to 1 input channel; "
+            "2-channel soft+binary is an in-memory experiment only"
+        )
     tensors: list[np.ndarray] = []
     for name, shape in cnn_tensor_shapes(num_classes):
         if name not in weights:
@@ -228,6 +226,7 @@ def write_cnn_model(
         "version": 1,
         "dtype": "f32",
         "classifier": "tinycnn",
+        "architecture": TINYCNN_V1_NAME,
         "input_mode": input_mode,
     }
     if font_sha256:
@@ -286,6 +285,7 @@ def write_hybrid_model(
         "version": 1,
         "dtype": "f32",
         "classifier": "hybrid",
+        "architecture": TINYCNN_V1_NAME,
         "template_threshold": float(template_threshold),
         "template_margin_threshold": float(template_margin_threshold),
         "cnn_threshold": float(cnn_threshold),

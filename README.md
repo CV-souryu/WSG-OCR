@@ -331,7 +331,8 @@ numpy RGB
 model/
 ├── config.json    # input_width, input_height, classes, version, dtype,
 │                  # classifier (template|tinycnn|hybrid), thresholds,
-│                  # font_sha256 + normalize (Goal 3 baseline frame)
+│                  # architecture (tinycnn_v1), font_sha256 + normalize
+│                  # (Goal 3 baseline frame)
 ├── charset.txt
 └── weights.bin    # template: uint32 count + packed bits;
                    # tinycnn/hybrid: f32 tensors in fixed order
@@ -362,6 +363,11 @@ spacing, and normalized size. Pass a custom profile to
   merge/split candidates are generated with geometric pruning, and a visual
   DP decodes the best path (`鲃`/`小`/`鲃鱼。` plus `潜甲`/`潜乙`/
   `巴尔的摩`/`Z17` regressions are covered).
+- Goal 5 TinyCNN V1 is frozen: the exact Conv3x3→DWConv→Pointwise→GAP→Linear
+  topology and 24×24 input are enforced at model load/export and in the
+  numpy/torch/WGPU layer maps. Only single-channel (binary or soft) and the
+  experimental two-channel soft+binary input variants are allowed; no
+  Transformer/LSTM/Attention/complex normalization may be added.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

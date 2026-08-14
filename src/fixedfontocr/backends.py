@@ -29,7 +29,7 @@ from importlib import resources
 import numpy as np
 from numpy.typing import NDArray
 
-from .cnn import forward, prepare_weights
+from .cnn import forward, prepare_weights, validate_v1_weights
 from .postprocess import top2
 
 
@@ -87,7 +87,7 @@ class CPUBackend(Backend):
     """Numpy TinyCNN backend; the reference every GPU layer is checked against."""
 
     def __init__(self, weights: dict[str, NDArray[np.float32]], input_size: int = 24):
-        self.weights = prepare_weights(weights)
+        self.weights = prepare_weights(weights)  # also validates frozen V1
         self.input_size = input_size
 
     def classify(self, glyphs: NDArray[np.uint8]) -> BackendResult:
@@ -143,6 +143,7 @@ class WGPUBackend(Backend):
     ):
         if input_size != self._H:
             raise ValueError(f"WGPU backend supports {self._H}x{self._H} glyphs")
+        validate_v1_weights(weights)
         if weights["fc.weight"].shape[1] != self._C3:
             raise ValueError("WGPU backend requires the fixed 32-feature TinyCNN")
         import wgpu

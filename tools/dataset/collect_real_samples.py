@@ -22,6 +22,7 @@ the image is skipped with a warning. Output matches
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -63,8 +64,12 @@ def collect_directory(
     origins: list[str] = []
     skipped = 0
 
+    labels_map: dict[str, str] = {}
+    labels_path = root / "labels.json"
+    if labels_path.is_file():
+        labels_map = json.loads(labels_path.read_text(encoding="utf-8"))
     for label_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        label = label_dir.name
+        label = labels_map.get(label_dir.name, label_dir.name)
         label_chars = list(label)
         if not label_chars:
             continue

@@ -14,10 +14,12 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 │   ├── backends.py      # CPUBackend / WGPUBackend / AutoBackend + benchmark
 │   ├── classifier.py    # template matcher (with coarse candidate filtering)
 │   ├── cnn.py           # numpy TinyCNN reference (Conv + ReLU only)
+│   ├── segmentation.py  # candidate lattice + visual DP decoder (P0)
+│   ├── scorer.py        # unified template/CNN scoring (P4/P6)
 │   ├── defaults.py      # bundled game font / charset / model paths
 │   ├── postprocess.py   # allowed-chars restriction / confidence scoring
 │   ├── model.py         # config.json + charset.txt + weights.bin I/O
-│   ├── preprocess.py    # segmentation + 24x24 normalization
+│   ├── preprocess.py    # mask / lines / run-length CC + 24x24 normalization
 │   ├── shaders/         # WGSL layer shaders
 │   └── types.py         # CharResult / OCRResult / Profile
 ├── charsets/            # charset assets (English names, no spaces)
@@ -26,10 +28,12 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 ├── tools/               # dev-only pipeline (PyTorch + Pillow), grouped:
 │   ├── charset/         #   export_names.py + extract_charset.py
 │   ├── dataset/         #   generate_font_dataset.py + collect_real_samples.py
+│   │                     #   + extract_game_samples.py + synthetic samples
 │   ├── train/           #   train.py + export_model.py + build_model.py
-│   ├── benchmark/       #   benchmark.py + benchmark_wgpu.py + footprint.py
+│   ├── benchmark/       #   cpu_benchmark.py + benchmark_wgpu.py + footprint.py
 │   └── register_font.py #   fonts/registry.json updater
 ├── scripts/             # legacy entry points (generate/train/benchmark)
+├── benchmarks/          # machine snapshots of the CPU benchmark suite
 ├── tests/               # pytest suite + checked-in CNN fixtures
 ├── docs/
 ├── fonts/               # registered local fonts (gitignored; registry.json tracked)
@@ -79,8 +83,9 @@ Three classifier types are supported in the same model directory format:
   Pointwise1x1 stride-2, GAP, Linear). Runtime inference is pure numpy or
   WGSL; training uses PyTorch.
 - **Hybrid**: template level-1 + TinyCNN level-2 + unknown. Only glyphs
-  whose template confidence is low (the 未/末, 日/曰, 0/O cases) reach the
-  CNN.
+  whose template confidence *or* top-1/top-2 margin is low (the 未/末,
+  日/曰, 0/O cases) reach the CNN — a high score with a tiny margin is
+  treated as ambiguous (P6).
 
 ## Automatic backend selection (`backend="auto"`)
 
@@ -120,16 +125,53 @@ models (same charset):
 
 ```bash
 python tools/train/export_model.py model.pth --templates template_model/ \
-    --output hybrid_model/ --template-threshold 0.90
+    --output hybrid_model/ --template-threshold 0.90 \
+    --template-margin-threshold 0.04
 ```
 
 `config.json` then declares `"classifier": "hybrid"` with
-`template_threshold` / `cnn_threshold`, and `templates.bin` + `weights.bin`
-hold both stages.
+`template_threshold` / `template_margin_threshold` / `cnn_threshold`, and
+`templates.bin` + `weights.bin` hold both stages.
 
 The bundled recognizer is built from `charsets/sets/combined.txt` and
 `fonts/SourceHanSansSC/SourceHanSansSC-Bold.otf`; `tools/train/build_model.py`
 regenerates the whole thing in one command.
+
+## Segmentation: candidate lattice + visual DP
+
+Segmentation never merges connected components irreversibly. Every line is
+expanded into a candidate lattice (each original component plus merges of
+up to 4 consecutive components), every candidate is scored once in a batch,
+and a dynamic program over the lattice picks the path with the highest mean
+visual score. This is what fixes the old `stroke_width=2` special cases:
+
+```text
+鲃     -> 鲃      (fragmented into 3 components)
+鲃鱼。 -> 鲃鱼。
+小     -> 小      (3 components)
+潜甲   -> 潜甲    (潜 has 4 components)
+潜乙   -> 潜乙
+```
+
+See `docs/architecture.md` for the scoring details (unified 0..1 visual
+scores, margin-aware hybrid gate, O(C) Top-2) and the P2 stride-2 CNN
+optimization.
+
+## CPU benchmark suite and game regression set
+
+```bash
+# median + p95 per OCR stage, CNN batches 1..128, and 10/100/3000/7000
+# charset template+CNN timings; ends with the optimized-vs-reference check
+python tools/benchmark/cpu_benchmark.py --output benchmarks/cpu_benchmark.json
+
+# the frozen regression corpus (real level badges + synthetic coverage)
+python -m pytest tests/test_game_samples.py
+```
+
+`tests/game_samples/manifest.json` maps every image to its expected text,
+category, profile overrides and the registered font; `slot1` level badges
+are a documented limitation (`L`/`V` touch at one pixel and form one
+connected component at both scales).
 
 ## UI-limited charsets (`allowed_chars`)
 

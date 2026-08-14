@@ -13,6 +13,40 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def top2(
+    logits: NDArray[np.float32],
+) -> tuple[NDArray[np.int32], NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+    """Top-1/top-2 ids and scores from an ``[N, C]`` logit matrix.
+
+    Uses ``argmax`` plus a single ``argpartition`` over the first two
+    positions, so the cost is O(N*C) instead of a full O(N*C*log C) sort.
+    ``argmax`` keeps the same tie-breaking (first occurrence) as the
+    previous stable ``argsort`` reference.
+    """
+
+    logits = np.asarray(logits, dtype=np.float32)
+    if logits.ndim == 1:
+        logits = logits.reshape(1, -1)
+    n, c = logits.shape
+    if n == 0:
+        empty_i = np.empty(0, dtype=np.int32)
+        empty_f = np.empty(0, dtype=np.float32)
+        return empty_i, empty_f, empty_f, empty_f
+
+    top1 = np.argmax(logits, axis=-1)
+    best = logits[np.arange(n), top1]
+    if c == 1:
+        second = np.full(n, -np.inf, dtype=np.float32)
+    else:
+        # argpartition puts the two largest values at positions 0 and 1
+        # (in either order); the "second" value is the smaller of the two.
+        idx = np.argpartition(-logits, 1, axis=-1)[:, :2]
+        v = logits[np.arange(n)[:, None], idx]
+        second = np.minimum(v[:, 0], v[:, 1])
+    margins = best - second
+    return top1.astype(np.int32), best.astype(np.float32), second.astype(np.float32), margins.astype(np.float32)
+
+
 def allowed_ids(charset: list[str], allowed_chars: str | None) -> set[int] | None:
     """Map an ``allowed_chars`` string to charset indices (``None`` = all)."""
     if allowed_chars is None:
@@ -44,19 +78,15 @@ def pick(
         idx = np.fromiter(sorted(allowed), dtype=np.int64)
         masked = np.full(c, -np.inf, dtype=np.float32)
         masked[idx] = logits[idx]
-        order = np.argsort(-masked, kind="stable")
-        best = int(order[0])
+        ids, top1, top2, margin = top2(masked)
+        best = int(ids[0])
         if len(idx) == 1:
             return charset[best], 1.0
-        second = int(order[1])
-        margin = float(logits[best] - logits[second])
-        return charset[best], margin
+        return charset[best], float(margin[0])
 
-    order = np.argsort(-logits, kind="stable")
-    best = int(order[0])
+    ids, top1, top2, margin = top2(logits)
+    best = int(ids[0])
     if c >= 2:
-        second = int(order[1])
-        margin = float(logits[best] - logits[second])
+        return charset[best], float(margin[0])
     else:
-        margin = 1.0
-    return charset[best], margin
+        return charset[best], 1.0

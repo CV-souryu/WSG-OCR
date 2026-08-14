@@ -93,6 +93,12 @@ def main() -> None:
     parser.add_argument("--synthetic", required=True, help="npz from generate_font_dataset.py")
     parser.add_argument("--real", help="npz from collect_real_samples.py")
     parser.add_argument("--output", default="model.pth", help="checkpoint path")
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="existing checkpoint to fine-tune from (same architecture/classes)",
+    )
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=2e-3)
@@ -126,6 +132,20 @@ def main() -> None:
     )
 
     model = tinycnn_arch.TinyCNNBN(len(charset)).to(device)
+    if args.resume is not None:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        if ckpt.get("architecture") != "tinycnn_bn":
+            raise SystemExit(
+                f"unsupported resume architecture: {ckpt.get('architecture')}"
+            )
+        ck_charset = [str(c) for c in ckpt["charset"]]
+        if ck_charset != charset:
+            raise SystemExit(
+                "resume checkpoint charset differs from the merged dataset "
+                f"({len(ck_charset)} vs {len(charset)} classes)"
+            )
+        model.load_state_dict(ckpt["state_dict"])
+        print(f"resumed from {args.resume}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
     steps = max(1, len(train_idx) // args.batch_size)

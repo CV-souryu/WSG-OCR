@@ -234,6 +234,7 @@ def write_hybrid_model(
     weights: dict[str, np.ndarray],
     input_size: int = 24,
     template_threshold: float = 0.90,
+    template_margin_threshold: float = 0.04,
     cnn_threshold: float = 0.0,
     font_path: str | Path | None = None,
     font_sha256: str | None = None,
@@ -259,6 +260,7 @@ def write_hybrid_model(
         "dtype": "f32",
         "classifier": "hybrid",
         "template_threshold": float(template_threshold),
+        "template_margin_threshold": float(template_margin_threshold),
         "cnn_threshold": float(cnn_threshold),
     }
     if font_sha256:

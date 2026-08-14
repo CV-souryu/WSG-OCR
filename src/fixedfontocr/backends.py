@@ -29,7 +29,8 @@ from importlib import resources
 import numpy as np
 from numpy.typing import NDArray
 
-from .cnn import forward
+from .cnn import forward, prepare_weights
+from .postprocess import top2
 
 
 @dataclass(frozen=True)
@@ -77,23 +78,16 @@ def _margin_from_logits(
     logits: NDArray[np.float32],
 ) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
     """Top-1 id and top1-top2 margin from an ``[N, C]`` logit matrix."""
-    n, c = logits.shape
-    order = np.argsort(-logits, axis=1, kind="stable")
-    top1 = order[:, 0]
-    best = logits[np.arange(n), top1]
-    if c >= 2:
-        second = logits[np.arange(n), order[:, 1]]
-        scores = best - second
-    else:
-        scores = np.full(n, np.inf, dtype=np.float32)
-    return top1.astype(np.int32), scores.astype(np.float32)
+    ids, _, _, margins = top2(logits)
+    # Single-class rows have second = -inf; the margin becomes +inf.
+    return ids, margins.astype(np.float32)
 
 
 class CPUBackend(Backend):
     """Numpy TinyCNN backend; the reference every GPU layer is checked against."""
 
     def __init__(self, weights: dict[str, NDArray[np.float32]], input_size: int = 24):
-        self.weights = weights
+        self.weights = prepare_weights(weights)
         self.input_size = input_size
 
     def classify(self, glyphs: NDArray[np.uint8]) -> BackendResult:

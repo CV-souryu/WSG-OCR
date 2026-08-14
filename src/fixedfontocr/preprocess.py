@@ -62,6 +62,13 @@ def collect_glyphs(
     ``24x24`` resize/normalize all stay on the CPU. Returns the segments (for
     bounding boxes) and an ``uint8 [N, target_size, target_size]`` batch with
     0/255 values, ready for ``Backend.classify``.
+
+    .. note::
+        This legacy helper still uses the old irreversible merge for
+        training-sample collection. The production OCR path
+        (``FixedFontOCR.recognize``) uses the candidate lattice + visual DP
+        in :mod:`fixedfontocr.segmentation`, which keeps every original
+        component and decides merges after classification.
     """
 
     mask = profile.color_mask(image)
@@ -76,6 +83,12 @@ def collect_glyphs(
             (0, profile.target_size, profile.target_size), dtype=np.uint8
         )
     return segments, np.stack(glyphs)
+
+
+def find_lines(mask: NDArray[np.bool_], profile: Profile) -> list[Segment]:
+    """Public wrapper around the row-grouping line detector."""
+
+    return _find_lines(mask, profile)
 
 
 def _find_lines(mask: NDArray[np.bool_], profile: Profile) -> list[Segment]:
@@ -124,7 +137,74 @@ def _segment_line(line: Segment, profile: Profile) -> list[Segment]:
 
 
 def _connected_components(mask: NDArray[np.bool_]) -> list[NDArray[np.bool_]]:
-    """Label connected components with a union-find sweep (4-connectivity)."""
+    """Label connected components with a run-length union-find sweep.
+
+    Each row is reduced to its foreground runs first, so the per-pixel loop
+    of the old implementation is replaced by a per-run loop (text masks are
+    sparse: a 1920x1080 UI line has far fewer runs than pixels). Only runs
+    that overlap the previous row's runs participate in the union pass.
+    """
+
+    h, w = mask.shape
+    label = np.zeros((h, w), dtype=np.int32)
+    parent: list[int] = [0]
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    nxt = 0
+    prev_runs: list[tuple[int, int, int]] = []  # (start, end, label)
+    for y in range(h):
+        padded = np.concatenate(([False], mask[y], [False]))
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        # Every foreground run is a (start, end) pair in the edge list.
+        curr_runs: list[tuple[int, int, int]] = []
+        for k in range(0, edges.size, 2):
+            a = int(edges[k])
+            b = int(edges[k + 1])
+            overlaps = [
+                (ps, pe, pl)
+                for (ps, pe, pl) in prev_runs
+                if a < pe and ps < b
+            ]
+            if not overlaps:
+                nxt += 1
+                parent.append(nxt)
+                lab = nxt
+            else:
+                lab = overlaps[0][2]
+                for (_, _, other) in overlaps[1:]:
+                    union(lab, other)
+            label[y, a:b] = lab
+            curr_runs.append((a, b, lab))
+        prev_runs = curr_runs
+
+    # Compress every label to its root, then renumber roots to 1..K.
+    root_to_new: dict[int, int] = {}
+    for v in np.unique(label):
+        if v == 0:
+            continue
+        r = find(int(v))
+        if r not in root_to_new:
+            root_to_new[r] = len(root_to_new) + 1
+        label[label == v] = root_to_new[r]
+
+    out: list[NDArray[np.bool_]] = []
+    for k in range(1, len(root_to_new) + 1):
+        out.append(label == k)
+    return out
+
+
+def _connected_components_pixel(mask: NDArray[np.bool_]) -> list[NDArray[np.bool_]]:
+    """Reference per-pixel 4-connectivity implementation (tests only)."""
 
     h, w = mask.shape
     label = np.zeros((h, w), dtype=np.int32)
@@ -160,7 +240,6 @@ def _connected_components(mask: NDArray[np.bool_]) -> list[NDArray[np.bool_]]:
                 label[y, x] = up
                 union(up, left)
 
-    # Compress every label to its root, then renumber roots to 1..K.
     root_to_new: dict[int, int] = {}
     for v in np.unique(label):
         if v == 0:
@@ -322,3 +401,59 @@ def normalize(mask: NDArray[np.bool_], target: int = 24) -> NDArray[np.uint8]:
     x0 = (target - new_w) // 2
     out[y0 : y0 + new_h, x0 : x0 + new_w] = resized.astype(np.uint8) * 255
     return out
+
+
+def normalize_grayscale(roi: NDArray[np.uint8], target: int = 24) -> NDArray[np.uint8]:
+    """Center a tight grayscale ROI in a ``target x target`` image.
+
+    Unlike :func:`normalize` this keeps anti-aliasing, edge intensity and
+    sub-pixel scaling information: the result is ``uint8 [target, target]``
+    with values in 0..255 (not just 0/255). Used for the P1 grayscale-CNN
+    experiment; segmentation still consumes the binary mask.
+    """
+
+    roi = np.asarray(roi, dtype=np.uint8)
+    if roi.ndim != 2:
+        raise ValueError(f"expected a grayscale ROI with shape (H, W), got {roi.shape}")
+    h, w = roi.shape
+    if h == 0 or w == 0:
+        return np.zeros((target, target), dtype=np.uint8)
+    scale = min(target * 0.8 / h, target * 0.8 / w)
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+    ys = (np.arange(new_h)[:, None] * h / new_h).astype(np.int32)
+    xs = (np.arange(new_w)[None, :] * w / new_w).astype(np.int32)
+    resized = roi[ys, xs]
+    out = np.zeros((target, target), dtype=np.uint8)
+    y0 = (target - new_h) // 2
+    x0 = (target - new_w) // 2
+    out[y0 : y0 + new_h, x0 : x0 + new_w] = resized
+    return out
+
+
+def collect_glyphs_grayscale(
+    image: NDArray[np.uint8],
+    profile: Profile,
+) -> tuple[list[Segment], NDArray[np.uint8]]:
+    """Segment an image and return binary segments plus grayscale glyphs.
+
+    The P1 input split: segmentation/template keep the binary mask while
+    the TinyCNN may consume ``uint8 [N, 24, 24]`` grayscale glyphs that
+    preserve anti-aliasing and edge strength.
+    """
+
+    mask = profile.color_mask(image)
+    gray = image @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    gray = np.clip(gray, 0, 255).astype(np.uint8)
+    segments: list[Segment] = []
+    glyphs: list[NDArray[np.uint8]] = []
+    for line in _find_lines(mask, profile):
+        for seg in _segment_line(line, profile):
+            roi = gray[seg.y : seg.y + seg.h, seg.x : seg.x + seg.w]
+            segments.append(seg)
+            glyphs.append(normalize_grayscale(roi, profile.target_size))
+    if not glyphs:
+        return segments, np.empty(
+            (0, profile.target_size, profile.target_size), dtype=np.uint8
+        )
+    return segments, np.stack(glyphs)

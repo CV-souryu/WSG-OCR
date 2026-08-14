@@ -30,6 +30,38 @@ class OCRResult:
 
 
 @dataclass(frozen=True)
+class ClassificationBatch:
+    """Top-K classifier output for a batch of glyphs.
+
+    ``ids`` is the top-1 character id, ``top1``/``top2`` are the raw
+    classifier scores of the first two candidates and ``margins`` is
+    ``top1 - top2``. The API supports ``top_k`` > 2 for future dictionary
+    decoding without changing the CNN itself.
+    """
+
+    ids: np.ndarray  # int32 [N]
+    top1: np.ndarray  # f32 [N]
+    top2: np.ndarray  # f32 [N]
+    margins: np.ndarray  # f32 [N]
+
+
+@dataclass(frozen=True)
+class CandidateScore:
+    """Unified score of one segmentation candidate.
+
+    ``visual_score`` lives on a shared 0..1 scale and is what the
+    segmentation DP compares across candidates. ``raw_score`` keeps the
+    classifier-specific quantity (template Hamming distance or CNN logit
+    margin) and ``score_type`` names the source, so two different units are
+    never averaged directly.
+    """
+
+    visual_score: float
+    raw_score: float
+    score_type: str
+
+
+@dataclass(frozen=True)
 class Profile:
     """Per-UI-type configuration used by the preprocessing pipeline."""
 
@@ -78,4 +110,24 @@ def default_profile() -> Profile:
         char_spacing=1,
         target_size=24,
         bright_text=True,
+    )
+
+
+def profile_from_dict(data: dict) -> Profile:
+    """Build a :class:`Profile` from a manifest-style dict."""
+
+    return Profile(
+        name=str(data.get("name", "default")),
+        target_color=tuple(data["target_color"]) if "target_color" in data else None,
+        tolerance=int(data.get("tolerance", 40)),
+        use_grayscale=bool(data.get("use_grayscale", True)),
+        grayscale_threshold=int(data.get("grayscale_threshold", 140)),
+        char_height_min=int(data.get("char_height_min", 8)),
+        char_height_max=int(data.get("char_height_max", 64)),
+        char_width_min=int(data.get("char_width_min", 3)),
+        char_width_max=int(data.get("char_width_max", 72)),
+        stroke_width=int(data.get("stroke_width", 1)),
+        char_spacing=int(data.get("char_spacing", 1)),
+        target_size=int(data.get("target_size", 24)),
+        bright_text=bool(data.get("bright_text", True)),
     )

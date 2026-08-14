@@ -20,7 +20,9 @@ from .cnn import forward
 from .model import load_model
 from .postprocess import allowed_ids as build_allowed_ids
 from .postprocess import pick
-from .preprocess import collect_glyphs, preprocess
+from .preprocess import find_lines, normalize
+from .scorer import SegmentScorer, to_confidence
+from .segmentation import segment_line
 from .types import CharResult, OCRResult, Profile, default_profile
 
 UNKNOWN_CHAR = "?"
@@ -64,6 +66,7 @@ class FixedFontOCR:
             )
         self.model = load_model(Path(self.model_path))
         self.profile = self.profile or default_profile()
+        self._scorer = SegmentScorer(self.model)
         self._benchmark: dict[int, dict[str, float]] | None = None
         self._benchmark_error: str | None = None
         self._backend: Backend | None = None
@@ -169,24 +172,37 @@ class FixedFontOCR:
             raise ValueError(f"expected uint8 image, got {image.dtype}")
 
         allowed = build_allowed_ids(self.model.charset, allowed_chars)
-        if self.model.classifier in ("tinycnn", "hybrid"):
-            segments, glyphs = collect_glyphs(image, self.profile)
-            if self.model.classifier == "hybrid":
-                chars = self._recognize_hybrid(segments, glyphs, allowed)
+        mask = self.profile.color_mask(image)
+        chars: list[CharResult] = []
+        for line in find_lines(mask, self.profile):
+            path = segment_line(line, self.profile, self._scorer, allowed)
+            if not path.candidates:
+                continue
+            segments = [c.segment for c in path.candidates]
+            if self.model.classifier == "template":
+                for seg in segments:
+                    char, conf = self._classifier(seg.mask, self.profile, allowed)
+                    chars.append(
+                        CharResult(
+                            char=char,
+                            x=seg.x,
+                            y=seg.y,
+                            w=seg.w,
+                            h=seg.h,
+                            confidence=conf,
+                        )
+                    )
             else:
-                result = self._backend.classify(glyphs)
-                chars = self._chars_from_backend(segments, glyphs, result, allowed)
-        else:
-            chars, text = preprocess(
-                image,
-                profile=self.profile,
-                classify=self._classifier,
-                allowed_ids=allowed,
-            )
-            if not chars:
-                return OCRResult(text="", confidence=0.0, chars=())
-            confidence = float(np.mean([c.confidence for c in chars]))
-            return OCRResult(text=text, confidence=confidence, chars=tuple(chars))
+                glyphs = np.stack(
+                    [normalize(s.mask, self.model.input_size) for s in segments]
+                )
+                if self.model.classifier == "hybrid":
+                    chars.extend(self._recognize_hybrid(segments, glyphs, allowed))
+                else:
+                    result = self._backend.classify(glyphs)
+                    chars.extend(
+                        self._chars_from_backend(segments, glyphs, result, allowed)
+                    )
 
         if not chars:
             return OCRResult(text="", confidence=0.0, chars=())
@@ -217,7 +233,7 @@ class FixedFontOCR:
                     y=seg.y,
                     w=seg.w,
                     h=seg.h,
-                    confidence=float(score),
+                    confidence=to_confidence(float(score), "cnn"),
                 )
             else:
                 remask.append(i)
@@ -234,7 +250,7 @@ class FixedFontOCR:
                     y=seg.y,
                     w=seg.w,
                     h=seg.h,
-                    confidence=conf,
+                    confidence=to_confidence(conf, "cnn"),
                 )
         return [c for c in chars if c is not None]
 
@@ -244,20 +260,30 @@ class FixedFontOCR:
         glyphs: NDArray[np.uint8],
         allowed: set[int] | None,
     ) -> list[CharResult]:
-        """Three-level strategy: template -> TinyCNN -> unknown."""
-        n = len(segments)
-        if n == 0:
-            return []
-        chars: list[CharResult | None] = [None] * n
-        fallback: list[int] = []
+        """Three-level strategy: template (margin-gated) -> CNN -> unknown.
 
-        # Level 1: template. Only glyphs below the threshold reach the CNN.
-        for i, seg in enumerate(segments):
-            char, conf = self._template_classifier.match(
-                seg.mask, self.profile, allowed
-            )
-            if conf >= self._template_threshold:
-                chars[i] = CharResult(
+        Uses the same :class:`SegmentScorer` as the segmentation DP, so the
+        final hybrid classification and the lattice share one margin-aware
+        gate: a template match is trusted only when both its confidence and
+        its top-1/top-2 margin are high.
+        """
+
+        if not segments:
+            return []
+        scores = self._scorer.score(segments, allowed)
+        chars: list[CharResult] = []
+        for seg, score in zip(segments, scores):
+            if score.char_id < 0:
+                char = UNKNOWN_CHAR
+                conf = 0.0
+            elif score.score_type == "cnn" and score.raw_score < self._cnn_threshold:
+                char = UNKNOWN_CHAR  # Level 3: unknown
+                conf = score.visual_score
+            else:
+                char = self.model.charset[int(score.char_id)]
+                conf = score.visual_score
+            chars.append(
+                CharResult(
                     char=char,
                     x=seg.x,
                     y=seg.y,
@@ -265,44 +291,5 @@ class FixedFontOCR:
                     h=seg.h,
                     confidence=conf,
                 )
-            else:
-                fallback.append(i)
-
-        # Level 2: TinyCNN on the ambiguous subset.
-        if fallback:
-            idx = np.asarray(fallback, dtype=np.int64)
-            fb = glyphs[idx]
-            result = self._backend.classify(fb)
-            if allowed is None:
-                for k, i in enumerate(fallback):
-                    conf = float(result.scores[k])
-                    if conf >= self._cnn_threshold:
-                        char = self.model.charset[int(result.char_ids[k])]
-                    else:
-                        char = UNKNOWN_CHAR  # Level 3: unknown
-                    seg = segments[i]
-                    chars[i] = CharResult(
-                        char=char,
-                        x=seg.x,
-                        y=seg.y,
-                        w=seg.w,
-                        h=seg.h,
-                        confidence=conf,
-                    )
-            else:
-                x = fb.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
-                logits = forward(x, self.model.weights)
-                for k, i in enumerate(fallback):
-                    char, conf = pick(logits[k], self.model.charset, allowed)
-                    if conf < self._cnn_threshold:
-                        char = UNKNOWN_CHAR
-                    seg = segments[i]
-                    chars[i] = CharResult(
-                        char=char,
-                        x=seg.x,
-                        y=seg.y,
-                        w=seg.w,
-                        h=seg.h,
-                        confidence=conf,
-                    )
-        return [c for c in chars if c is not None]
+            )
+        return chars

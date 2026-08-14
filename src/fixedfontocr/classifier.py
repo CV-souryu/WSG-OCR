@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
@@ -10,6 +11,23 @@ from numpy.typing import NDArray
 from .preprocess import normalize
 from .postprocess import pick
 from .types import Profile
+
+
+@dataclass(frozen=True)
+class TemplateBatch:
+    """Top-2 template match for a batch of normalized glyphs.
+
+    ``scores`` are ``1 - dist / area`` (0..1); ``margins`` are the
+    normalized top-1/top-2 Hamming-distance gap in the same 0..1 scale.
+    ``dists`` keep the raw distances for reporting.
+    """
+
+    ids: np.ndarray  # int32 [N]
+    scores: np.ndarray  # f32 [N]
+    second_scores: np.ndarray  # f32 [N]
+    margins: np.ndarray  # f32 [N]
+    dists: np.ndarray  # int32 [N]
+    second_dists: np.ndarray  # int32 [N]
 
 
 class Classifier(ABC):
@@ -231,3 +249,83 @@ class TemplateClassifier(Classifier):
             + self._popcount_table[hi]
             + self._popcount_table[top]
         ).astype(np.int32)
+
+    # ------------------------------------------------------------------
+    # Batched matching (used by the segmentation candidate lattice)
+    # ------------------------------------------------------------------
+
+    def match_batch(
+        self,
+        glyphs: NDArray[np.uint8],
+        allowed_ids: set[int] | None = None,
+    ) -> TemplateBatch:
+        """Top-2 template match for an ``uint8 [N, H, W]`` glyph batch.
+
+        Unlike :meth:`match` this runs a full vectorized scan over every
+        candidate, which is fast enough for the small candidate sets the
+        segmentation lattice produces and avoids per-glyph Python overhead.
+        """
+
+        glyphs = np.asarray(glyphs, dtype=np.uint8)
+        if glyphs.ndim != 3:
+            raise ValueError(f"glyphs must be [N, H, W], got {glyphs.shape}")
+        n = glyphs.shape[0]
+        if n == 0:
+            return TemplateBatch(
+                ids=np.empty(0, dtype=np.int32),
+                scores=np.empty(0, dtype=np.float32),
+                second_scores=np.empty(0, dtype=np.float32),
+                margins=np.empty(0, dtype=np.float32),
+                dists=np.empty(0, dtype=np.int32),
+                second_dists=np.empty(0, dtype=np.int32),
+            )
+        if allowed_ids is not None and not allowed_ids:
+            return TemplateBatch(
+                ids=np.full(n, -1, dtype=np.int32),
+                scores=np.zeros(n, dtype=np.float32),
+                second_scores=np.zeros(n, dtype=np.float32),
+                margins=np.zeros(n, dtype=np.float32),
+                dists=np.full(n, self.input_size * self.input_size, dtype=np.int32),
+                second_dists=np.full(
+                    n, self.input_size * self.input_size, dtype=np.int32
+                ),
+            )
+        if glyphs.shape[1:] != (self.input_size, self.input_size):
+            raise ValueError(
+                f"expected {self.input_size}x{self.input_size} glyphs, "
+                f"got {glyphs.shape[1:]}"
+            )
+
+        bits = np.packbits(glyphs.reshape(n, -1), axis=1, bitorder="little")
+        words = bits.view(np.uint64).reshape(n, -1)
+        candidates = self._allowed_candidates(allowed_ids)
+        template_bits = self._template_bits[candidates]
+        diff = words[:, None, :] ^ template_bits[None, :, :]
+        dists = self._popcount16(diff).sum(axis=-1)  # [N, C]
+
+        if dists.shape[1] == 1:
+            best = np.zeros(n, dtype=np.int64)
+            second = np.full(n, self.input_size * self.input_size, dtype=np.int64)
+        else:
+            idx = np.argpartition(dists, 1, axis=-1)[:, :2]
+            v = dists[np.arange(n)[:, None], idx]
+            a, b = v[:, 0], v[:, 1]
+            best = np.minimum(a, b)
+            second = np.maximum(a, b)
+            # Recover the ids that produced the two distances.
+            best_ids = np.where(a <= b, idx[:, 0], idx[:, 1])
+        if dists.shape[1] == 1:
+            best_ids = np.zeros(n, dtype=np.int64)
+        ids = candidates[best_ids].astype(np.int32)
+        area = self.input_size * self.input_size
+        scores = (1.0 - best.astype(np.float32) / area).astype(np.float32)
+        second_scores = (1.0 - second.astype(np.float32) / area).astype(np.float32)
+        margins = ((second - best).astype(np.float32) / area).astype(np.float32)
+        return TemplateBatch(
+            ids=ids,
+            scores=scores,
+            second_scores=second_scores,
+            margins=margins,
+            dists=best.astype(np.int32),
+            second_dists=second.astype(np.int32),
+        )

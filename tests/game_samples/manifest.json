@@ -1,0 +1,178 @@
+{
+  "font": "SourceHanSansSC/SourceHanSansSC-Bold.otf",
+  "known_limitations": [
+    "Glyphs may sit in adjacent columns with no blank run between them (e.g. slot1's 'L' and 'V'); they remain separate connected components and are split by the visual DP, not by blank-column valleys."
+  ],
+  "default_profile": {
+    "name": "default",
+    "use_grayscale": true,
+    "grayscale_threshold": 140,
+    "char_height_min": 8,
+    "char_height_max": 64,
+    "char_width_min": 3,
+    "char_width_max": 72,
+    "stroke_width": 1,
+    "char_spacing": 1,
+    "target_size": 24,
+    "bright_text": true
+  },
+  "samples": [
+    {
+      "file": "level/slot0_level.png",
+      "expected": "LV.40",
+      "category": "real-game/level",
+      "note": "1x game level badge"
+    },
+    {
+      "file": "level/slot0_level_4x.png",
+      "expected": "LV.40",
+      "category": "real-game/level",
+      "note": "4x game level badge"
+    },
+    {
+      "file": "level/slot1_level.png",
+      "expected": "LV.26",
+      "category": "real-game/level",
+      "note": "1x game level badge"
+    },
+    {
+      "file": "level/slot1_level_4x.png",
+      "expected": "LV.26",
+      "category": "real-game/level",
+      "note": "4x game level badge"
+    },
+    {
+      "file": "level/slot2_level.png",
+      "expected": "LV.24",
+      "category": "real-game/level",
+      "note": "1x game level badge"
+    },
+    {
+      "file": "level/slot2_level_4x.png",
+      "expected": "LV.24",
+      "category": "real-game/level",
+      "note": "4x game level badge"
+    },
+    {
+      "file": "level/slot3_level.png",
+      "expected": "LV.23",
+      "category": "real-game/level",
+      "note": "1x game level badge"
+    },
+    {
+      "file": "level/slot3_level_4x.png",
+      "expected": "LV.23",
+      "category": "real-game/level",
+      "note": "4x game level badge"
+    },
+    {
+      "file": "level/slot4_level.png",
+      "expected": "LV.1",
+      "category": "real-game/level",
+      "note": "1x game level badge"
+    },
+    {
+      "file": "level/slot4_level_4x.png",
+      "expected": "LV.1",
+      "category": "real-game/level",
+      "note": "4x game level badge"
+    },
+    {
+      "file": "level/slot5_level.png",
+      "expected": "LV.5",
+      "category": "real-game/level",
+      "note": "1x game level badge"
+    },
+    {
+      "file": "level/slot5_level_4x.png",
+      "expected": "LV.5",
+      "category": "real-game/level",
+      "note": "4x game level badge"
+    },
+    {
+      "file": "synthetic/zh_32.png",
+      "expected": "获得金币1000",
+      "category": "synthetic/normal-chinese",
+      "note": "normal Chinese copy"
+    },
+    {
+      "file": "synthetic/digits_32.png",
+      "expected": "1234567890",
+      "category": "synthetic/digits",
+      "note": "digits"
+    },
+    {
+      "file": "synthetic/mixed_32.png",
+      "expected": "舰船Lv.99",
+      "category": "synthetic/mixed-cn-ascii",
+      "note": "mixed Chinese + ASCII"
+    },
+    {
+      "file": "synthetic/punct_32.png",
+      "expected": "。，！？",
+      "category": "synthetic/punctuation",
+      "note": "punctuation"
+    },
+    {
+      "file": "synthetic/frag_ba_32.png",
+      "expected": "鲃",
+      "category": "synthetic/fragment-glyphs",
+      "note": "fragment-heavy glyph"
+    },
+    {
+      "file": "synthetic/frag_xiao_32.png",
+      "expected": "小",
+      "category": "synthetic/fragment-glyphs",
+      "note": "fragment-heavy glyph"
+    },
+    {
+      "file": "synthetic/jiashen_32.png",
+      "expected": "甲申",
+      "category": "synthetic/confusable",
+      "note": "confusable pair 甲/申"
+    },
+    {
+      "file": "synthetic/weimo_32.png",
+      "expected": "未末",
+      "category": "synthetic/confusable",
+      "note": "confusable pair 未/末"
+    },
+    {
+      "file": "synthetic/light_bg_32.png",
+      "expected": "获得金币1000",
+      "category": "synthetic/light-background",
+      "note": "dark text on light background",
+      "profile": {
+        "bright_text": false,
+        "grayscale_threshold": 100
+      }
+    },
+    {
+      "file": "synthetic/dark_bg_32.png",
+      "expected": "生命值1000",
+      "category": "synthetic/dark-background",
+      "note": "bright text on dark background"
+    },
+    {
+      "file": "synthetic/antialias_32.png",
+      "expected": "获得金币1000",
+      "category": "synthetic/antialiasing",
+      "note": "gaussian-blurred edges",
+      "profile": {
+        "grayscale_threshold": 120
+      }
+    },
+    {
+      "file": "synthetic/small_16.png",
+      "expected": "获得金币1000",
+      "category": "synthetic/font-size",
+      "note": "small font size"
+    },
+    {
+      "file": "synthetic/large_48.png",
+      "expected": "获得金币1000",
+      "category": "synthetic/font-size",
+      "note": "large font size"
+    }
+  ]
+}

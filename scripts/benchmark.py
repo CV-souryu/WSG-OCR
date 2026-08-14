@@ -133,7 +133,12 @@ class _CountingClassifier:
     def __init__(self) -> None:
         self.calls = 0
 
-    def __call__(self, mask: np.ndarray, profile) -> tuple[str, float]:
+    def __call__(
+        self,
+        mask: np.ndarray,
+        profile,
+        allowed_ids=None,
+    ) -> tuple[str, float]:
         self.calls += 1
         normalize(mask, profile.target_size)
         return "?", 0.0

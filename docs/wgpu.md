@@ -6,7 +6,8 @@ Only the classifier is on the GPU. The CPU still does:
 
 - color/grayscale mask
 - line finding
-- connected components + fragment merging / width splitting
+- run-length connected components
+- candidate lattice + visual DP segmentation
 - 24x24 resize + normalization
 
 The result is an `uint8 [N, 24, 24]` glyph batch (0/255) that is handed to a
@@ -21,6 +22,11 @@ class Backend:
 `CPUBackend` is the numpy reference. `WGPUBackend` implements the same
 contract with WGSL compute shaders, so the OCR pipeline above never needs to
 know which backend is active.
+
+The production recognizer now segments with the candidate lattice + visual
+DP (see `architecture.md`); the WGPU re-integration that feeds the
+DP-selected candidates back into the WGSL classifier is the next phase and
+is intentionally not part of this CPU freeze.
 
 ## Data layout
 

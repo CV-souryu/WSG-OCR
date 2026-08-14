@@ -105,3 +105,18 @@ def test_custom_profile_is_used(font_path, model_dir):
     image = render_text("42", font_path)
     result = ocr.recognize(image)
     assert result.text == "42"
+
+
+def test_hsl_profile_keeps_white_text_and_drops_colored_ui():
+    """HSL binarization: white game text survives, colored UI/1px noise does not."""
+    image = np.full((30, 128, 3), (16, 125, 214), dtype=np.uint8)  # blue box
+    image[10:26, 20:108] = (255, 255, 255)  # white text band
+    image[0, :] = (120, 160, 100)  # colored 1px noise row (not white)
+
+    profile = Profile(name="hsl-white", use_hsl=True, use_grayscale=False)
+    mask = profile.color_mask(image)
+
+    assert mask[10:26, 20:108].all()  # white text kept
+    assert not mask[0, :].any()  # colored noise row dropped
+    assert not mask[1:10, :].any()  # blue background dropped
+    assert not mask[26:, :].any()

@@ -8,6 +8,29 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def _hsl_lightness_saturation(
+    image: NDArray[np.uint8],
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Convert an RGB image to HSL lightness/saturation in [0, 1].
+
+    Hue is intentionally not computed: the game text is white (low
+    saturation, high lightness) and the surrounding UI is colored, so
+    ``(lightness, saturation)`` alone separates ink from background without
+    depending on hue.
+    """
+
+    rgb = image.astype(np.float32) / 255.0
+    maxc = rgb.max(axis=-1)
+    minc = rgb.min(axis=-1)
+    lightness = (maxc + minc) / 2.0
+    delta = maxc - minc
+    denom = 1.0 - np.abs(2.0 * lightness - 1.0)
+    saturation = np.zeros_like(lightness)
+    colored = delta > 0
+    saturation[colored] = delta[colored] / np.maximum(denom[colored], 1e-6)
+    return lightness, saturation
+
+
 @dataclass(frozen=True)
 class CharResult:
     """A single recognized character and its location in the source image."""
@@ -71,6 +94,13 @@ class Profile:
     tolerance: int = 40
     use_grayscale: bool = True
     grayscale_threshold: int = 140
+    # HSL-based binarization: game text is mostly white, i.e. high
+    # lightness and low saturation, while UI frames/backgrounds are
+    # colored. When ``use_hsl`` is True the grayscale/RGB branches are
+    # ignored.
+    use_hsl: bool = False
+    hsl_lightness_min: float = 0.55
+    hsl_saturation_max: float = 0.70
     # Character size expectations (used for merging/splitting components).
     char_height_min: int = 8
     char_height_max: int = 64
@@ -85,6 +115,12 @@ class Profile:
 
     def color_mask(self, image: NDArray[np.uint8]) -> NDArray[np.bool_]:
         """Return a boolean mask of pixels matching this profile's text color."""
+        if self.use_hsl:
+            lightness, saturation = _hsl_lightness_saturation(image)
+            sat_ok = saturation <= self.hsl_saturation_max
+            if self.bright_text:
+                return (lightness >= self.hsl_lightness_min) & sat_ok
+            return (lightness <= self.hsl_lightness_min) & sat_ok
         if self.use_grayscale or self.target_color is None:
             gray = image @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
             if self.bright_text:
@@ -122,6 +158,9 @@ def profile_from_dict(data: dict) -> Profile:
         tolerance=int(data.get("tolerance", 40)),
         use_grayscale=bool(data.get("use_grayscale", True)),
         grayscale_threshold=int(data.get("grayscale_threshold", 140)),
+        use_hsl=bool(data.get("use_hsl", False)),
+        hsl_lightness_min=float(data.get("hsl_lightness_min", 0.55)),
+        hsl_saturation_max=float(data.get("hsl_saturation_max", 0.70)),
         char_height_min=int(data.get("char_height_min", 8)),
         char_height_max=int(data.get("char_height_max", 64)),
         char_width_min=int(data.get("char_width_min", 3)),

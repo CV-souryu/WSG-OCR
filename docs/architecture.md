@@ -46,6 +46,7 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/preprocess.py` | Color/grayscale mask, line finding, run-length connected components, Goal 3 binary + soft baseline-aligned 24×24 normalization (`NormalizeSpec`, `glyph_normalize_geometry`). |
 | `src/fixedfontocr/frontend.py` | Goal 2 Visual Frontend: one RGB pass extracts `binary_mask` (segmentation/template) and `soft_foreground` (TinyCNN), plus binary/soft glyph normalization helpers. |
 | `src/fixedfontocr/geometry.py` | Goal 8 font geometry database: offline generation from a registered font (`advance`, bbox, aspect, ink, component count, baseline) plus the runtime JSON lookup table used by pruning and geometry scoring. |
+| `src/fixedfontocr/lexicon.py` | Goal 11 Lexicon Layer: loads `charsets/words/` by domain, normalizes whitespace, ranks exact/full/partial-word matches and applies `none`/`prefer`/`strict` modes to the decoded result. |
 | `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms) and the visual DP decoder. This is the production segmentation path. |
 | `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate; converts raw scores to a shared 0..1 visual score. |
 | `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier` (V1 single-template) and `TemplateV2Classifier` (Goal 9 multi-prototype): coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; Top-K/best/second/margin + winning-prototype metadata for the lattice. |
@@ -76,6 +77,7 @@ numpy RGB
        hybrid:   template gate first, CNN fallback for ambiguous glyphs
   -> visual DP (max mean visual score path, Goal 8 geometry penalties)
   -> allowed_chars restriction (postprocess)
+  -> lexicon layer (none / prefer / strict, Goal 11)
   -> charset -> string
 ```
 

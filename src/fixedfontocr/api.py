@@ -18,6 +18,7 @@ from .backends import (
 from .classifier import Classifier, TemplateClassifier, TemplateV2Classifier
 from .cnn import forward
 from .frontend import extract_frontend
+from .lexicon import Lexicon, apply_lexicon, is_lexicon_ref, load_lexicon
 from .model import load_model
 from .postprocess import allowed_ids as build_allowed_ids
 from .postprocess import pick
@@ -175,6 +176,9 @@ class FixedFontOCR:
         self,
         image: NDArray[np.uint8],
         allowed_chars: str | None = None,
+        *lexicon_args,
+        lexicon: str | Path | Lexicon | None = None,
+        lexicon_mode: str | None = None,
     ) -> OCRResult:
         """Recognize horizontal, single-line text in ``image``.
 
@@ -183,6 +187,15 @@ class FixedFontOCR:
         alphabet (e.g. ``"0123456789"`` for a coin counter). Characters
         outside the set are never emitted; when no candidate survives, the
         position is reported as ``"?"`` with confidence 0.
+
+        ``lexicon`` selects a Goal 11 dictionary (``"ships"``,
+        ``"equipment"``, ``"ui"`` or ``"all"``, a ``Lexicon``, or a path to
+        a one-word-per-line file). ``lexicon_mode`` is ``"none"`` (default
+        when no lexicon is supplied), ``"prefer"`` (default when a lexicon
+        is supplied) or ``"strict"``. The visible ``text`` is never
+        rewritten unless the lexicon target is already a visually plausible
+        Top-K alternative for a low-confidence character; ``strict`` rejects
+        non-dictionary text with an empty result.
         """
 
         image = np.asarray(image)
@@ -191,7 +204,46 @@ class FixedFontOCR:
         if image.dtype != np.uint8:
             raise ValueError(f"expected uint8 image, got {image.dtype}")
 
+        if len(lexicon_args) >= 1 and lexicon is None:
+            if is_lexicon_ref(allowed_chars):
+                if lexicon_mode is None:
+                    lexicon_mode = lexicon_args[0]
+            else:
+                lexicon = lexicon_args[0]
+        if len(lexicon_args) >= 2 and lexicon_mode is None:
+            if not is_lexicon_ref(allowed_chars):
+                lexicon_mode = lexicon_args[1]
+        if len(lexicon_args) > 2:
+            raise TypeError("recognize() takes at most 4 positional arguments")
+
+        # ``recognize(image, "ships", "prefer")`` is accepted as shorthand
+        # for the keyword form while keeping the existing positional
+        # ``allowed_chars`` API intact.
+        if lexicon is None and is_lexicon_ref(allowed_chars):
+            lexicon = allowed_chars
+            allowed_chars = None
+        if lexicon_mode is None:
+            lexicon_mode = "prefer" if lexicon is not None else "none"
+        lexicon_mode = str(lexicon_mode).strip().lower()
+        if lexicon_mode not in ("none", "prefer", "strict"):
+            raise ValueError(
+                f"lexicon_mode {lexicon_mode!r} is not supported; "
+                "use 'none', 'prefer' or 'strict'"
+            )
+        if lexicon_mode != "none" and lexicon is None:
+            raise ValueError(
+                "lexicon must be provided when lexicon_mode is not 'none'"
+            )
+
         allowed = build_allowed_ids(self.model.charset, allowed_chars)
+        if lexicon_mode == "strict" and lexicon is not None:
+            lexicon_ids = build_allowed_ids(
+                self.model.charset, load_lexicon(lexicon).charset
+            )
+            if allowed is None:
+                allowed = lexicon_ids
+            elif lexicon_ids is not None:
+                allowed &= lexicon_ids
         frontend = extract_frontend(image, self.profile)
         mask = frontend.binary_mask
         paths: list[DecodePath] = []
@@ -276,7 +328,7 @@ class FixedFontOCR:
             )
             for cand, char, conf in decoded
         )
-        return OCRResult(
+        result = OCRResult(
             text=text,
             confidence=confidence,
             chars=chars,
@@ -285,6 +337,12 @@ class FixedFontOCR:
             alternatives=self._alternatives(paths),
             lexicon_match=None,
             path=paths[0] if len(paths) == 1 else None,
+        )
+        return apply_lexicon(
+            result,
+            lexicon,
+            lexicon_mode,
+            charset=self.model.charset,
         )
 
     def _binary_glyph_batch(

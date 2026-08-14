@@ -23,6 +23,14 @@ from .types import (
 from .classifier import TemplateClassifier
 from .frontend import VisualFrontend, extract_frontend
 from .geometry import FontGeometryDatabase
+from .lexicon import (
+    LEXICON_DOMAINS,
+    LEXICON_FILES,
+    Lexicon,
+    LexiconLayer,
+    apply_lexicon,
+    load_lexicon,
+)
 from .model import write_hybrid_model
 from .postprocess import pick
 from .scorer import (
@@ -49,6 +57,12 @@ __all__ = [
     "LexiconMatch",
     "VisualFrontend",
     "FontGeometryDatabase",
+    "Lexicon",
+    "LexiconLayer",
+    "LEXICON_FILES",
+    "LEXICON_DOMAINS",
+    "load_lexicon",
+    "apply_lexicon",
     "extract_frontend",
     "Profile",
     "TemplateClassifier",

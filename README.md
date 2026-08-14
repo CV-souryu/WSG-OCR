@@ -79,6 +79,9 @@ print(result.text)        # "获得金币1000"
 print(result.confidence)
 print(result.alternatives)  # Top-K single-substitution alternatives
 print(result.matched_term)  # None until a lexicon is supplied
+result = ocr.recognize(image, lexicon="ships", lexicon_mode="prefer")
+print(result.matched_term)  # dictionary-inferred entity, e.g. "巴尔的摩"
+print(result.matched_span)  # half-open range inside matched_term
 for c in result.chars:
     print(c.char, c.x, c.y, c.w, c.h, c.confidence)
 ```
@@ -480,6 +483,14 @@ spacing, and normalized size. Pass a custom profile to
   `[0, 1]`, and `tools/train/tune_visual.py` re-fits the weights on any
   real-screenshot npz. `tests/test_goal10_unified_scoring.py` pins the
   evidence fields, formula, geometry integration and calibration.
+- Goal 11 lexicon layer is implemented: `charsets/words/` is loaded by
+  domain (`ships`, `equipment`, `ui`, plus `all` or explicit paths), and
+  `recognize(..., lexicon=..., lexicon_mode=...)` supports
+  `none`/`prefer`/`strict`. The matcher handles exact, full-term-in-text and
+  Goal 12 partial-word alignments; `prefer` only rewrites visually
+  uncertain characters when the dictionary target is already in the
+  candidate's Top-K, and `strict` rejects non-dictionary text.
+  `tests/test_goal11_lexicon.py` covers loading, matching and the modes.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

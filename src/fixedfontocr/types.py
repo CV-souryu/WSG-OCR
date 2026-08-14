@@ -237,8 +237,16 @@ class LexiconMatch:
     """A dictionary match over a span of visible text.
 
     ``term`` is the full entity inferred from the lexicon; ``span`` is the
-    half-open character range it covers in :attr:`OCRResult.text`. The
-    visible text itself is never rewritten by the lexicon layer.
+    half-open character range inside ``term`` that the visible text covers.
+    For a cropped/partial view this follows the Goal 12 convention
+    (``text="尔的摩"`` / ``term="巴尔的摩"`` / ``span=(1, 4)``), while
+    ``text_span`` records the same range inside the visible text when the
+    term is only a substring of it. The dictionary never invents or
+    overwrites visible characters on its own: ``prefer`` may replace a
+    character only when that replacement is already among the candidate's
+    visual Top-K and the original visual evidence was uncertain. ``kind``
+    names the alignment used by the matcher (``exact``, ``term_in_text``,
+    ``prefix_crop``, ``suffix_crop``, ``inner_crop`` or ``gap_crop``).
     """
 
     term: str
@@ -246,6 +254,9 @@ class LexiconMatch:
     confidence: float = 0.0
     score: float = 0.0
     mode: str = "none"
+    text: str = ""
+    text_span: tuple[int, int] | None = None
+    kind: str = "exact"
 
 
 @dataclass(frozen=True)
@@ -254,9 +265,10 @@ class OCRResult:
 
     ``text`` is exactly what is visible on screen. ``matched_term`` (and
     ``lexicon_match``) are dictionary-inferred entities and must never be
-    conflated with the visible text. ``alternatives`` holds alternate
-    decoder outputs, and ``path`` retains the chosen lattice path for
-    debugging/inspection.
+    conflated with the visible text; ``matched_span`` is the half-open
+    range inside ``matched_term`` that the visible text covers (Goal 12).
+    ``alternatives`` holds alternate decoder outputs, and ``path`` retains
+    the chosen lattice path for debugging/inspection.
     """
 
     text: str

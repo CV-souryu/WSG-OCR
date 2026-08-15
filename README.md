@@ -323,9 +323,10 @@ python -m pytest tests/test_game_samples.py
 category, profile overrides, optional lexicon/matched-term annotations and
 the registered font. The Goal 14 battery adds small-size `鲃鱼`/`小`/
 `潜甲`/`潜乙`/`Z17`/`巴尔的摩`, mixed Chinese+ASCII, digits, short/long
-words and a partial-word crop to the corpus; `slot1` level badges remain a
-documented limitation (`L`/`V` touch at one pixel and form one connected
-component at both scales).
+words and a partial-word crop to the corpus, and the Goal 15 battery pins
+that the ships lexicon never rewrites clear `潜乙` into `潜甲`; `slot1`
+level badges remain a documented limitation (`L`/`V` touch at one pixel
+and form one connected component at both scales).
 
 ## UI-limited charsets (`allowed_chars`)
 
@@ -592,6 +593,17 @@ spacing, and normalized size. Pass a custom profile to
   geometry score stops double-penalizing multi-component glyphs (小/鲃/潜)
   and rewards an exact component-count match, and the game-sample corpus
   grew to 37 images with per-sample lexicon annotations.
+- Goal 15 lexicon/visual priority is implemented: the lexicon may annotate
+  or help only when the visual evidence is uncertain. Confident visible
+  text is never rewritten, dictionary corrections require the target to be
+  in the character's visual Top-K, a non-unique or near-tied dictionary
+  match keeps the OCR text and its `alternatives`, and unknown text is
+  still emitted normally. The decoder gates every lexicon/word-prior term
+  by `1 - mean(visual)`, and `apply_lexicon` enforces the same rule at the
+  result level with `prefer_threshold`/`correction_unique_margin`.
+  `tests/test_goal15_lexicon_visual_priority.py` pins the contract,
+  including the canonical case that clear `潜乙` is never rewritten to
+  `潜甲` even though `潜甲` is in the ships lexicon.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

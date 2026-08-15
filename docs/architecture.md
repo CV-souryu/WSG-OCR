@@ -46,9 +46,9 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/preprocess.py` | Color/grayscale mask, line finding, run-length connected components, Goal 3 binary + soft baseline-aligned 24×24 normalization (`NormalizeSpec`, `glyph_normalize_geometry`). |
 | `src/fixedfontocr/frontend.py` | Goal 2 Visual Frontend: one RGB pass extracts `binary_mask` (segmentation/template) and `soft_foreground` (TinyCNN), plus binary/soft glyph normalization helpers. |
 | `src/fixedfontocr/geometry.py` | Goal 8 font geometry database: offline generation from a registered font (`advance`, bbox, aspect, ink, component count, baseline) plus the runtime JSON lookup table used by pruning and geometry scoring. |
-| `src/fixedfontocr/lexicon.py` | Goal 11 Lexicon Layer + Goal 12 partial-word support: loads `charsets/words/` by domain, normalizes whitespace, ranks exact/full/partial-word matches (prefix/suffix/inner crops, internal-gap penalty) and applies `none`/`prefer`/`strict` modes to the decoded result. |
+| `src/fixedfontocr/lexicon.py` | Goal 11 Lexicon Layer + Goal 12 partial-word support + Goal 15 visual-priority guards: loads `charsets/words/` by domain, normalizes whitespace, ranks exact/full/partial-word matches (prefix/suffix/inner crops, internal-gap penalty) and applies `none`/`prefer`/`strict` modes to the decoded result. Prefer corrections require an uncertain character whose target is in the visual Top-K and a unique (non-near-tied) dictionary match. |
 | `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms) and the visual DP decoder. This is the production segmentation path. |
-| `src/fixedfontocr/decoder.py` | Goal 13 joint decoder: exact DP (`decode_dp`, lexicon-prefix trie state) + beam-search upgrade (`decode_beam`, `beam_width` 8..32) scoring `visual + geometry + lexicon + word_prior - segmentation_penalty` and returning the best path + alternatives. |
+| `src/fixedfontocr/decoder.py` | Goal 13 joint decoder: exact DP (`decode_dp`, lexicon-prefix trie state) + beam-search upgrade (`decode_beam`, `beam_width` 8..32) scoring `visual + geometry + lexicon + word_prior - segmentation_penalty` and returning the best path + alternatives. Every lexicon/word-prior term is gated by visual uncertainty so confident evidence stays dominant (Goal 15). |
 | `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate; converts raw scores to a shared 0..1 visual score. |
 | `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier` (V1 single-template) and `TemplateV2Classifier` (Goal 9 multi-prototype): coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; Top-K/best/second/margin + winning-prototype metadata for the lattice. |
 | `src/fixedfontocr/cnn.py` | `TinyCNNClassifier` numpy forward pass (stride-2 optimized), `forward_with_activations` for exported test vectors and `classify_batch(glyphs, top_k=2)`. |
@@ -413,6 +413,33 @@ and `matched_term`/`matched_span` annotation, and `tests/test_goal13_decoder.py`
 pins the formula, DP/beam agreement, segmentation penalty, lexicon
 tie-breaking, geometry input and the Goal 4/7/11/12 end-to-end regressions.
 
+## Lexicon visual priority (Goal 15)
+
+Goal 15 is the rule that the lexicon is a helper, never an override: in
+`prefer` mode it may annotate or resolve, but it must not rewrite strong
+visual evidence. Four invariants are enforced:
+
+* visually confident text is never rewritten. In the decoder every lexicon
+  term (`lexicon * (1 - mean(visual))`), word prior and prefix/term bonus
+  is gated by visual uncertainty, and in `apply_lexicon` a character with
+  confidence `>= prefer_threshold` (0.9) is never a correction target;
+* ambiguous text is helped only when the dictionary target is already a
+  plausible visual Top-K alternative of that character -- the lexicon can
+  pick between `С`/`C` or `Χ`/`X` at low resolution, but it can never
+  invent a character the visual evidence did not consider;
+* a non-unique dictionary match keeps the OCR text and its `alternatives`.
+  `apply_lexicon` refuses to correct when two differently-worded
+  corrections score within `correction_unique_margin` (0.02) of each other;
+* unknown text is still emitted normally: `prefer` never suppresses
+  output, never fabricates a `matched_term`, and at regular resolution
+  `ABCXYZ999` decodes exactly even though the ships lexicon has no such
+  term.
+
+The canonical regression is `潜乙`: the ships lexicon contains `潜甲`, yet
+a clear `潜乙` (12..32 px) is never rewritten into `潜甲`. The contract is
+pinned by `tests/test_goal15_lexicon_visual_priority.py` and the
+`synthetic/qianyi_14.png` game sample.
+
 ## Unified scoring and Top-K
 
 Template confidence is in `[0,1]` while the CNN reports unbounded logits;
@@ -651,8 +678,9 @@ light/dark backgrounds, anti-aliasing and multiple font sizes.
 overrides, optional lexicon/matched-term annotations and the registered
 font. The Goal 14 battery contributes small-size `鲃鱼`/`小`/`潜甲`/`潜乙`/
 `Z17`/`巴尔的摩`, mixed Chinese+ASCII, digits, short/long words and a
-partial-word crop. `tests/test_game_samples.py` fails on any
-segmentation/CNN change that breaks the set (37 samples).
+partial-word crop, and the Goal 15 battery pins that the ships lexicon
+never rewrites clear `潜乙` into `潜甲`. `tests/test_game_samples.py` fails
+on any segmentation/CNN change that breaks the set (37 samples).
 
 The level badges are also training data:
 `tools/dataset/extract_game_samples.py` splits them into per-character crops
@@ -685,6 +713,7 @@ verified:
 | Goal 9 Template V2 | `tests/test_goal9_template_v2.py` (11..16 px × sub-pixel × downsample grid, V1/V2 round-trip, prefilter Top-K exactness, low-res confusables 未/末 & Z/2, exact low-res tie routing to CNN, bundled models in V2 format) |
 | Goal 13 joint decoder | `src/fixedfontocr/decoder.py` + `tests/test_goal13_decoder.py` (DP + beam search, `visual + geometry + lexicon + word_prior - segmentation_penalty`, alternatives, Goal 15 visual-uncertainty gate, end-to-end `鲃`/`小`/`潜甲`/`潜乙`/`巴尔的摩`/`Z17` with lexicon) |
 | Goal 14 typical-problem regressions | `tests/test_goal14_regressions.py` + `tests/game_samples/` (鲃鱼 != $E鱼, 小 not fragmented, 潜甲/潜乙 not merged, small-size Z17/巴尔的摩, mixed/digits/punct/short/long/partial-word at 12..32 px; scorer keeps full Top-5 + low-res template corroboration, geometry rewards multi-component glyph matches) |
+| Goal 15 lexicon cannot override strong visual evidence | `tests/test_goal15_lexicon_visual_priority.py` + `src/fixedfontocr/lexicon.py` (confident text never rewritten; ambiguous Top-K-only correction; non-unique/near-tied matches keep OCR + alternatives; unknown text emitted; 潜乙 never becomes 潜甲 at 12..32 px with ships lexicon) + `tests/game_samples/` |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
 | Real game regression passes | `tests/test_game_samples.py` (37 samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |

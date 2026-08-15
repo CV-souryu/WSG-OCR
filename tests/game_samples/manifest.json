@@ -196,14 +196,14 @@
       "file": "synthetic/qianjia_14.png",
       "expected": "潜甲",
       "category": "synthetic/goal14-fragments",
-      "note": "Goal 14: 潜甲 must not be falsely merged",
+      "note": "Goal 14/15: 潜甲 must not be falsely merged or rewritten",
       "lexicon": "ships"
     },
     {
       "file": "synthetic/qianyi_14.png",
       "expected": "潜乙",
       "category": "synthetic/goal14-fragments",
-      "note": "Goal 14: 潜乙 must not be falsely merged",
+      "note": "Goal 14/15: 潜乙 must not be falsely merged, and ships lexicon must not rewrite clear 潜乙 to 潜甲",
       "lexicon": "ships"
     },
     {

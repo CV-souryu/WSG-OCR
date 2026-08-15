@@ -467,8 +467,17 @@ def _lexicon_correction(
     charset: list[str] | None,
     prefer_threshold: float,
     correction_min_score: float,
+    correction_unique_margin: float,
 ) -> OCRResult | None:
-    """Build a corrected exact-term result when visual evidence permits."""
+    """Build a corrected exact-term result when visual evidence permits.
+
+    A correction is only emitted when the visual evidence for the changed
+    characters is genuinely uncertain (``confidence < prefer_threshold``)
+    and the lexicon target is already in that character's visual Top-K.
+    When two different dictionary terms are both plausible corrections and
+    their scores are close (within ``correction_unique_margin``) the match
+    is not unique, so the visible OCR text is kept (Goal 15).
+    """
 
     text = normalize_text(result.text)
     if not text or len(result.chars) != len(text):
@@ -505,7 +514,7 @@ def _lexicon_correction(
         second_score, second_term, _ = candidates[1]
         if (
             second_term != best_term
-            and abs(second_score - best_score) < 1e-9
+            and (best_score - second_score) < correction_unique_margin
         ):
             return None
 
@@ -554,15 +563,18 @@ def apply_lexicon(
     charset: list[str] | None = None,
     prefer_threshold: float = 0.9,
     correction_min_score: float = 0.0,
+    correction_unique_margin: float = 0.02,
 ) -> OCRResult:
     """Apply the Goal 11 lexicon modes to an OCR result.
 
     ``mode`` may be ``"none"``, ``"prefer"`` or ``"strict"``. With
     ``"prefer"`` the best dictionary match is attached to the result and a
     visually uncertain character is corrected only when the dictionary
-    target is already among that character's Top-K alternatives. With
-    ``"strict"`` only an exact dictionary term is accepted; anything else
-    is rejected as empty output.
+    target is already among that character's Top-K alternatives and the
+    correction is unique (a second, differently-worded correction within
+    ``correction_unique_margin`` keeps the visible OCR text, Goal 15).
+    With ``"strict"`` only an exact dictionary term is accepted; anything
+    else is rejected as empty output.
     """
 
     if mode is None:
@@ -604,6 +616,7 @@ def apply_lexicon(
                 charset,
                 prefer_threshold,
                 correction_min_score,
+                correction_unique_margin,
             )
             if corrected is not None:
                 return corrected
@@ -625,6 +638,7 @@ def apply_lexicon(
         charset,
         prefer_threshold,
         correction_min_score,
+        correction_unique_margin,
     )
     if corrected is not None:
         return corrected

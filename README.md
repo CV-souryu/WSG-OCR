@@ -17,6 +17,8 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 │   ├── decoder.py       # Goal 13 joint decoder: DP + beam search over the
 │   │                    #   lattice with visual/geometry/lexicon/word-prior
 │   │                    #   evidence, outputting the best path + alternatives
+│   ├── tracker.py       # Goal 16 cross-frame tracker: ROI change detection,
+│   │                    #   result caching, multi-frame logits fusion, voting
 │   ├── frontend.py      # Goal 2 Visual Frontend: binary mask + soft
 │   │                    #   foreground from one RGB pass
 │   ├── geometry.py      # Goal 8 font geometry database: offline generation
@@ -225,6 +227,28 @@ path; the beam's runner-up texts are ranked with the full formula.
 characters (`DecodePath.char_ids`) are authoritative, while `apply_lexicon`
 still handles strict mode and the Goal 12 `matched_term`/`matched_span`
 annotation.
+
+## Cross-frame tracking (Goal 16)
+
+`recognize` stays a pure single-frame function. When the same UI crop is
+seen repeatedly, an optional tracker layers temporal state on top without
+mutating the OCR engine:
+
+```python
+tracker = ocr.tracker()
+
+result = tracker.update(frame1)   # 巴尔的摩
+result = tracker.update(frame2)   # 巴你的摩 (one-frame flicker)
+result = tracker.update(frame3)   # 巴尔的摩 (stable)
+```
+
+Each update first computes a compact text-ROI signature. An unchanged ROI
+is served from the tracker's result cache (no re-run of segmentation or
+classification). When the ROI content does change, the recent per-character
+Top-K evidence is aligned and summed, so one bad frame cannot overwhelm the
+accumulated logits, and majority text voting suppresses flicker once enough
+frames agree. The tracker owns all of this state; `ocr.recognize(image)` is
+unchanged and temporal state never leaks into the baseline OCR tests.
 
 ## Font geometry database (Goal 8)
 
@@ -604,6 +628,12 @@ spacing, and normalized size. Pass a custom profile to
   `tests/test_goal15_lexicon_visual_priority.py` pins the contract,
   including the canonical case that clear `潜乙` is never rewritten to
   `潜甲` even though `潜甲` is in the ships lexicon.
+- Goal 16 cross-frame tracking is implemented: `ocr.tracker()` / 
+  `FrameTracker` layers ROI change detection, per-ROI result caching,
+  multi-frame Top-K logits fusion and stable text voting on top of the
+  pure single-frame API. `tests/test_goal16_cross_frame.py` pins caching,
+  ROI change flags, the `巴尔的摩 / 巴你的摩 / 巴尔的摩` stabilization
+  example and tracker reset.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per

@@ -49,6 +49,7 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/lexicon.py` | Goal 11 Lexicon Layer + Goal 12 partial-word support + Goal 15 visual-priority guards: loads `charsets/words/` by domain, normalizes whitespace, ranks exact/full/partial-word matches (prefix/suffix/inner crops, internal-gap penalty) and applies `none`/`prefer`/`strict` modes to the decoded result. Prefer corrections require an uncertain character whose target is in the visual Top-K and a unique (non-near-tied) dictionary match. |
 | `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms) and the visual DP decoder. This is the production segmentation path. |
 | `src/fixedfontocr/decoder.py` | Goal 13 joint decoder: exact DP (`decode_dp`, lexicon-prefix trie state) + beam-search upgrade (`decode_beam`, `beam_width` 8..32) scoring `visual + geometry + lexicon + word_prior - segmentation_penalty` and returning the best path + alternatives. Every lexicon/word-prior term is gated by visual uncertainty so confident evidence stays dominant (Goal 15). |
+| `src/fixedfontocr/tracker.py` | Goal 16 cross-frame tracker (`FrameTracker`): ROI change detection from a compact text-region signature, per-ROI result caching, aligned multi-frame Top-K logits fusion and stable text voting. It is a separate stateful layer; `FixedFontOCR.recognize` remains a pure single-frame function. |
 | `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate; converts raw scores to a shared 0..1 visual score. |
 | `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier` (V1 single-template) and `TemplateV2Classifier` (Goal 9 multi-prototype): coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; Top-K/best/second/margin + winning-prototype metadata for the lattice. |
 | `src/fixedfontocr/cnn.py` | `TinyCNNClassifier` numpy forward pass (stride-2 optimized), `forward_with_activations` for exported test vectors and `classify_batch(glyphs, top_k=2)`. |
@@ -91,6 +92,13 @@ numpy RGB
   -> allowed_chars restriction (postprocess)
   -> lexicon layer (none / prefer / strict, Goal 11)
   -> charset -> string
+
+Repeated UI crops can additionally go through the Goal 16 tracker
+(`ocr.tracker().update(image)`): a compact ROI signature detects whether
+the same crop is being seen again (cache hit), and per-character Top-K
+evidence from a bounded recent window is aligned and summed before stable
+text voting suppresses frame-to-frame flicker. The tracker never mutates
+the engine, so the single-frame pipeline above remains a pure function.
 ```
 
 ## Normalization (Goal 3)
@@ -714,6 +722,7 @@ verified:
 | Goal 13 joint decoder | `src/fixedfontocr/decoder.py` + `tests/test_goal13_decoder.py` (DP + beam search, `visual + geometry + lexicon + word_prior - segmentation_penalty`, alternatives, Goal 15 visual-uncertainty gate, end-to-end `鲃`/`小`/`潜甲`/`潜乙`/`巴尔的摩`/`Z17` with lexicon) |
 | Goal 14 typical-problem regressions | `tests/test_goal14_regressions.py` + `tests/game_samples/` (鲃鱼 != $E鱼, 小 not fragmented, 潜甲/潜乙 not merged, small-size Z17/巴尔的摩, mixed/digits/punct/short/long/partial-word at 12..32 px; scorer keeps full Top-5 + low-res template corroboration, geometry rewards multi-component glyph matches) |
 | Goal 15 lexicon cannot override strong visual evidence | `tests/test_goal15_lexicon_visual_priority.py` + `src/fixedfontocr/lexicon.py` (confident text never rewritten; ambiguous Top-K-only correction; non-unique/near-tied matches keep OCR + alternatives; unknown text emitted; 潜乙 never becomes 潜甲 at 12..32 px with ships lexicon) + `tests/game_samples/` |
+| Goal 16 cross-frame tracking | `src/fixedfontocr/tracker.py` + `tests/test_goal16_cross_frame.py` (`ocr.tracker()` / `FrameTracker.update`; ROI change detection, unchanged-ROI cache, multi-frame Top-K logits fusion, stable voting for `巴尔的摩 / 巴你的摩 / 巴尔的摩`, reset; `recognize` remains pure) |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
 | Real game regression passes | `tests/test_game_samples.py` (37 samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |

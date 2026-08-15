@@ -47,6 +47,7 @@ from .scorer import (
     calibrate_visual,
     unified_visual_score,
 )
+from .tracker import FrameTracker, TrackerConfig
 
 __all__ = [
     "FixedFontOCR",
@@ -87,6 +88,8 @@ __all__ = [
     "VisualCalibration",
     "unified_visual_score",
     "calibrate_visual",
+    "FrameTracker",
+    "TrackerConfig",
 ]
 
 __version__ = "0.1.0"

@@ -514,3 +514,18 @@ class FixedFontOCR:
                 if text != base and text not in out:
                     out.append(text)
         return tuple(out[:8])
+
+    # ------------------------------------------------------------------
+    # Cross-frame tracking (Goal 16)
+    # ------------------------------------------------------------------
+
+    def tracker(self, **kwargs) -> "FrameTracker":
+        """Build a :class:`FrameTracker` for this OCR engine.
+
+        The tracker is a separate stateful layer: it never mutates this
+        engine, so :meth:`recognize` remains a pure single-frame function.
+        """
+
+        from .tracker import FrameTracker
+
+        return FrameTracker(self, **kwargs)

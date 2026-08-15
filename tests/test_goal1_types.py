@@ -144,8 +144,13 @@ def test_scorer_exposes_topk_visual_scores(font_path, model_dir):
     seg = Segment(mask=mask, x=0, y=0, w=mask.shape[1], h=mask.shape[0])
     scores = scorer.score([seg])
     assert scores[0].visual_scores is not None
-    assert len(scores[0].visual_scores.char_ids) == 2
-    assert len(scores[0].visual_scores.logits) == 2
+    # Goal 1 says Top-K, never Top-1 only; the runtime stores the full
+    # Top-5 so the Goal 13 decoder/lexicon can recover a correct character
+    # that ranks below Top-2 at low resolution (Goal 14).
+    assert 2 <= len(scores[0].visual_scores.char_ids) <= 5
+    assert len(scores[0].visual_scores.char_ids) == len(
+        scores[0].visual_scores.logits
+    )
 
 
 def test_recognize_result_has_goal1_fields(font_path, model_dir):

@@ -319,9 +319,12 @@ python -m pytest tests/test_game_samples.py
 ```
 
 `tests/game_samples/manifest.json` maps every image to its expected text,
-category, profile overrides and the registered font; `slot1` level badges
-are a documented limitation (`L`/`V` touch at one pixel and form one
-connected component at both scales).
+category, profile overrides, optional lexicon/matched-term annotations and
+the registered font. The Goal 14 battery adds small-size `鲃鱼`/`小`/
+`潜甲`/`潜乙`/`Z17`/`巴尔的摩`, mixed Chinese+ASCII, digits, short/long
+words and a partial-word crop to the corpus; `slot1` level badges remain a
+documented limitation (`L`/`V` touch at one pixel and form one connected
+component at both scales).
 
 ## UI-limited charsets (`allowed_chars`)
 
@@ -551,6 +554,18 @@ spacing, and normalized size. Pass a custom profile to
   confident visual evidence (Goal 15). `tests/test_goal13_decoder.py` pins
   the formula, DP/beam behavior, segmentation penalty, lexicon tie-breaking,
   geometry input and the end-to-end acceptance strings.
+- Goal 14 typical-problem regression battery is established:
+  `tests/test_goal14_regressions.py` pins the named cases at the project's
+  small sizes (12/14/16 px) plus 32 px — `鲃鱼` never decodes as `$E鱼`,
+  `小` never fragments into multiple characters, `潜甲`/`潜乙` never merge,
+  `Z17` and `巴尔的摩` stay correct at small sizes, and the battery covers
+  mixed Chinese+ASCII (`舰船Lv.99`), digits, punctuation, short/long words
+  and partial-word crops. The fixes behind it: the hybrid scorer keeps a
+  full Top-5 in `VisualScores` and lets low-res template evidence
+  corroborate a low-margin CNN pick instead of discarding it, the font
+  geometry score stops double-penalizing multi-component glyphs (小/鲃/潜)
+  and rewards an exact component-count match, and the game-sample corpus
+  grew to 37 images with per-sample lexicon annotations.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per
@@ -560,5 +575,5 @@ spacing, and normalized size. Pass a custom profile to
 - Template coarse features are stored in compact uint8/uint16 arrays
   (8 B/char) and numpy ≥ 2.0 uses `bitwise_count` instead of the 64 KiB
   popcount table; `tools/benchmark/footprint.py` reports storage/memory.
-- Next milestones: Goal 14 regression hardening at scale, real-screenshot
-  collection, shader fusion (fewer dispatches) and GPU preprocessing.
+- Next milestones: real-screenshot collection at scale, shader fusion
+  (fewer dispatches) and GPU preprocessing.

@@ -420,6 +420,13 @@ def geometry_score(
     seg = candidate.segment
     if seg is None:
         return score
+    if char_id is None and candidate.score is not None:
+        char_id = getattr(candidate.score, "char_id", None)
+    entry = (
+        geometry.get(int(char_id))
+        if geometry is not None and char_id is not None and char_id >= 0
+        else None
+    )
 
     # Vertical alignment: character centers should sit in one band.
     centers = [c.y + c.h / 2 for c in comps]
@@ -438,23 +445,29 @@ def geometry_score(
         score -= min(0.04, excess * 0.01)
 
         # Merged candidates much wider than the line's typical glyph are
-        # almost always two adjacent characters.
-        heights = [c.h for c in comps]
-        median_h = float(np.median(heights))
-        typical = [
-            c.w for c in comps if c.h >= max(2, 0.5 * median_h)
-        ]
-        expected = float(np.median(typical)) if typical else float(median_h)
-        if seg.w > expected * 1.9:
-            score -= 0.05
+        # almost always two adjacent characters. Goal 14 exception: a font
+        # glyph whose database entry is itself multi-component (小/鲃/潜 are
+        # 3-4 components in this font) is legitimately much wider than any
+        # single fragment of it; the generic heuristic would double-penalize
+        # the correct merged candidate and let a fragmented look-alike path
+        # win at small sizes. The database's component count is the
+        # authoritative prior here.
+        expected_cc = max(1, entry.component_count) if entry is not None else 1
+        actual_cc = max(1, len(candidate.components))
+        if expected_cc <= 1 or actual_cc <= 1:
+            heights = [c.h for c in comps]
+            median_h = float(np.median(heights))
+            typical = [
+                c.w for c in comps if c.h >= max(2, 0.5 * median_h)
+            ]
+            expected = float(np.median(typical)) if typical else float(median_h)
+            if seg.w > expected * 1.9:
+                score -= 0.05
 
     if geometry is None:
         return max(score, -0.10)
-    if char_id is None and candidate.score is not None:
-        char_id = getattr(candidate.score, "char_id", None)
     if char_id is None or char_id < 0:
         return max(score, -0.10)
-    entry = geometry.get(int(char_id))
     if entry is None:
         return max(score, -0.10)
 
@@ -498,6 +511,15 @@ def geometry_score(
             score -= min(0.04, (actual_cc - 1) * 0.02)
         elif actual_cc == 1 and expected_cc > 1:
             score -= min(0.03, (expected_cc - 1) * 0.015)
+        elif expected_cc == actual_cc and actual_cc > 1:
+            # Goal 14 merge agreement: the chosen character's database
+            # entry expects exactly the number of components this candidate
+            # merged (小/鲃/获/得 at low resolution). That agreement is
+            # positive evidence for a real fragmented glyph, so it offsets
+            # the generic merge penalties above; without it the correct
+            # whole-glyph candidate keeps losing to look-alike single-char
+            # fragments (小 -> fj\, 鲃 -> $8) at 12-18 px.
+            score += min(0.05, (actual_cc - 1) * 0.025)
 
     if normalize_geometry is not None:
         baseline_offset = float(normalize_geometry[0])

@@ -33,6 +33,12 @@ REQUIRED_CATEGORIES = {
     "synthetic/dark-background",
     "synthetic/antialiasing",
     "synthetic/font-size",
+    "synthetic/goal14-fragments",
+    "synthetic/goal14-lowres",
+    "synthetic/goal14-mixed",
+    "synthetic/goal14-digits",
+    "synthetic/goal14-words",
+    "synthetic/goal14-partial",
     "real-game/level",
 }
 
@@ -85,8 +91,24 @@ def test_game_sample_recognizes(entry):
     image = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
     ocr = _ocr()
     ocr.profile = _sample_profile(manifest, sample)
-    result = ocr.recognize(image)
+    if sample.get("lexicon"):
+        result = ocr.recognize(
+            image,
+            lexicon=sample["lexicon"],
+            lexicon_mode=sample.get("lexicon_mode", "prefer"),
+        )
+    else:
+        result = ocr.recognize(image)
     assert result.text == sample["expected"], (
         f"{sample['file']}: expected {sample['expected']!r}, got {result.text!r}"
     )
     assert len(result.chars) == len(sample["expected"])
+    if "matched_term" in sample:
+        assert result.matched_term == sample["matched_term"], (
+            f"{sample['file']}: expected matched_term "
+            f"{sample['matched_term']!r}, got {result.matched_term!r}"
+        )
+        assert result.matched_span == tuple(sample["matched_span"]), (
+            f"{sample['file']}: expected matched_span "
+            f"{sample['matched_span']!r}, got {result.matched_span!r}"
+        )

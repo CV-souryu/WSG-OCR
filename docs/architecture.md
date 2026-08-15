@@ -639,8 +639,11 @@ covering normal Chinese, digits, mixed Chinese+ASCII, punctuation,
 fragment-heavy glyphs (`鲃`, `小`), confusable pairs (`甲/申`, `未/末`),
 light/dark backgrounds, anti-aliasing and multiple font sizes.
 `manifest.json` records each image's expected text, category, profile
-overrides and the registered font. `tests/test_game_samples.py` fails on any
-segmentation/CNN change that breaks the set.
+overrides, optional lexicon/matched-term annotations and the registered
+font. The Goal 14 battery contributes small-size `鲃鱼`/`小`/`潜甲`/`潜乙`/
+`Z17`/`巴尔的摩`, mixed Chinese+ASCII, digits, short/long words and a
+partial-word crop. `tests/test_game_samples.py` fails on any
+segmentation/CNN change that breaks the set (37 samples).
 
 The level badges are also training data:
 `tools/dataset/extract_game_samples.py` splits them into per-character crops
@@ -672,8 +675,9 @@ verified:
 | Goal 8 font geometry database | `tests/test_goal8_geometry.py` (per-char advance/bbox/aspect/ink/component/baseline, JSON round-trip + model embedding, narrow vs. full-width priors, geometry score and pruning) |
 | Goal 9 Template V2 | `tests/test_goal9_template_v2.py` (11..16 px × sub-pixel × downsample grid, V1/V2 round-trip, prefilter Top-K exactness, low-res confusables 未/末 & Z/2, exact low-res tie routing to CNN, bundled models in V2 format) |
 | Goal 13 joint decoder | `src/fixedfontocr/decoder.py` + `tests/test_goal13_decoder.py` (DP + beam search, `visual + geometry + lexicon + word_prior - segmentation_penalty`, alternatives, Goal 15 visual-uncertainty gate, end-to-end `鲃`/`小`/`潜甲`/`潜乙`/`巴尔的摩`/`Z17` with lexicon) |
+| Goal 14 typical-problem regressions | `tests/test_goal14_regressions.py` + `tests/game_samples/` (鲃鱼 != $E鱼, 小 not fragmented, 潜甲/潜乙 not merged, small-size Z17/巴尔的摩, mixed/digits/punct/short/long/partial-word at 12..32 px; scorer keeps full Top-5 + low-res template corroboration, geometry rewards multi-component glyph matches) |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
-| Real game regression passes | `tests/test_game_samples.py` (23 samples) |
+| Real game regression passes | `tests/test_game_samples.py` (37 samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |
 | Segmentation supports candidate lattice | `src/fixedfontocr/segmentation.py` |
 

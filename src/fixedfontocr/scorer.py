@@ -410,13 +410,21 @@ def _unified_visual_scores(
     score_type: str,
     calibration: VisualCalibration,
 ) -> VisualScores | None:
-    """Project fused evidence into the Goal 1 Top-K ``VisualScores``."""
+    """Project fused evidence into the Goal 1 Top-K ``VisualScores``.
+
+    The full Top-5 is retained (not just Top-2): at low resolution the
+    correct character is frequently the third/fourth-ranked alternative of
+    a merged candidate (e.g. 潜 at 17 px, 摩 at 18 px), and the Goal 13
+    decoder or a Goal 11/12 lexicon can only correct the path when that
+    alternative is still visible in ``VisualScores``.
+    """
     if not fused:
         return None
-    best = fused[0]
-    second = fused[1] if len(fused) > 1 else None
-    char_ids = (best[1], second[1] if second is not None else -1)
-    logits = (best[0], second[0] if second is not None else 0.0)
+    top = fused[:5]
+    char_ids = tuple(int(row[1]) for row in top)
+    logits = tuple(float(row[0]) for row in top)
+    best = top[0]
+    second = top[1] if len(top) > 1 else None
     margin = best[0] - (second[0] if second is not None else 0.0)
     return VisualScores(
         char_ids=char_ids,
@@ -634,10 +642,17 @@ class SegmentScorer:
                 cnn_entries = _cnn_entries(cnn, i)
                 full_logits = cnn.logits[i] if cnn.logits is not None else None
                 if needs_cnn[i]:
-                    # The template margin gate failed: only the CNN evidence
-                    # may choose the character or set the visual score. The
-                    # template raw score is still stored for the decoder.
-                    fused = _fuse_scores(
+                    # The template margin gate failed, so the CNN remains
+                    # the decision source; but the template Top-K evidence
+                    # still participates in the unified visual score. For
+                    # every character the final score is the max of its
+                    # CNN-only evidence and its weighted template+CNN
+                    # evidence: a confident CNN pick is never diluted by an
+                    # absent/weak template, while a correct low-margin
+                    # low-res match (潜 at 17 px, 鲃 at 15 px) gets the
+                    # corroborating template boost it needs to beat
+                    # look-alike fragments (Goal 14).
+                    cnn_only = _fuse_scores(
                         [],
                         cnn_entries,
                         float(cnn.top2[i]),
@@ -648,6 +663,27 @@ class SegmentScorer:
                             geometry=self.visual_weights.geometry,
                         ),
                     )
+                    if template_entries:
+                        fused_full = _fuse_scores(
+                            template_entries,
+                            cnn_entries,
+                            float(cnn.top2[i]),
+                            full_logits,
+                            self.visual_weights,
+                        )
+                        cnn_only_by_id = {row[1]: row for row in cnn_only}
+                        fused = []
+                        for row in fused_full:
+                            base = cnn_only_by_id.get(row[1])
+                            if base is None:
+                                fused.append(row)
+                            else:
+                                fused.append(
+                                    (max(base[0], row[0]), *row[1:])
+                                )
+                        fused.sort(key=lambda r: (-r[0], r[1]))
+                    else:
+                        fused = cnn_only
                     score_type = "cnn"
                     raw = float(cnn.margins[i])
                 else:

@@ -173,6 +173,86 @@
       "expected": "获得金币1000",
       "category": "synthetic/font-size",
       "note": "large font size"
+    },
+    {
+      "file": "synthetic/frag_ba_yu_32.png",
+      "expected": "鲃鱼",
+      "category": "synthetic/goal14-fragments",
+      "note": "Goal 14: fragmented 鲃 + 鱼 must not become $E鱼"
+    },
+    {
+      "file": "synthetic/frag_ba_yu_14.png",
+      "expected": "鲃鱼",
+      "category": "synthetic/goal14-fragments",
+      "note": "Goal 14: 鲃鱼 at small size"
+    },
+    {
+      "file": "synthetic/frag_xiao_14.png",
+      "expected": "小",
+      "category": "synthetic/goal14-fragments",
+      "note": "Goal 14: 小 must not fragment at 14px"
+    },
+    {
+      "file": "synthetic/qianjia_14.png",
+      "expected": "潜甲",
+      "category": "synthetic/goal14-fragments",
+      "note": "Goal 14: 潜甲 must not be falsely merged",
+      "lexicon": "ships"
+    },
+    {
+      "file": "synthetic/qianyi_14.png",
+      "expected": "潜乙",
+      "category": "synthetic/goal14-fragments",
+      "note": "Goal 14: 潜乙 must not be falsely merged",
+      "lexicon": "ships"
+    },
+    {
+      "file": "synthetic/z17_14.png",
+      "expected": "Z17",
+      "category": "synthetic/goal14-lowres",
+      "note": "Goal 14: Z17 at small size"
+    },
+    {
+      "file": "synthetic/baltimore_14.png",
+      "expected": "巴尔的摩",
+      "category": "synthetic/goal14-lowres",
+      "note": "Goal 14: 巴尔的摩 at small size",
+      "lexicon": "ships"
+    },
+    {
+      "file": "synthetic/mixed_16.png",
+      "expected": "舰船Lv.99",
+      "category": "synthetic/goal14-mixed",
+      "note": "Goal 14: mixed Chinese + ASCII at 16px"
+    },
+    {
+      "file": "synthetic/digits_16.png",
+      "expected": "1234567890",
+      "category": "synthetic/goal14-digits",
+      "note": "Goal 14: digits at 16px"
+    },
+    {
+      "file": "synthetic/short_word_14.png",
+      "expected": "使用",
+      "category": "synthetic/goal14-words",
+      "note": "Goal 14: short UI word at 14px",
+      "lexicon": "ui"
+    },
+    {
+      "file": "synthetic/long_word_16.png",
+      "expected": "塞瓦斯托波尔",
+      "category": "synthetic/goal14-words",
+      "note": "Goal 14: long ship name at 16px",
+      "lexicon": "ships"
+    },
+    {
+      "file": "synthetic/partial_word_14.png",
+      "expected": "尔的摩",
+      "category": "synthetic/goal14-partial",
+      "note": "Goal 14: partial-word crop at 14px",
+      "lexicon": "ships",
+      "matched_term": "巴尔的摩",
+      "matched_span": [1, 4]
     }
   ]
 }

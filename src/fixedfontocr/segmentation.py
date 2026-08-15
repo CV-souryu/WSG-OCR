@@ -189,16 +189,17 @@ def _valley_cuts(
     """Return x positions where a wide component should be split.
 
     A cut is the middle of a vertical valley: columns whose ink count is at
-    most ``~12%`` of the component height. That catches a low-resolution
-    connector between two glyphs while avoiding interior whitespace of
-    closed CJK glyphs (口/日/中 have top/bottom strokes keeping the valley
-    columns well above the threshold). Edge valleys are ignored and each
-    resulting piece must be wide enough to be a glyph.
+    most ``~18%`` of the component height. That catches a low-resolution
+    connector between two glyphs (and the weak valley in touching real-game
+    crops) while avoiding interior whitespace of closed CJK glyphs (口/日/中
+    have top/bottom strokes keeping the valley columns well above the
+    threshold). Edge valleys are ignored and each resulting piece must be
+    wide enough to be a glyph.
     """
 
     h, w = mask.shape
     proj = mask.sum(axis=0).astype(np.int32)
-    threshold = max(1, int(h * 0.12))
+    threshold = max(1, int(h * 0.18))
     runs: list[tuple[int, int]] = []
     start: int | None = None
     for x in range(w):
@@ -237,7 +238,9 @@ def _split_atoms(
     if (
         max_splits < 1
         or comp.h < max(2, profile.char_height_min)
-        or comp.w <= max(expected_width * 1.5, comp.h * 1.4)
+        # 1.25 * height still protects single CJK glyphs (aspect ~1.0)
+        # but lets touching Latin+digit pairs such as Z2 / Z1 be split.
+        or comp.w <= max(expected_width * 1.5, comp.h * 1.25)
     ):
         return whole
     cuts = _valley_cuts(comp.mask, expected_width, profile, max_splits)
@@ -282,6 +285,12 @@ def _expand_atoms(
             )
         else:
             atoms.append(_Atom(component_index=i, segment=comp))
+    # Sort atoms by image position so a small fragment that belongs to a
+    # glyph is adjacent to its split pieces. The pre-split component order
+    # could otherwise place such a fragment after a later glyph, making the
+    # only correct merge non-consecutive (real-game crops such as 江原 /
+    # 追赶者).
+    atoms.sort(key=lambda atom: (atom.segment.x, atom.segment.y, atom.component_index))
     return atoms, expected
 
 
@@ -343,7 +352,10 @@ def _passes_filters(
     # Vertical overlap/proximity: at least one adjacent pair must overlap
     # vertically or be close enough to belong to one glyph (colon and i-dot
     # punctuation are deliberately allowed by the generous gap bound).
-    max_v_gap = max(4, profile.char_height_min // 2)
+    # Real-game crops render 二 as two horizontal bars separated by more
+    # than half a char height; allow up to one full char height so that
+    # multi-bar glyphs remain mergeable.
+    max_v_gap = max(4, profile.char_height_min)
     if not any(
         _vertical_overlap(a.segment, b.segment) >= 1
         or _vertical_gap(a.segment, b.segment) <= max_v_gap

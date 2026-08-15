@@ -193,14 +193,18 @@ class FixedFontOCR:
         ``"equipment"``, ``"ui"`` or ``"all"``, a ``Lexicon``, or a path to
         a one-word-per-line file). ``lexicon_mode`` is ``"none"`` (default
         when no lexicon is supplied), ``"prefer"`` (default when a lexicon
-        is supplied) or ``"strict"``. The visible ``text`` is never
-        rewritten unless the lexicon target is already a visually plausible
-        Top-K alternative for a low-confidence character. Goal 12 partial
-        words follow the same rule: a screen crop keeps its visible
-        ``text`` and only annotates ``matched_term``/``matched_span`` (for
-        example ``text="尔的摩"``, ``matched_term="巴尔的摩"``,
-        ``matched_span=(1, 4)``). ``strict`` rejects non-exact text with an
-        empty result.
+        is supplied), ``"topk"`` or ``"strict"``. The visible ``text`` is
+        never rewritten in ``prefer`` unless the lexicon target is already a
+        visually plausible Top-K alternative for a low-confidence character.
+        ``"topk"`` is the "Top-3 取词表" mode: when the visible text is not
+        itself a dictionary term it promotes the first decoder alternative
+        that is an exact term, or rewrites from the per-position visual
+        Top-3 when a term is fully supported by those alternatives (unique
+        matches only). Goal 12 partial words follow the same rule: a screen
+        crop keeps its visible ``text`` and only annotates
+        ``matched_term``/``matched_span`` (for example ``text="尔的摩"``,
+        ``matched_term="巴尔的摩"``, ``matched_span=(1, 4)``). ``strict``
+        rejects non-exact text with an empty result.
         """
 
         image = np.asarray(image)
@@ -230,10 +234,10 @@ class FixedFontOCR:
         if lexicon_mode is None:
             lexicon_mode = "prefer" if lexicon is not None else "none"
         lexicon_mode = str(lexicon_mode).strip().lower()
-        if lexicon_mode not in ("none", "prefer", "strict"):
+        if lexicon_mode not in ("none", "prefer", "topk", "strict"):
             raise ValueError(
                 f"lexicon_mode {lexicon_mode!r} is not supported; "
-                "use 'none', 'prefer' or 'strict'"
+                "use 'none', 'prefer', 'topk' or 'strict'"
             )
         if lexicon_mode != "none" and lexicon is None:
             raise ValueError(

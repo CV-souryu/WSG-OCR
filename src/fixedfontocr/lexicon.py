@@ -8,6 +8,10 @@ whitespace the OCR pipeline cannot emit, and exposes three API modes:
 * ``prefer``  -- the dictionary annotates the result and may resolve a
   visually ambiguous character when that character is already a plausible
   Top-K alternative and the visual evidence is not confident;
+* ``topk``    -- "Top-3 取词表": when the visible text is not itself a
+  dictionary term, promote the first decoder alternative that is an exact
+  term, or rewrite from the per-position visual Top-3 when a term is fully
+  supported by those alternatives (unique matches only);
 * ``strict``  -- only a full dictionary term is accepted; otherwise the
   result is rejected (empty text, confidence 0).
 
@@ -67,7 +71,10 @@ SHIP_LEXICON_FILES: tuple[str, ...] = (
     "ship_names_harmonized.txt",
 )
 
-LEXICON_MODES = ("none", "prefer", "strict")
+LEXICON_MODES = ("none", "prefer", "topk", "strict")
+TOP_K_GUESS = 3
+TOP_K_GUESS_MIN_SCORE = 0.6
+TOP_K_GUESS_UNIQUE_MARGIN = 0.02
 
 
 def normalize_text(text: str) -> str:
@@ -460,6 +467,222 @@ def _top_sets(result: OCRResult, charset: list[str] | None) -> list[set[str]]:
     return sets
 
 
+def _position_topk(
+    result: OCRResult,
+    charset: list[str] | None,
+    top_k: int = TOP_K_GUESS,
+) -> list[list[str]]:
+    """Ordered per-position visual Top-K characters (decoded char first).
+
+    Uses each candidate's Goal 1 ``VisualScores.char_ids`` (already ranked)
+    plus same-length decoder alternatives. The decoded character is kept at
+    the front so an exact visible term always outranks a rewrite.
+    """
+
+    n = len(result.text)
+    lists: list[list[str]] = [[] for _ in range(n)]
+    if not n:
+        return lists
+    if (
+        charset
+        and result.path is not None
+        and len(result.path.candidates) == n
+    ):
+        for i, cand in enumerate(result.path.candidates):
+            scores = cand.scores
+            if scores is None:
+                continue
+            for cid in scores.char_ids[:top_k]:
+                if 0 <= int(cid) < len(charset):
+                    ch = charset[int(cid)]
+                    if ch not in lists[i]:
+                        lists[i].append(ch)
+    for alt in result.alternatives:
+        if len(alt) != n:
+            continue
+        for i, ch in enumerate(alt):
+            if ch and ch not in lists[i]:
+                lists[i].append(ch)
+    for i, ch in enumerate(result.text):
+        if ch and ch not in lists[i]:
+            lists[i].insert(0, ch)
+    return lists
+
+
+def _topk_rank_weight(
+    position: list[str],
+    decoded: str,
+    target: str,
+    top_k: int,
+) -> float:
+    """Visual support for replacing one decoded char by ``target``.
+
+    Rank 0 (the decoded char) scores 1.0; the remaining visual Top-K ranks
+    score 0.85 / 0.7; characters only seen in decoder alternatives score
+    0.35. Characters outside the Top-3 set score 0 (never guessed).
+    """
+
+    if target == decoded:
+        return 1.0
+    try:
+        idx = position.index(target)
+    except ValueError:
+        return 0.0
+    if idx == 0:
+        return 0.85
+    if idx == 1:
+        return 0.7
+    if idx < top_k:
+        return 0.6
+    return 0.35
+
+
+def _promote_term_alternative(
+    result: OCRResult,
+    lex: Lexicon,
+) -> OCRResult | None:
+    """Promote the first decoder alternative that is an exact lexicon term.
+
+    Only used when the visible text is *not* already a dictionary term, so a
+    clear visible term (e.g. ``狮``) is never replaced by a visually
+    confused alternative (e.g. ``蜩``). The promoted alternative may have a
+    different segmentation than the decoded text (``灶7`` -> ``Z17``), which
+    the per-position rewrite below cannot handle.
+    """
+
+    text = normalize_text(result.text)
+    if not text or text in lex:
+        return None
+    for rank, alt in enumerate(result.alternatives):
+        term = normalize_text(alt)
+        if not term or term == text or term not in lex:
+            continue
+        n = len(term)
+        confidence = max(0.5, 0.95 - 0.05 * rank)
+        chars = tuple(
+            CharResult(
+                char=ch,
+                x=i,
+                y=0,
+                w=1,
+                h=1,
+                confidence=confidence,
+            )
+            for i, ch in enumerate(term)
+        )
+        match = LexiconMatch(
+            term=term,
+            span=(0, n),
+            confidence=confidence,
+            score=confidence,
+            mode="topk",
+            text=term,
+            text_span=(0, n),
+            kind="exact",
+        )
+        return replace(
+            result,
+            text=term,
+            confidence=confidence,
+            chars=chars,
+            matched_term=term,
+            matched_span=(0, n),
+            lexicon_match=match,
+        )
+    return None
+
+
+def _topk_lexicon_guess(
+    result: OCRResult,
+    lex: Lexicon,
+    charset: list[str] | None,
+) -> OCRResult | None:
+    """Rewrite from the per-position visual Top-3 when a term fits uniquely.
+
+    Looks for dictionary terms with the same length as the visible text
+    whose every character is supported by that position's Top-3 visual
+    alternatives. The best-supported term wins; two differently-worded
+    terms within ``TOP_K_GUESS_UNIQUE_MARGIN`` keep the visible text so the
+    guess never invents an arbitrary name (Goal 15's non-unique rule).
+    """
+
+    text = normalize_text(result.text)
+    if not text or len(result.chars) != len(text) or text in lex:
+        return None
+    topk = _position_topk(result, charset)
+    candidates: list[tuple[float, int, str, list[tuple[int, str]]]] = []
+    for term in lex.terms:
+        if len(term) != len(text):
+            continue
+        changes: list[tuple[int, str]] = []
+        weights: list[float] = []
+        ok = True
+        for i, (target, original) in enumerate(zip(term, text)):
+            weight = _topk_rank_weight(topk[i], original, target, TOP_K_GUESS)
+            if weight <= 0.0:
+                ok = False
+                break
+            weights.append(weight)
+            if target != original:
+                changes.append((i, target))
+        if not ok or not changes:
+            continue
+        score = float(np.mean(weights))
+        if score >= TOP_K_GUESS_MIN_SCORE:
+            candidates.append((score, len(changes), term, changes))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (-row[0], row[1], row[2]))
+    best_score, _best_changes_n, best_term, best_changes = candidates[0]
+    if len(candidates) > 1:
+        second_score, _second_n, second_term, _ = candidates[1]
+        if (
+            second_term != best_term
+            and (best_score - second_score) < TOP_K_GUESS_UNIQUE_MARGIN
+        ):
+            return None
+
+    new_chars = list(result.chars)
+    for i, target in best_changes:
+        old = new_chars[i]
+        new_chars[i] = CharResult(
+            char=target,
+            x=old.x,
+            y=old.y,
+            w=old.w,
+            h=old.h,
+            confidence=_topk_rank_weight(
+                topk[i], result.text[i], target, TOP_K_GUESS
+            ),
+        )
+    confidence = (
+        float(np.mean([c.confidence for c in new_chars]))
+        if new_chars
+        else 0.0
+    )
+    n = len(best_term)
+    match = LexiconMatch(
+        term=best_term,
+        span=(0, n),
+        confidence=best_score,
+        score=best_score,
+        mode="topk",
+        text=best_term,
+        text_span=(0, n),
+        kind="exact",
+    )
+    return replace(
+        result,
+        text=best_term,
+        confidence=confidence,
+        chars=tuple(new_chars),
+        matched_term=best_term,
+        matched_span=(0, n),
+        lexicon_match=match,
+    )
+
+
 def _lexicon_correction(
     result: OCRResult,
     lexicon: Lexicon,
@@ -567,12 +790,15 @@ def apply_lexicon(
 ) -> OCRResult:
     """Apply the Goal 11 lexicon modes to an OCR result.
 
-    ``mode`` may be ``"none"``, ``"prefer"`` or ``"strict"``. With
+    ``mode`` may be ``"none"``, ``"prefer"``, ``"topk"`` or ``"strict"``. With
     ``"prefer"`` the best dictionary match is attached to the result and a
     visually uncertain character is corrected only when the dictionary
     target is already among that character's Top-K alternatives and the
     correction is unique (a second, differently-worded correction within
     ``correction_unique_margin`` keeps the visible OCR text, Goal 15).
+    With ``"topk"`` a non-term visible text is rewritten from the lexicon
+    when an exact term is the first supported decoder alternative or is
+    fully covered by each position's visual Top-3 (unique match only).
     With ``"strict"`` only an exact dictionary term is accepted; anything
     else is rejected as empty output.
     """
@@ -620,6 +846,32 @@ def apply_lexicon(
             )
             if corrected is not None:
                 return corrected
+        return out
+
+    if normalized_mode == "topk":
+        matches = lex.match(text)
+        top = matches[0] if matches else None
+        if top is not None:
+            top = replace(top, mode="topk")
+            out = replace(
+                result,
+                matched_term=top.term,
+                matched_span=top.span,
+                lexicon_match=top,
+            )
+        else:
+            out = replace(
+                result,
+                matched_term=None,
+                matched_span=None,
+                lexicon_match=None,
+            )
+        promoted = _promote_term_alternative(result, lex)
+        if promoted is not None:
+            return promoted
+        guessed = _topk_lexicon_guess(result, lex, charset)
+        if guessed is not None:
+            return guessed
         return out
 
     # strict

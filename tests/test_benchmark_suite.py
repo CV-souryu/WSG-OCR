@@ -1,4 +1,4 @@
-"""Smoke-test the P7 CPU benchmark suite (fast mode)."""
+"""Smoke-test the Goal 17 CPU benchmark suite (fast mode)."""
 
 from __future__ import annotations
 
@@ -28,17 +28,14 @@ def test_cpu_benchmark_fast_mode(tmp_path):
     assert result.returncode == 0, result.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
     assert set(data["ocr_stages"]) == {
-        "frontend",
-        "mask",
-        "soft_foreground",
-        "line_detection",
-        "connected_components",
-        "candidate_generation",
+        "foreground",
+        "cc",
+        "lattice_generation",
         "normalize",
-        "normalize_soft",
-        "classifier",
+        "template",
+        "tinycnn",
         "decoder",
-        "recognize_total",
+        "total",
     }
     for stage in data["ocr_stages"].values():
         assert stage["median"] > 0
@@ -47,3 +44,19 @@ def test_cpu_benchmark_fast_mode(tmp_path):
     assert set(data["charsets"]) == {"10", "100"}
     assert data["optimized_vs_reference"]["argmax_match"] is True
     assert data["optimized_vs_reference"]["max_error"] < 1e-5
+
+
+def test_goal17_default_charset_matrix_is_10_100_1894():
+    """The full run must cover the real 1894-char project charset."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools" / "benchmark" / "cpu_benchmark.py"),
+            "--help",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "10,100,1894" in result.stdout

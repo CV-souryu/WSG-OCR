@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""CPU benchmark suite for the frozen NumPy OCR reference (P7).
+"""CPU benchmark suite for the frozen NumPy OCR reference (Goal 17).
 
 Records, per stage, per CNN batch size and per charset size:
 
-* OCR pipeline stages: color mask, line detection, connected components,
-  candidate generation, normalize, template match, TinyCNN, visual DP and
-  end-to-end recognize();
+* OCR pipeline stages: foreground (binary + soft visual frontend), CC,
+  lattice generation, normalize, template, TinyCNN, decoder and end-to-end
+  ``total``;
 * TinyCNN batch classify() for N = 1/8/16/32/64/128;
-* template + CNN classification over digit (~10), small (~100), CJK (~3000)
-  and CJK (~7000) charsets (the large sets are sampled from the registered
-  font's Unicode coverage, not committed as files);
+* template + CNN classification over digit (10), small (100) and the real
+  1894-char project charset (``charsets/sets/combined.txt``);
 * the optimized stride-2 forward vs the full-then-slice reference
   (max abs error and argmax identity).
 
@@ -49,8 +48,6 @@ from fixedfontocr.model import load_model  # noqa: E402
 from fixedfontocr.reference_cnn import reference_forward  # noqa: E402
 from fixedfontocr.preprocess import (  # noqa: E402
     Component,
-    Segment,
-    _connected_components,
     compute_normalize_spec,
     find_lines,
     glyph_normalize_geometry,
@@ -62,9 +59,12 @@ from fixedfontocr.segmentation import (  # noqa: E402
     connected_components,
     decode,
     geometry_score,
-    segment_line,
 )
 from fixedfontocr.types import default_profile  # noqa: E402
+
+# Goal 17 fixed matrix.
+DEFAULT_BATCH_SIZES = (1, 8, 16, 32, 64, 128)
+DEFAULT_CHARSET_SIZES = (10, 100, 1894)
 
 
 def median_p95(samples: list[float]) -> tuple[float, float]:
@@ -103,6 +103,27 @@ def _normalize_template_glyph(
         scale=scale,
         baseline_row=spec.baseline_row,
     )
+
+
+def _binary_glyph_batch(segments, spec, target: int = 24) -> np.ndarray:
+    """Normalize every candidate's binary mask with Goal 3 geometry."""
+    glyphs: list[np.ndarray] = []
+    for s in segments:
+        if spec is None:
+            glyphs.append(normalize(s.mask, target))
+            continue
+        cand = Component(mask=s.mask, x=s.x, y=s.y, w=s.w, h=s.h)
+        baseline_offset, scale = glyph_normalize_geometry(cand, spec, target)
+        glyphs.append(
+            normalize(
+                s.mask,
+                target,
+                baseline_offset=baseline_offset,
+                scale=scale,
+                baseline_row=spec.baseline_row,
+            )
+        )
+    return np.stack(glyphs)
 
 
 def render_line(
@@ -202,34 +223,56 @@ def bench_ocr_stages(
             char_id=score.char_id,
         )
 
-    stages = {
-        "frontend": (lambda: extract_frontend(image, profile), 200),
-        "mask": (lambda: profile.color_mask(image), 200),
-        "soft_foreground": (lambda: profile.soft_foreground(image), 200),
-        "line_detection": (lambda: find_lines(mask, profile), 200),
-        "connected_components": (
-            lambda: _connected_components(line.mask),
-            200,
-        ),
-        "candidate_generation": (
+    spec = scorer.normalize_spec
+    target = ocr.model.input_size
+    geoms: list[tuple[float, float] | None]
+    if spec is None:
+        geoms = [None] * len(cand_segments)
+    else:
+        geoms = [
+            glyph_normalize_geometry(
+                Component(mask=s.mask, x=s.x, y=s.y, w=s.w, h=s.h),
+                spec,
+                target,
+            )
+            for s in cand_segments
+        ]
+    glyphs = _binary_glyph_batch(cand_segments, spec, target)
+    if ocr.model.input_mode == "soft":
+        cnn_input = frontend.soft_glyph_batch(
+            cand_segments,
+            target,
+            geometries=geoms,
+            spec=spec,
+        )
+    else:
+        cnn_input = glyphs
+
+    stages: dict[str, tuple] = {
+        "foreground": (lambda: extract_frontend(image, profile), 200),
+        "cc": (lambda: connected_components(line), 200),
+        "lattice_generation": (
             lambda: build_candidates(comps, profile, geometry=geometry),
             200,
         ),
         "normalize": (
-            lambda: np.stack([normalize(s.mask, 24) for s in cand_segments]),
+            lambda: _binary_glyph_batch(cand_segments, spec, target),
             200,
         ),
-        "normalize_soft": (
-            lambda: frontend.soft_glyph_batch(cand_segments, 24),
-            200,
-        ),
-        "classifier": (
-            lambda: scorer.score(cand_segments, soft=frontend.soft_foreground),
-            50,
-        ),
-        "decoder": (lambda: decode(cands, len(comps)), 200),
-        "recognize_total": (lambda: ocr.recognize(image), 30),
     }
+    if scorer.template is not None:
+        stages["template"] = (
+            lambda: scorer.template.match_batch(glyphs),
+            50,
+        )
+    if ocr.model.weights is not None and getattr(ocr, "_backend", None) is not None:
+        stages["tinycnn"] = (
+            lambda: ocr._backend.classify(cnn_input),
+            50,
+        )
+    stages["decoder"] = (lambda: decode(cands, len(comps)), 200)
+    stages["total"] = (lambda: ocr.recognize(image), 30)
+
     out: dict[str, dict[str, float]] = {}
     for name, (fn, n) in stages.items():
         med, p95 = timed_samples(fn, min(calls, n))
@@ -241,7 +284,7 @@ def bench_cnn_batches(weights, calls: int) -> dict[str, dict[str, float]]:
     backend = CPUBackend(weights, input_size=24)
     rng = np.random.default_rng(7)
     out: dict[str, dict[str, float]] = {}
-    for n in (1, 8, 16, 32, 64, 128):
+    for n in DEFAULT_BATCH_SIZES:
         glyphs = (rng.random((n, 24, 24)) > 0.5).astype(np.uint8) * 255
         med, p95 = timed_samples(lambda g=glyphs: backend.classify(g), calls)
         out[str(n)] = {"median": med, "p95": p95}
@@ -253,6 +296,7 @@ def bench_charsets(
     sizes: list[int],
     calls: int,
 ) -> dict[str, dict[str, dict[str, float]]]:
+    project_chars = list(defaults.read_charset())
     out: dict[str, dict[str, dict[str, float]]] = {}
     for size in sizes:
         if size <= 200:
@@ -263,6 +307,10 @@ def bench_charsets(
             )
             while len(charset) < size:
                 charset.append(alphabet[len(charset) % len(alphabet)])
+            charset = charset[:size]
+        elif size <= len(project_chars):
+            # Goal 17: the real 1894-char project charset (combined.txt).
+            charset = project_chars[:size]
         else:
             charset = cjk_charset(font_path, size)
         chars, templates = build_templates(
@@ -333,10 +381,11 @@ def main() -> None:
         help="timed calls per measurement (smoke tests should use ~5)",
     )
     parser.add_argument(
-        "--max-charset",
-        type=int,
-        default=7000,
-        help="largest CJK charset to benchmark",
+        "--charset-sizes",
+        type=str,
+        default=",".join(str(s) for s in DEFAULT_CHARSET_SIZES),
+        help="template/CNN charset sizes to benchmark "
+        "(default: 10,100,1894)",
     )
     parser.add_argument(
         "--fast",
@@ -346,8 +395,12 @@ def main() -> None:
     args = parser.parse_args()
 
     calls = 5 if args.fast else args.calls
-    sizes = [10, 100] if args.fast else [10, 100, 3000, args.max_charset]
-    sizes = sorted(set(sizes))
+    if args.fast:
+        sizes = [10, 100]
+    else:
+        sizes = sorted(
+            {int(v) for v in args.charset_sizes.split(",") if v.strip()}
+        )
 
     font_path = defaults.resolve_font(defaults.FONT_PATH)
     profile = default_profile()

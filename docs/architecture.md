@@ -663,16 +663,16 @@ what a WGPU backend would read, keeping both backends bit-identical.
    current machine;
 6. `benchmark/footprint.py` reports on-disk sizes and runtime memory estimates.
 
-## CPU benchmark suite (P7)
+## CPU benchmark suite (Goal 17)
 
 `tools/benchmark/cpu_benchmark.py` is the frozen-CPU measurement suite. It
 records median and p95 latencies (never a single run) for every OCR stage
-(mask, line detection, connected components, candidate generation,
-normalize, classifier, decoder, end-to-end), for TinyCNN batch sizes
-1/8/16/32/64/128, and for template/CNN classification over digit (~10),
-small (~100), CJK (~3000) and CJK (~7000) charsets sampled from the
-registered font's Unicode coverage. The last section re-runs the optimized
-vs. reference forward check. `--fast` is the CI smoke mode.
+(foreground, CC, lattice generation, normalize, template, TinyCNN, decoder,
+end-to-end total), for TinyCNN batch sizes 1/8/16/32/64/128, and for
+template/CNN classification over digit (10), small (100) and the real
+1894-char project charset (`charsets/sets/combined.txt`). The last section
+re-runs the optimized vs. reference forward check. `--fast` is the CI
+smoke mode.
 `benchmarks/cpu_benchmark.json` snapshots one machine's numbers.
 
 ## Game regression set (P8)
@@ -712,7 +712,7 @@ verified:
 | 鲃/小 no longer need morphology special-casing | `tests/test_segmentation.py::test_acceptance_does_not_need_stroke_width_special_case` |
 | Adjacent Chinese characters are not merged | `tests/test_segmentation.py::test_adjacent_chinese_characters_not_merged` |
 | Template + TinyCNN stable | margin-aware hybrid gate (`tests/test_scorer.py`), full suite green |
-| 3K/7K charset usable | `tools/benchmark/cpu_benchmark.py` charsets 10/100/3000/7000 |
+| 1894-char project charset usable | `tools/benchmark/cpu_benchmark.py` charsets 10/100/1894 |
 | Top-2 without full sort | `postprocess.top2` (argmax + argpartition), `tests/test_segmentation.py::test_top2_matches_argsort_reference` |
 | Stride-2 forward has no useless work | optimized conv/pw + `tests/test_cnn.py` parity tests, benchmark max_error 0.0 |
 | Goal 6 CPU TinyCNN optimization | `tests/test_goal6_tinycnn.py` (strided im2col, no activation-dict forward, prepared weights, batch, Top-K via partition) |

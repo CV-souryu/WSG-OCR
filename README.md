@@ -335,8 +335,10 @@ npz, so a training run can prove it covered every Goal 7 size (10, 11,
 ## CPU benchmark suite and game regression set
 
 ```bash
-# median + p95 per OCR stage, CNN batches 1..128, and 10/100/3000/7000
-# charset template+CNN timings; ends with the optimized-vs-reference check
+# Goal 17: median + p95 for foreground / CC / lattice generation /
+# normalize / template / TinyCNN / decoder / total, CNN batches 1..128,
+# and 10/100/1894 charset template+CNN timings; ends with the
+# optimized-vs-reference check
 python tools/benchmark/cpu_benchmark.py --output benchmarks/cpu_benchmark.json
 
 # the frozen regression corpus (real level badges + synthetic coverage)

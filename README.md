@@ -43,6 +43,7 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 │   ├── charset/         #   export_names.py + extract_charset.py
 │   ├── dataset/         #   generate_font_dataset.py + collect_real_samples.py
 │   │                     #   + extract_game_samples.py + synthetic samples
+│   │                     #   + extract_portrait_card_samples.py (Goal 18)
 │   ├── train/           #   train.py + export_model.py + build_model.py
 │   ├── benchmark/       #   cpu_benchmark.py + benchmark_wgpu.py + footprint.py
 │   └── register_font.py #   fonts/registry.json updater
@@ -353,6 +354,17 @@ words and a partial-word crop to the corpus, and the Goal 15 battery pins
 that the ships lexicon never rewrites clear `潜乙` into `潜甲`; `slot1`
 level badges remain a documented limitation (`L`/`V` touch at one pixel
 and form one connected component at both scales).
+
+Goal 18 turns the corpus into a real game dataset: besides the 12 level
+badges, `real-game/ship-name/` holds 244 crops taken directly from 19 real
+WSG ship-list screenshots (validated ship names from the portrait-card
+alignment). `tools/dataset/extract_portrait_card_samples.py` regenerates
+them from the external `portrait-card-testset.zip`; samples the current
+model does not read yet are kept in the manifest as `known_failure` entries
+with the observed output in `known_failure_note`, so real regressions stay
+visible instead of being dropped. The corpus currently contains 256 real
+game samples (the Goal 18 100+ milestone); 500+ / 1000+ accumulation is the
+next step as more real screenshots are labeled.
 
 ## UI-limited charsets (`allowed_chars`)
 

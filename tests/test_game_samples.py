@@ -1,4 +1,4 @@
-"""P8: real game + synthetic regression set (tests/game_samples/)."""
+"""P8/Goal 18: real game + synthetic regression set (tests/game_samples/)."""
 
 from __future__ import annotations
 
@@ -40,7 +40,11 @@ REQUIRED_CATEGORIES = {
     "synthetic/goal14-words",
     "synthetic/goal14-partial",
     "real-game/level",
+    "real-game/ship-name",
 }
+
+# Goal 18 first milestone: real game crops, not a handful of screenshots.
+MIN_REAL_GAME_SAMPLES = 100
 
 
 def _manifest() -> dict:
@@ -75,6 +79,35 @@ def _ocr():
     return FixedFontOCR(model_path=MODEL_PATH, backend="cpu")
 
 
+def test_real_game_corpus_size():
+    manifest = _manifest()
+    real = [s for s in manifest["samples"] if s["category"].startswith("real-game")]
+    assert len(real) >= MIN_REAL_GAME_SAMPLES, (
+        f"Goal 18 requires at least {MIN_REAL_GAME_SAMPLES} real game samples, "
+        f"manifest has {len(real)}"
+    )
+    missing = [s["file"] for s in real if not (GAME_SAMPLES / s["file"]).exists()]
+    assert not missing, f"real-game samples missing image files: {missing[:5]}"
+
+
+def test_real_game_manifest_schema():
+    manifest = _manifest()
+    for sample in manifest["samples"]:
+        if not sample["category"].startswith("real-game"):
+            continue
+        assert sample.get("expected"), sample
+        assert (GAME_SAMPLES / sample["file"]).is_file(), sample["file"]
+        assert sample["category"] in ("real-game/level", "real-game/ship-name")
+
+
+def test_known_failures_are_documented():
+    manifest = _manifest()
+    known = [s for s in manifest["samples"] if s.get("known_failure")]
+    for sample in known:
+        assert sample.get("expected"), sample["file"]
+        assert sample.get("known_failure_note"), sample["file"]
+
+
 @pytest.mark.parametrize(
     "entry",
     [json.dumps(s, ensure_ascii=False) for s in _manifest()["samples"]],
@@ -99,6 +132,15 @@ def test_game_sample_recognizes(entry):
         )
     else:
         result = ocr.recognize(image)
+    if sample.get("known_failure"):
+        # Real regression sample: keep it in the corpus and pin that the
+        # current model still misses it. When the model starts reading it,
+        # remove the flag and it becomes an ordinary passing assertion.
+        assert result.text != sample["expected"], (
+            f"{sample['file']}: marked known_failure but now recognized "
+            f"{result.text!r}; remove the flag"
+        )
+        return
     assert result.text == sample["expected"], (
         f"{sample['file']}: expected {sample['expected']!r}, got {result.text!r}"
     )

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Extract per-character training crops from the game-sample regression set.
 
-The level badges in ``tests/game_samples/`` are fixed fixtures with known
-expected text. For each image this script splits the line into one box per
-expected character (using the deepest blank-column valleys, so it does not
-depend on the OCR classifier) and writes tight RGB crops into
-``out_dir/{label}/...png`` — the layout :mod:`collect_real_samples` consumes.
+The level badges in ``tests/game_samples/real-game/level/`` are fixed
+fixtures with known expected text. For each image this script splits the
+line into one box per expected character (using the deepest blank-column
+valleys, so it does not depend on the OCR classifier) and writes tight RGB
+crops into ``out_dir/{label}/...png`` — the layout
+:mod:`collect_real_samples` consumes.
 
 Usage:
     python tools/dataset/extract_game_samples.py \
@@ -94,10 +95,12 @@ def extract(
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for sample in manifest["samples"]:
-        if not sample.get("category", "").startswith("real-game"):
-            # Synthetic regression renders are full lines with fragment-heavy
-            # glyphs; blank-valley splitting would misalign per-character
-            # training crops. Only the real-game badges are extracted.
+        if sample.get("category") != "real-game/level":
+            # Synthetic renders are full lines with fragment-heavy glyphs and
+            # the Goal 18 ship-name crops mix Chinese/Latin/punctuation with
+            # decorative glyphs; blank-valley splitting would misalign
+            # per-character training crops. Only the level badges are
+            # extracted as per-character training crops.
             continue
         path = root / sample["file"]
         expected = sample["expected"]

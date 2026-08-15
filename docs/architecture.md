@@ -678,17 +678,28 @@ smoke mode.
 ## Game regression set (P8)
 
 `tests/game_samples/` holds the regression corpus: real game level badges
-(`level/`, 1x and 4x) and deterministic synthetic renders (`synthetic/`)
-covering normal Chinese, digits, mixed Chinese+ASCII, punctuation,
-fragment-heavy glyphs (`鲃`, `小`), confusable pairs (`甲/申`, `未/末`),
-light/dark backgrounds, anti-aliasing and multiple font sizes.
-`manifest.json` records each image's expected text, category, profile
-overrides, optional lexicon/matched-term annotations and the registered
-font. The Goal 14 battery contributes small-size `鲃鱼`/`小`/`潜甲`/`潜乙`/
-`Z17`/`巴尔的摩`, mixed Chinese+ASCII, digits, short/long words and a
-partial-word crop, and the Goal 15 battery pins that the ships lexicon
-never rewrites clear `潜乙` into `潜甲`. `tests/test_game_samples.py` fails
-on any segmentation/CNN change that breaks the set (37 samples).
+(`level/`, 1x and 4x), 244 real ship-name crops (`real-game/ship-name/`)
+and deterministic synthetic renders (`synthetic/`) covering normal Chinese,
+digits, mixed Chinese+ASCII, punctuation, fragment-heavy glyphs (`鲃`,
+`小`), confusable pairs (`甲/申`, `未/末`), light/dark backgrounds,
+anti-aliasing and multiple font sizes. `manifest.json` records each image's
+expected text, category, profile overrides, optional lexicon/matched-term
+annotations and the registered font. The Goal 14 battery contributes
+small-size `鲃鱼`/`小`/`潜甲`/`潜乙`/`Z17`/`巴尔的摩`, mixed Chinese+ASCII,
+digits, short/long words and a partial-word crop, and the Goal 15 battery
+pins that the ships lexicon never rewrites clear `潜乙` into `潜甲`.
+`tests/test_game_samples.py` fails on any segmentation/CNN change that
+breaks the set (281 samples: 252 asserted passing + 29 documented known
+failures).
+
+Goal 18 is the real-game corpus: 256 real samples (12 level badges + 244
+ship-name crops from 19 real screenshots). Samples the current model cannot
+read yet (long ship names, `U-156`/`U-96`, stylized low-contrast glyphs)
+stay in the manifest as `known_failure` entries with the observed output
+recorded, so the dataset measures the algorithm honestly instead of only
+keeping easy crops. `tools/dataset/extract_portrait_card_samples.py`
+regenerates the ship-name category from the external portrait-card testset;
+the 500+ and 1000+ accumulation milestones remain open.
 
 The level badges are also training data:
 `tools/dataset/extract_game_samples.py` splits them into per-character crops
@@ -724,7 +735,7 @@ verified:
 | Goal 15 lexicon cannot override strong visual evidence | `tests/test_goal15_lexicon_visual_priority.py` + `src/fixedfontocr/lexicon.py` (confident text never rewritten; ambiguous Top-K-only correction; non-unique/near-tied matches keep OCR + alternatives; unknown text emitted; 潜乙 never becomes 潜甲 at 12..32 px with ships lexicon) + `tests/game_samples/` |
 | Goal 16 cross-frame tracking | `src/fixedfontocr/tracker.py` + `tests/test_goal16_cross_frame.py` (`ocr.tracker()` / `FrameTracker.update`; ROI change detection, unchanged-ROI cache, multi-frame Top-K logits fusion, stable voting for `巴尔的摩 / 巴你的摩 / 巴尔的摩`, reset; `recognize` remains pure) |
 | CPU benchmark fixed | `tools/benchmark/cpu_benchmark.py` + `benchmarks/cpu_benchmark.json` |
-| Real game regression passes | `tests/test_game_samples.py` (37 samples) |
+| Real game regression passes | `tests/test_game_samples.py` (281 samples: 252 passing + 29 documented known failures; Goal 18 real corpus = 256 real-game samples) |
 | Classifier outputs Top-K/raw score | `ClassificationBatch(ids, top1, top2, margins)` + `CandidateScore` |
 | Segmentation supports candidate lattice | `src/fixedfontocr/segmentation.py` |
 

@@ -252,7 +252,1776 @@
       "note": "Goal 14: partial-word crop at 14px",
       "lexicon": "ships",
       "matched_term": "巴尔的摩",
-      "matched_span": [1, 4]
+      "matched_span": [
+        1,
+        4
+      ]
+    },
+    {
+      "file": "real-game/ship-name/vp00_r0_c0.png",
+      "expected": "霞飞",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 0 col 0; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r0_c1.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 0 col 1; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r0_c2.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 0 col 2; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r0_c3.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 0 col 3; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r0_c4.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 0 col 4; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r0_c5.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 0 col 5; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r0_c6.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 0 col 6; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r1_c0.png",
+      "expected": "约克城",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 1 col 0; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r1_c1.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 1 col 1; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r1_c2.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 1 col 2; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r1_c3.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 1 col 3; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r1_c4.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 1 col 4; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r1_c5.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 1 col 5; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp00_r1_c6.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp00 row 1 col 6; source screens/viewport-00.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r0_c0.png",
+      "expected": "霞飞",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 0 col 0; source screens/viewport-01.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '-飞'"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r0_c1.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 0 col 1; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r0_c2.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 0 col 2; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r0_c3.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 0 col 3; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r0_c4.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 0 col 4; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r0_c5.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 0 col 5; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r0_c6.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 0 col 6; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r1_c0.png",
+      "expected": "约克城",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 1 col 0; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r1_c1.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 1 col 1; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r1_c2.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 1 col 2; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r1_c3.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 1 col 3; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r1_c4.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 1 col 4; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r1_c5.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 1 col 5; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp01_r1_c6.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp01 row 1 col 6; source screens/viewport-01.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r0_c0.png",
+      "expected": "霞飞",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 0 col 0; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r0_c1.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 0 col 1; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r0_c2.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 0 col 2; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r0_c3.png",
+      "expected": "埃塞克斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 0 col 3; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r0_c4.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 0 col 4; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r0_c5.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 0 col 5; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r0_c6.png",
+      "expected": "企业",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 0 col 6; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r1_c0.png",
+      "expected": "约克城",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 1 col 0; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r1_c1.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 1 col 1; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r1_c2.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 1 col 2; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r1_c3.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 1 col 3; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r1_c4.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 1 col 4; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r1_c5.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 1 col 5; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp02_r1_c6.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp02 row 1 col 6; source screens/viewport-02.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r0_c0.png",
+      "expected": "约克城",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 0 col 0; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r0_c1.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 0 col 1; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r0_c2.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 0 col 2; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r0_c3.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 0 col 3; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r0_c4.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 0 col 4; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r0_c5.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 0 col 5; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r0_c6.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 0 col 6; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r1_c0.png",
+      "expected": "新泽西",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 1 col 0; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r1_c1.png",
+      "expected": "新泽西",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 1 col 1; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r1_c2.png",
+      "expected": "密苏里",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 1 col 2; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r1_c3.png",
+      "expected": "密苏里",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 1 col 3; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r1_c4.png",
+      "expected": "马萨诸塞",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 1 col 4; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r1_c5.png",
+      "expected": "南达科他",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 1 col 5; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp03_r1_c6.png",
+      "expected": "北卡罗来纳",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp03 row 1 col 6; source screens/viewport-03.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r0_c0.png",
+      "expected": "约克城",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 0 col 0; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r0_c1.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 0 col 1; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r0_c2.png",
+      "expected": "皇家方舟",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 0 col 2; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r0_c3.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 0 col 3; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r0_c4.png",
+      "expected": "大黄蜂",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 0 col 4; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r0_c5.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 0 col 5; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r0_c6.png",
+      "expected": "怨仇",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 0 col 6; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r1_c0.png",
+      "expected": "新泽西",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 1 col 0; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r1_c1.png",
+      "expected": "新泽西",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 1 col 1; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r1_c2.png",
+      "expected": "密苏里",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 1 col 2; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r1_c3.png",
+      "expected": "密苏里",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 1 col 3; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r1_c4.png",
+      "expected": "马萨诸塞",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 1 col 4; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r1_c5.png",
+      "expected": "南达科他",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 1 col 5; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp04_r1_c6.png",
+      "expected": "北卡罗来纳",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp04 row 1 col 6; source screens/viewport-04.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r0_c0.png",
+      "expected": "新泽西",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 0 col 0; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r0_c1.png",
+      "expected": "新泽西",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 0 col 1; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r0_c2.png",
+      "expected": "密苏里",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 0 col 2; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r0_c3.png",
+      "expected": "密苏里",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 0 col 3; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r0_c4.png",
+      "expected": "马萨诸塞",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 0 col 4; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r0_c5.png",
+      "expected": "南达科他",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 0 col 5; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r0_c6.png",
+      "expected": "北卡罗来纳",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 0 col 6; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r1_c0.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 1 col 0; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r1_c1.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 1 col 1; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r1_c2.png",
+      "expected": "维托里奥·维内托",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 1 col 2; source screens/viewport-05.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '维托里:'"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r1_c3.png",
+      "expected": "维托里奥·维内托",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 1 col 3; source screens/viewport-05.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '维托里;'"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r1_c4.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 1 col 4; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r1_c5.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 1 col 5; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp05_r1_c6.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp05 row 1 col 6; source screens/viewport-05.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r0_c0.png",
+      "expected": "新泽西",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 0 col 0; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r0_c1.png",
+      "expected": "新泽西",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 0 col 1; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r0_c2.png",
+      "expected": "密苏里",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 0 col 2; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r0_c3.png",
+      "expected": "密苏里",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 0 col 3; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r0_c4.png",
+      "expected": "马萨诸塞",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 0 col 4; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r0_c5.png",
+      "expected": "南达科他",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 0 col 5; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r0_c6.png",
+      "expected": "北卡罗来纳",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 0 col 6; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r1_c0.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 1 col 0; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r1_c1.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 1 col 1; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r1_c2.png",
+      "expected": "维托里奥·维内托",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 1 col 2; source screens/viewport-06.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '维托里奥.维'"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r1_c3.png",
+      "expected": "维托里奥·维内托",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 1 col 3; source screens/viewport-06.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '维托里奥*维'"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r1_c4.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 1 col 4; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r1_c5.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 1 col 5; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp06_r1_c6.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp06 row 1 col 6; source screens/viewport-06.png"
+    },
+    {
+      "file": "real-game/ship-name/vp07_r0_c0.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp07 row 0 col 0; source screens/viewport-07.png"
+    },
+    {
+      "file": "real-game/ship-name/vp07_r0_c1.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp07 row 0 col 1; source screens/viewport-07.png"
+    },
+    {
+      "file": "real-game/ship-name/vp07_r0_c2.png",
+      "expected": "维托里奥·维内托",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp07 row 0 col 2; source screens/viewport-07.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '念·托里奥·维内托'"
+    },
+    {
+      "file": "real-game/ship-name/vp07_r0_c3.png",
+      "expected": "维托里奥·维内托",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp07 row 0 col 3; source screens/viewport-07.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '念·托里奥吸维内托'"
+    },
+    {
+      "file": "real-game/ship-name/vp07_r0_c4.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp07 row 0 col 4; source screens/viewport-07.png"
+    },
+    {
+      "file": "real-game/ship-name/vp07_r0_c5.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp07 row 0 col 5; source screens/viewport-07.png"
+    },
+    {
+      "file": "real-game/ship-name/vp07_r0_c6.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp07 row 0 col 6; source screens/viewport-07.png"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r0_c0.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 0 col 0; source screens/viewport-08.png"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r0_c1.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 0 col 1; source screens/viewport-08.png"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r0_c2.png",
+      "expected": "维托里奥·维内托",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 0 col 2; source screens/viewport-08.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '奥·维内托'"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r0_c3.png",
+      "expected": "维托里奥·维内托",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 0 col 3; source screens/viewport-08.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '奥·维内托'"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r0_c4.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 0 col 4; source screens/viewport-08.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '华盛预'"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r0_c5.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 0 col 5; source screens/viewport-08.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '华盛预'"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r0_c6.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 0 col 6; source screens/viewport-08.png"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r1_c0.png",
+      "expected": "前卫",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 1 col 0; source screens/viewport-08.png"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r1_c1.png",
+      "expected": "前卫",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 1 col 1; source screens/viewport-08.png"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r1_c2.png",
+      "expected": "安德烈亚·多利亚",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 1 col 2; source screens/viewport-08.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '安德E,亚便'"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r1_c3.png",
+      "expected": "俾斯麦",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 1 col 3; source screens/viewport-08.png"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r1_c4.png",
+      "expected": "俾斯麦",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 1 col 4; source screens/viewport-08.png"
+    },
+    {
+      "file": "real-game/ship-name/vp08_r1_c5.png",
+      "expected": "不挠",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp08 row 1 col 5; source screens/viewport-08.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r0_c0.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 0 col 0; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r0_c1.png",
+      "expected": "兴登堡",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 0 col 1; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r0_c4.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 0 col 4; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r0_c5.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 0 col 5; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r0_c6.png",
+      "expected": "华盛顿",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 0 col 6; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r1_c0.png",
+      "expected": "前卫",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 1 col 0; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r1_c1.png",
+      "expected": "前卫",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 1 col 1; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r1_c2.png",
+      "expected": "安德烈亚·多利亚",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 1 col 2; source screens/viewport-09.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '安德FJ亚鲞多利Ξ'"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r1_c3.png",
+      "expected": "俾斯麦",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 1 col 3; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r1_c4.png",
+      "expected": "俾斯麦",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 1 col 4; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp09_r1_c5.png",
+      "expected": "不挠",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp09 row 1 col 5; source screens/viewport-09.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r0_c0.png",
+      "expected": "前卫",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 0 col 0; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r0_c1.png",
+      "expected": "前卫",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 0 col 1; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r0_c2.png",
+      "expected": "安德烈亚·多利亚",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 0 col 2; source screens/viewport-10.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns \"'E9I↓亚.多利亚\""
+    },
+    {
+      "file": "real-game/ship-name/vp10_r0_c3.png",
+      "expected": "俾斯麦",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 0 col 3; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r0_c4.png",
+      "expected": "俾斯麦",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 0 col 4; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r0_c5.png",
+      "expected": "不挠",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 0 col 5; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r0_c6.png",
+      "expected": "斯佩伯爵海军上将",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 0 col 6; source screens/viewport-10.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '斯佩{f'"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r1_c0.png",
+      "expected": "格奈森瑙",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 1 col 0; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r1_c1.png",
+      "expected": "胡德",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 1 col 1; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r1_c2.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 1 col 2; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r1_c3.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 1 col 3; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r1_c4.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 1 col 4; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r1_c5.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 1 col 5; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp10_r1_c6.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp10 row 1 col 6; source screens/viewport-10.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r0_c0.png",
+      "expected": "前卫",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 0 col 0; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r0_c1.png",
+      "expected": "前卫",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 0 col 1; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r0_c3.png",
+      "expected": "俾斯麦",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 0 col 3; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r0_c4.png",
+      "expected": "俾斯麦",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 0 col 4; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r0_c5.png",
+      "expected": "不挠",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 0 col 5; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r0_c6.png",
+      "expected": "斯佩伯爵海军上将",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 0 col 6; source screens/viewport-11.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '斯佩伯爵'"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r1_c0.png",
+      "expected": "格奈森瑙",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 1 col 0; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r1_c1.png",
+      "expected": "胡德",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 1 col 1; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r1_c2.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 1 col 2; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r1_c3.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 1 col 3; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r1_c4.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 1 col 4; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r1_c5.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 1 col 5; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp11_r1_c6.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp11 row 1 col 6; source screens/viewport-11.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r0_c0.png",
+      "expected": "格奈森瑙",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 0 col 0; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r0_c1.png",
+      "expected": "胡德",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 0 col 1; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r0_c2.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 0 col 2; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r0_c3.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 0 col 3; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r0_c4.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 0 col 4; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r0_c5.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 0 col 5; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r0_c6.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 0 col 6; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r1_c0.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 1 col 0; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r1_c1.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 1 col 1; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r1_c2.png",
+      "expected": "爱丽",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 1 col 2; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r1_c3.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 1 col 3; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r1_c4.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 1 col 4; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r1_c5.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 1 col 5; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp12_r1_c6.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp12 row 1 col 6; source screens/viewport-12.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r0_c0.png",
+      "expected": "格奈森瑙",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 0 col 0; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r0_c1.png",
+      "expected": "胡德",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 0 col 1; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r0_c2.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 0 col 2; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r0_c3.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 0 col 3; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r0_c4.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 0 col 4; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r0_c5.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 0 col 5; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r0_c6.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 0 col 6; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r1_c0.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 1 col 0; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r1_c1.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 1 col 1; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r1_c2.png",
+      "expected": "爱丽",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 1 col 2; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r1_c3.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 1 col 3; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r1_c4.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 1 col 4; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r1_c5.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 1 col 5; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp13_r1_c6.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp13 row 1 col 6; source screens/viewport-13.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r0_c0.png",
+      "expected": "格奈森瑙",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 0 col 0; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r0_c1.png",
+      "expected": "胡德",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 0 col 1; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r0_c2.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 0 col 2; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r0_c3.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 0 col 3; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r0_c4.png",
+      "expected": "纽波特纽斯",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 0 col 4; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r0_c5.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 0 col 5; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r0_c6.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 0 col 6; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r1_c0.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 1 col 0; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r1_c1.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 1 col 1; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r1_c2.png",
+      "expected": "爱丽",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 1 col 2; source screens/viewport-14.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '爱汇8'"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r1_c3.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 1 col 3; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r1_c4.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 1 col 4; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r1_c5.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 1 col 5; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp14_r1_c6.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp14 row 1 col 6; source screens/viewport-14.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r0_c0.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 0 col 0; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r0_c1.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 0 col 1; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r0_c2.png",
+      "expected": "爱丽",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 0 col 2; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r0_c3.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 0 col 3; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r0_c4.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 0 col 4; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r0_c5.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 0 col 5; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r0_c6.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 0 col 6; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r1_c0.png",
+      "expected": "克莱夫勋爵",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 1 col 0; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r1_c1.png",
+      "expected": "阿贝克隆比",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 1 col 1; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r1_c2.png",
+      "expected": "可怖",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 1 col 2; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r1_c3.png",
+      "expected": "巴夫勒尔",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 1 col 3; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r1_c4.png",
+      "expected": "巴夫勒尔",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 1 col 4; source screens/viewport-15.png"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r1_c5.png",
+      "expected": "乌戈里尼·维瓦尔迪",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 1 col 5; source screens/viewport-15.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '与戈里尼号维瓦尔j'"
+    },
+    {
+      "file": "real-game/ship-name/vp15_r1_c6.png",
+      "expected": "U-156",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp15 row 1 col 6; source screens/viewport-15.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns 'い156'"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r0_c0.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 0 col 0; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r0_c1.png",
+      "expected": "虎",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 0 col 1; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r0_c2.png",
+      "expected": "爱丽",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 0 col 2; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r0_c3.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 0 col 3; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r0_c4.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 0 col 4; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r0_c5.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 0 col 5; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r0_c6.png",
+      "expected": "大淀",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 0 col 6; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r1_c0.png",
+      "expected": "克莱夫勋爵",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 1 col 0; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r1_c1.png",
+      "expected": "阿贝克隆比",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 1 col 1; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r1_c2.png",
+      "expected": "可怖",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 1 col 2; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r1_c3.png",
+      "expected": "巴夫勒尔",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 1 col 3; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r1_c4.png",
+      "expected": "巴夫勒尔",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 1 col 4; source screens/viewport-16.png"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r1_c5.png",
+      "expected": "乌戈里尼·维瓦尔迪",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 1 col 5; source screens/viewport-16.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '乌戈里尼·维且'"
+    },
+    {
+      "file": "real-game/ship-name/vp16_r1_c6.png",
+      "expected": "U-156",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp16 row 1 col 6; source screens/viewport-16.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns 'い156'"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r0_c0.png",
+      "expected": "克莱夫勋爵",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 0 col 0; source screens/viewport-17.png"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r0_c1.png",
+      "expected": "阿贝克隆比",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 0 col 1; source screens/viewport-17.png"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r0_c2.png",
+      "expected": "可怖",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 0 col 2; source screens/viewport-17.png"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r0_c3.png",
+      "expected": "巴夫勒尔",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 0 col 3; source screens/viewport-17.png"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r0_c4.png",
+      "expected": "巴夫勒尔",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 0 col 4; source screens/viewport-17.png"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r0_c5.png",
+      "expected": "马戈迪尼",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 0 col 5; source screens/viewport-17.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '乌戈里尼+44·'"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r0_c6.png",
+      "expected": "U-156",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 0 col 6; source screens/viewport-17.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns 'い156'"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r1_c0.png",
+      "expected": "U-156",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 1 col 0; source screens/viewport-17.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns 'い156'"
+    },
+    {
+      "file": "real-game/ship-name/vp17_r1_c1.png",
+      "expected": "U-96",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp17 row 1 col 1; source screens/viewport-17.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns 'い96'"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r0_c0.png",
+      "expected": "克莱夫勋爵",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 0 col 0; source screens/viewport-18.png"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r0_c1.png",
+      "expected": "阿贝克隆比",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 0 col 1; source screens/viewport-18.png"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r0_c2.png",
+      "expected": "可怖",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 0 col 2; source screens/viewport-18.png"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r0_c3.png",
+      "expected": "巴夫勒尔",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 0 col 3; source screens/viewport-18.png"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r0_c4.png",
+      "expected": "巴夫勒尔",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 0 col 4; source screens/viewport-18.png"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r0_c5.png",
+      "expected": "乌戈里尼·维瓦尔迪",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 0 col 5; source screens/viewport-18.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns '乌戈里f|'"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r0_c6.png",
+      "expected": "U-156",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 0 col 6; source screens/viewport-18.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns 'い156'"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r1_c0.png",
+      "expected": "U-156",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 1 col 0; source screens/viewport-18.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns 'い156'"
+    },
+    {
+      "file": "real-game/ship-name/vp18_r1_c1.png",
+      "expected": "U-96",
+      "category": "real-game/ship-name",
+      "lexicon": "ships",
+      "note": "real ship-list card vp18 row 1 col 1; source screens/viewport-18.png",
+      "known_failure": true,
+      "known_failure_note": "current model returns 'い96'"
     }
   ]
 }

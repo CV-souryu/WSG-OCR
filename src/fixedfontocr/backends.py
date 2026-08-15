@@ -46,7 +46,13 @@ class BackendResult:
 
 
 class Backend(ABC):
-    """Unified batch classifier interface used by the OCR pipeline."""
+    """Unified batch classifier interface used by the OCR pipeline.
+
+    ``classify`` is the cheap public Top-1 contract. The lattice scorer
+    additionally needs raw ``[N, C]`` logits so it can build ranked Top-K
+    evidence and apply ``allowed_chars`` masks in one algorithm regardless
+    of backend; backends therefore also implement ``forward_logits``.
+    """
 
     @abstractmethod
     def classify(self, glyphs: NDArray[np.uint8]) -> BackendResult:
@@ -61,6 +67,15 @@ class Backend(ABC):
         -------
         BackendResult with ``char_ids`` (int32 ``[N]``) and ``scores``
         (f32 ``[N]``, top1-top2 logit margin).
+        """
+
+    @abstractmethod
+    def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
+        """Return raw ``[N, num_classes]`` logits for a glyph batch.
+
+        The caller owns Top-K generation and allowed-class masking. Keeping
+        the full logits at this boundary is what lets ``SegmentScorer`` run
+        the identical hybrid fusion algorithm on CPUBackend and WGPUBackend.
         """
 
 
@@ -89,20 +104,31 @@ class CPUBackend(Backend):
     def __init__(self, weights: dict[str, NDArray[np.float32]], input_size: int = 24):
         self.weights = prepare_weights(weights)  # also validates frozen V1
         self.input_size = input_size
+        self.num_classes = int(self.weights["fc.weight"].shape[0])
+
+    def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
+        arr, n, _h, _w = _check_glyphs(glyphs)
+        if _h != self.input_size or _w != self.input_size:
+            raise ValueError(
+                f"expected {self.input_size}x{self.input_size} glyphs, got {_h}x{_w}"
+            )
+        if n == 0:
+            return np.empty((0, self.num_classes), dtype=np.float32)
+        x = arr.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
+        return np.ascontiguousarray(forward(x, self.weights), dtype=np.float32)
 
     def classify(self, glyphs: NDArray[np.uint8]) -> BackendResult:
-        arr, n, h, w = _check_glyphs(glyphs)
-        if h != self.input_size or w != self.input_size:
+        arr, n, _h, _w = _check_glyphs(glyphs)
+        if _h != self.input_size or _w != self.input_size:
             raise ValueError(
-                f"expected {self.input_size}x{self.input_size} glyphs, got {h}x{w}"
+                f"expected {self.input_size}x{self.input_size} glyphs, got {_h}x{_w}"
             )
         if n == 0:
             return BackendResult(
                 char_ids=np.empty(0, dtype=np.int32),
                 scores=np.empty(0, dtype=np.float32),
             )
-        x = arr.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
-        logits = forward(x, self.weights)
+        logits = self.forward_logits(arr)
         char_ids, scores = _margin_from_logits(logits)
         return BackendResult(char_ids=char_ids, scores=scores)
 
@@ -265,6 +291,31 @@ class WGPUBackend(Backend):
             }
         char_ids, scores = self._parse_results(raw)
         return BackendResult(char_ids=char_ids, scores=scores)
+
+    def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
+        """Raw ``[N, C]`` logits through the per-layer WGPU pipeline.
+
+        The fused classify path only reads back Top-1/Top-2; the lattice
+        scorer needs full logits for Top-K fusion, so this method uses the
+        same verified per-layer entry points and the full ``linear`` shader.
+        """
+
+        arr, n, h, w = _check_glyphs(glyphs)
+        if h != self._H or w != self._W:
+            raise ValueError(f"expected {self._H}x{self._W} glyphs, got {h}x{w}")
+        if n == 0:
+            return np.empty((0, self.num_classes), dtype=np.float32)
+        norm = self.normalize(arr).reshape(n, self._H, self._W, 4)
+        c1 = self.conv1(norm).reshape(n, 12, 12, self._C1)
+        d1 = self.dw1(c1).reshape(n, 12, 12, self._C1)
+        p1 = self.pw1(d1).reshape(n, 6, 6, self._C2)
+        d2 = self.dw2(p1).reshape(n, 6, 6, self._C2)
+        p2 = self.pw2(d2).reshape(n, 3, 3, self._C3)
+        pooled = self.gap(p2).reshape(n, self._C3)
+        return np.ascontiguousarray(
+            self.linear(pooled).reshape(n, self.num_classes),
+            dtype=np.float32,
+        )
 
     # ------------------------------------------------------------------
     # Per-layer entry points (used by the CPU/GPU consistency tests)
@@ -784,3 +835,7 @@ class AutoBackend(Backend):
     def classify(self, glyphs: NDArray[np.uint8]) -> BackendResult:
         arr, n, _, _ = _check_glyphs(glyphs)
         return self.pick(n).classify(arr)
+
+    def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
+        arr, n, _, _ = _check_glyphs(glyphs)
+        return self.pick(n).forward_logits(arr)

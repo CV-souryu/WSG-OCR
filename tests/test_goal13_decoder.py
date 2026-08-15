@@ -33,7 +33,7 @@ from fixedfontocr import (
     decode_lattice,
     score_path,
 )
-from fixedfontocr.geometry import FontGeometryDatabase
+from fixedfontocr.geometry import FontGeometryDatabase, FontGeometryEntry
 
 from conftest import render_text
 
@@ -261,3 +261,103 @@ def test_goal13_end_to_end_regressions(font_path):
         lexicon_mode="prefer",
     )
     assert isinstance(with_alt.alternatives, tuple)
+
+
+def test_decoder_geometry_is_per_character_for_topk_alternatives():
+    """A Top-2 character must not inherit the Top-1 character's geometry."""
+
+    entries = (
+        FontGeometryEntry(
+            char_id=0,
+            advance=0.5,
+            bbox_width=0.4,
+            bbox_height=0.9,
+            aspect_ratio=0.44,
+            ink_count=100,
+            component_count=1,
+            baseline=0.72,
+            baseline_ratio=0.8,
+            ink_ratio=0.2,
+        ),
+        FontGeometryEntry(
+            char_id=1,
+            advance=1.0,
+            bbox_width=0.9,
+            bbox_height=0.9,
+            aspect_ratio=1.0,
+            ink_count=324,
+            component_count=1,
+            baseline=0.72,
+            baseline_ratio=0.8,
+            ink_ratio=0.2,
+        ),
+    )
+    db = FontGeometryDatabase(
+        font_sha256="test",
+        render_size=32,
+        threshold=140,
+        charset="1小",
+        entries=entries,
+    )
+    seg = Component(
+        mask=np.ones((20, 18), dtype=bool),
+        x=0,
+        y=0,
+        w=18,
+        h=20,
+    )
+    cand = VisualCandidate(
+        start=0,
+        end=1,
+        components=(0,),
+        atoms=(0, 1),
+        segment=seg,
+        candidate_geometry=0.0,
+        geometry_score=0.0,
+        scores=VisualScores(char_ids=(0, 1), logits=(0.9, 0.8)),
+    )
+    narrow = DecodePath(candidates=(cand,), text="1", char_ids=(0,))
+    wide = DecodePath(candidates=(cand,), text="小", char_ids=(1,))
+    narrow_score = score_path(narrow, ["1", "小"], geometry=db)
+    wide_score = score_path(wide, ["1", "小"], geometry=db)
+    assert narrow_score.geometry < wide_score.geometry
+    # The chosen Top-2 character keeps its own visual score as well.
+    assert narrow_score.visual == pytest.approx(0.9)
+    assert wide_score.visual == pytest.approx(0.8)
+
+
+def test_beam_full_path_score_can_overturn_dp_local_best():
+    """P0-3: DP local prefix bonuses never outrank complete score_path()."""
+
+    charset = ["甲", "乙", "丙", "丁", "戊", "己"]
+
+    def cand(span: tuple[int, int], a: float, b: float) -> VisualCandidate:
+        return VisualCandidate(
+            start=span[0],
+            end=span[1],
+            components=tuple(range(span[0], span[1])),
+            atoms=span,
+            geometry_score=0.0,
+            scores=VisualScores(
+                char_ids=(0, 1, 2, 3, 4, 5),
+                logits=(a, b, 0.5, 0.5, 0.5, 0.5),
+            ),
+        )
+
+    lat = _lattice(
+        cand((0, 1), 0.7, 0.6),
+        cand((1, 2), 0.7, 0.6),
+        cand((2, 3), 0.7, 0.6),
+        cand((3, 4), 0.55, 0.54),
+    )
+    lex = Lexicon.from_terms("t", ["甲乙丙丁戊己"])
+    cfg = DecoderConfig(beam_width=32, num_alternatives=8)
+
+    dp = decode_dp(lat, charset, lex, cfg)
+    beam = decode_beam(lat, charset, lex, cfg)
+    assert dp.text == "甲甲甲甲"
+    assert beam.text == "甲乙丙丁"
+    assert beam.mean_score == pytest.approx(
+        score_path(beam, charset, lex, cfg).total
+    )
+    assert beam.mean_score > score_path(dp, charset, lex, cfg).total

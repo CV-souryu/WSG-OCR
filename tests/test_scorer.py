@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from fixedfontocr.preprocess import Segment
 from fixedfontocr.scorer import SegmentScorer, cnn_visual, to_confidence
 from fixedfontocr.segmentation import build_candidates, connected_components
-from fixedfontocr.types import default_profile
+from fixedfontocr.types import VisualCandidate, VisualScores, default_profile
 
 from conftest import render_text
 
@@ -71,3 +73,21 @@ def test_cnn_visual_and_confidence_are_monotonic():
     assert cnn_visual(0.0) == 0.5
     assert 0.0 <= to_confidence(2.0, "cnn") <= 1.0
     assert to_confidence(0.9, "template") == 0.9
+
+
+def test_chosen_topk_character_keeps_its_own_confidence(font_path):
+    """A lexicon-chosen Top-2 must never report the Top-1 confidence."""
+    scorer = SegmentScorer(_game_model())
+    cand = VisualCandidate(
+        start=0,
+        end=1,
+        components=(0,),
+        candidate_geometry=0.0,
+        geometry_score=0.0,
+        scores=VisualScores(char_ids=(0, 1), logits=(0.72, 0.68)),
+    )
+    top1_visual, top1_conf = scorer.finalize_char_score(cand, 0, 0.0)
+    top2_visual, top2_conf = scorer.finalize_char_score(cand, 1, 0.0)
+    assert top1_visual == pytest.approx(0.72)
+    assert top2_visual == pytest.approx(0.68)
+    assert top2_conf < top1_conf

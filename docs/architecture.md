@@ -45,12 +45,12 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/types.py` | Goal 1 core dataclasses: `Component`, `VisualCandidate`, `VisualLattice`, `VisualScores` (Top-K), `DecodePath`, `LexiconMatch`, extended `OCRResult`; plus compatibility `CharResult`, `Profile`, `ClassificationBatch`, `CandidateScore`. |
 | `src/fixedfontocr/preprocess.py` | Color/grayscale mask, line finding, run-length connected components, Goal 3 binary + soft baseline-aligned 24×24 normalization (`NormalizeSpec`, `glyph_normalize_geometry`). |
 | `src/fixedfontocr/frontend.py` | Goal 2 Visual Frontend: one RGB pass extracts `binary_mask` (segmentation/template) and `soft_foreground` (TinyCNN), plus binary/soft glyph normalization helpers. |
-| `src/fixedfontocr/geometry.py` | Goal 8 font geometry database: offline generation from a registered font (`advance`, bbox, aspect, ink, component count, baseline) plus the runtime JSON lookup table used by pruning and geometry scoring. |
+| `src/fixedfontocr/geometry.py` | Goal 8 font geometry database: offline generation from a registered font (`advance`, bbox, aspect, ink, component count, baseline), the runtime JSON lookup table used by pruning, and `char_geometry(candidate, char_id)` for the character-specific half of the Goal 20 geometry split. |
 | `src/fixedfontocr/lexicon.py` | Goal 11 Lexicon Layer + Goal 12 partial-word support + Goal 15 visual-priority guards: loads `charsets/words/` by domain, normalizes whitespace, ranks exact/full/partial-word matches (prefix/suffix/inner crops, internal-gap penalty) and applies `none`/`prefer`/`strict` modes to the decoded result. Prefer corrections require an uncertain character whose target is in the visual Top-K and a unique (non-near-tied) dictionary match. |
-| `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms) and the visual DP decoder. This is the production segmentation path. |
+| `src/fixedfontocr/segmentation.py` | Candidate lattice (every original component + merges up to 4 components + split(Cx) atoms), `candidate_geometry` (identity-independent alignment/gap/width evidence), and the visual DP decoder. This is the production segmentation path. |
 | `src/fixedfontocr/decoder.py` | Goal 13 joint decoder: exact DP (`decode_dp`, lexicon-prefix trie state) + beam-search upgrade (`decode_beam`, `beam_width` 8..32) scoring `visual + geometry + lexicon + word_prior - segmentation_penalty` and returning the best path + alternatives. Every lexicon/word-prior term is gated by visual uncertainty so confident evidence stays dominant (Goal 15). |
 | `src/fixedfontocr/tracker.py` | Goal 16 cross-frame tracker (`FrameTracker`): ROI change detection from a compact text-region signature, per-ROI result caching, aligned multi-frame Top-K logits fusion and stable text voting. It is a separate stateful layer; `FixedFontOCR.recognize` remains a pure single-frame function. |
-| `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate; converts raw scores to a shared 0..1 visual score. |
+| `src/fixedfontocr/scorer.py` | `SegmentScorer`: batch template/CNN scoring with the margin-aware hybrid gate and Top-K fusion; receives a `Backend` (`CPUBackend`/`WGPUBackend`/`AutoBackend`) for all CNN logits and converts raw scores to a shared 0..1 visual score. |
 | `src/fixedfontocr/classifier.py` | `Classifier` interface plus `TemplateClassifier` (V1 single-template) and `TemplateV2Classifier` (Goal 9 multi-prototype): coarse-feature candidate filtering (ink count, bbox, margins) followed by XOR + popcount; Top-K/best/second/margin + winning-prototype metadata for the lattice. |
 | `src/fixedfontocr/cnn.py` | `TinyCNNClassifier` numpy forward pass (stride-2 optimized), `forward_with_activations` for exported test vectors and `classify_batch(glyphs, top_k=2)`. |
 | `src/fixedfontocr/reference_cnn.py` | Full-then-slice reference forward used by tests to prove the optimized forward matches (P2 acceptance). |
@@ -406,17 +406,26 @@ returned path is re-scored with the complete formula, including crop-aware
 lexicon matches.
 
 `decode_beam` is the beam-search upgrade (`beam_width` 8..32, default 16).
-The exact DP stays authoritative for the best path -- ranking complete
-paths by their whole-path mean would let a glyph split into several
-high-scoring look-alike fragments (e.g. the CNN-only `获得金币1000` fixture
-splitting `得` into two `得` pieces) overturn the frozen CPU reference. The
-beam explores complete-path hypotheses and returns the runner-up texts as
-`DecodePath.alternatives`, ranked with the full Goal 13 formula.
+Every complete path retained by the beam (plus the exact-DP path as a
+safety net) is re-ranked with the complete crop-aware `score_path` formula.
+A path whose full partial-word lexicon score is higher may therefore
+overturn a path that only looked better from DP-local prefix/term bonuses
+-- the local bonuses are a look-ahead, never the final authority.
+
+`segment_line` invokes `decode_beam` when a lexicon is supplied. A
+`decoder_config` without a lexicon uses the exact DP instead, which keeps a
+pure CNN-only segmentation-length beam artefact (e.g. the `获得金币1000`
+fixture splitting `得` into `1` + `获`) from entering the public
+no-lexicon path; direct `decode_beam` callers always get the complete-score
+ranking.
 
 The public pipeline passes the lexicon into `segment_line`, which runs the
-joint decoder, and the decoder's chosen characters (`DecodePath.char_ids`)
-are authoritative in `OCRResult`. The model's unknown gate (CNN threshold /
-empty allowed set) still wins, `apply_lexicon` keeps handling strict mode
+joint decoder. `segment_line` classifies every lattice candidate once, and
+`FixedFontOCR.recognize` projects the decoder-chosen `DecodePath.char_ids`
+and their own `candidate.scores` entries straight into `OCRResult` -- there
+is no second classification of the decoder-selected glyphs. The model's
+unknown gate (CNN threshold / empty allowed set) still wins,
+`apply_lexicon` keeps handling strict mode
 and `matched_term`/`matched_span` annotation, and `tests/test_goal13_decoder.py`
 pins the formula, DP/beam agreement, segmentation penalty, lexicon
 tie-breaking, geometry input and the Goal 4/7/11/12 end-to-end regressions.

@@ -1645,9 +1645,7 @@
       "expected": "爱丽",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp14 row 1 col 2; source screens/viewport-14.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns '爱汇8'"
+      "note": "real ship-list card vp14 row 1 col 2; source screens/viewport-14.png"
     },
     {
       "file": "real-game/ship-name/vp14_r1_c3.png",

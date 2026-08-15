@@ -299,3 +299,12 @@ def test_wgpu_random_model_matches_cpu(tmp_path, wgpu_weights):
     ref = cpu_ocr._backend.classify(glyphs)
     assert np.array_equal(got.char_ids, ref.char_ids)
     assert np.abs(got.scores - ref.scores).max() < 1e-4
+
+
+def test_wgpu_forward_logits_matches_cpu(wgpu_backend, random_glyphs, wgpu_weights):
+    """The lattice scorer uses raw logits; WGPU must match the CPU reference."""
+    cpu = CPUBackend(wgpu_weights)
+    cpu_logits = cpu.forward_logits(random_glyphs)
+    gpu_logits = wgpu_backend.forward_logits(random_glyphs)
+    assert gpu_logits.shape == cpu_logits.shape
+    assert np.abs(gpu_logits - cpu_logits).max() < 1e-4

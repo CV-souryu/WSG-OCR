@@ -15,20 +15,17 @@ from .backends import (
     WGPUBackend,
     benchmark_backends,
 )
-from .classifier import Classifier, TemplateClassifier, TemplateV2Classifier
-from .cnn import forward
 from .decoder import DecoderConfig
 from .frontend import extract_frontend
+from .geometry import char_geometry
 from .lexicon import Lexicon, apply_lexicon, is_lexicon_ref, load_lexicon
 from .model import load_model
 from .postprocess import allowed_ids as build_allowed_ids
-from .postprocess import pick
-from .preprocess import find_lines, normalize
-from .scorer import SegmentScorer, calibrate_visual, to_confidence
+from .preprocess import find_lines
+from .scorer import SegmentScorer
 from .segmentation import segment_line
 from .types import (
     CharResult,
-    Component,
     DecodePath,
     OCRResult,
     Profile,
@@ -77,46 +74,22 @@ class FixedFontOCR:
             )
         self.model = load_model(Path(self.model_path))
         self.profile = self.profile or default_profile()
-        self._scorer = SegmentScorer(self.model)
-        self._normalize_spec = self.model.normalize_spec
         self._benchmark: dict[int, dict[str, float]] | None = None
         self._benchmark_error: str | None = None
         self._backend: Backend | None = None
+        self._cnn_threshold = float(self.model.config.get("cnn_threshold", 0.0))
 
+        # P0-4 backend boundary: the same backend that scores every lattice
+        # candidate is created first and injected into SegmentScorer. No OCR
+        # stage below it (and no second classification after the decoder)
+        # ever calls a classifier on its own.
         if self.model.classifier in ("tinycnn", "hybrid"):
-            self._backend: Backend = self._make_backend()
-        else:
-            if self.backend == "wgpu":
-                raise ValueError(
-                    "WGPU backend requires a tinycnn model; template models run on CPU"
-                )
-            self._classifier: Classifier = self._make_template_classifier()
-        if self.model.classifier == "hybrid":
-            self._template_classifier = self._make_template_classifier()
-            self._template_threshold = float(
-                self.model.config.get("template_threshold", 0.90)
+            self._backend = self._make_backend()
+        elif self.backend == "wgpu":
+            raise ValueError(
+                "WGPU backend requires a tinycnn model; template models run on CPU"
             )
-            self._cnn_threshold = float(
-                self.model.config.get("cnn_threshold", 0.0)
-            )
-
-    def _make_template_classifier(self) -> Classifier:
-        """Goal 9: V2 multi-prototype matcher when present, V1 otherwise."""
-        if self.model.templates_v2 is not None:
-            return TemplateV2Classifier(
-                data=self.model.templates_v2,
-                charset=self.model.charset,
-                input_size=self.model.input_size,
-                normalize_spec=self.model.normalize_spec,
-            )
-        if self.model.templates is None:
-            raise ValueError("model has no template half")
-        return TemplateClassifier(
-            templates=self.model.templates,
-            charset=self.model.charset,
-            input_size=self.model.input_size,
-            normalize_spec=self.model.normalize_spec,
-        )
+        self._scorer = SegmentScorer(self.model, cnn_backend=self._backend)
 
     # ------------------------------------------------------------------
     # Backend selection
@@ -269,74 +242,20 @@ class FixedFontOCR:
             )
             if not path.candidates:
                 continue
-            segments = [c.segment for c in path.candidates]
-            geometries = [c.normalize_geometry for c in path.candidates]
-            if self.model.classifier == "template":
-                glyphs = self._binary_glyph_batch(segments, geometries)
-                tb = self._classifier.match_batch(glyphs, allowed)
-                for i, cand in enumerate(path.candidates):
-                    cid = int(tb.ids[i])
-                    if cid < 0:
-                        decoded.append((cand, UNKNOWN_CHAR, 0.0))
-                    else:
-                        decoded.append(
-                            (
-                                cand,
-                                self.model.charset[cid],
-                                calibrate_visual(
-                                    to_confidence(float(tb.scores[i]), "template"),
-                                    self._scorer.calibration,
-                                ),
-                            )
-                        )
-            else:
-                if self.model.input_mode == "soft":
-                    glyphs = frontend.soft_glyph_batch(
-                        segments,
-                        self.model.input_size,
-                        geometries=geometries,
-                        spec=self._normalize_spec,
-                    )
-                    cnn_soft = frontend.soft_foreground
-                else:
-                    glyphs = self._binary_glyph_batch(segments, geometries)
-                    cnn_soft = None
-                if self.model.classifier == "hybrid":
-                    pairs = self._classify_hybrid(
-                        path.candidates,
-                        glyphs,
-                        allowed,
-                        soft=cnn_soft,
-                        geometries=geometries,
-                        geometry_scores=[c.geometry for c in path.candidates],
-                    )
-                else:
-                    result = self._backend.classify(glyphs)
-                    pairs = self._classify_backend(
-                        path.candidates, glyphs, result, allowed
-                    )
-                decoded.extend(
-                    (cand, char, conf)
-                    for cand, (char, conf) in zip(path.candidates, pairs)
-                )
             paths.append(path)
-            if path.char_ids:
-                start = len(decoded) - len(path.candidates)
-                for offset, cid in enumerate(path.char_ids):
-                    idx = start + offset
-                    cand, _char, conf = decoded[idx]
-                    if self._candidate_char(cand) == UNKNOWN_CHAR:
-                        # The model's unknown gate (CNN threshold / no
-                        # allowed class) stays authoritative: the decoder
-                        # may not promote a visually-gated-out character.
-                        char = UNKNOWN_CHAR
-                    else:
-                        char = (
-                            self.model.charset[int(cid)]
-                            if 0 <= int(cid) < len(self.model.charset)
-                            else UNKNOWN_CHAR
-                        )
-                    decoded[idx] = (cand, char, conf)
+            # P0-1: DecodePath is the single classification authority. The
+            # lattice candidates were classified exactly once inside
+            # segment_line(); here we only project the chosen char_ids and
+            # their own candidate.scores entries into public CharResults.
+            char_ids = path.char_ids or ()
+            for i, cand in enumerate(path.candidates):
+                cid = (
+                    int(char_ids[i])
+                    if i < len(char_ids)
+                    else self._top_char_id(cand)
+                )
+                char, conf = self._path_char_result(cand, cid)
+                decoded.append((cand, char, conf))
 
         if not decoded:
             return OCRResult(text="", confidence=0.0, chars=(), alternatives=())
@@ -373,113 +292,72 @@ class FixedFontOCR:
             charset=self.model.charset,
         )
 
-    def _binary_glyph_batch(
-        self,
-        segments: list[Component],
-        geometries: list[tuple[float, float] | None] | None = None,
-    ) -> NDArray[np.uint8]:
-        """Normalize binary candidate masks (Goal 3 baseline frame)."""
+    def _top_char_id(self, candidate: VisualCandidate) -> int:
+        """Top-1 char id used when a legacy path carries no decoder char_ids."""
+        if candidate.scores is not None and candidate.scores.char_ids:
+            return int(candidate.scores.char_ids[0])
+        if candidate.score is not None:
+            return int(getattr(candidate.score, "char_id", -1))
+        return -1
 
-        geoms = geometries or [None] * len(segments)
-        spec = self._normalize_spec
-        if spec is None:
-            return np.stack(
-                [normalize(s.mask, self.model.input_size) for s in segments]
-            )
-        return np.stack(
-            [
-                (
-                    normalize(s.mask, self.model.input_size)
-                    if g is None
-                    else normalize(
-                        s.mask,
-                        self.model.input_size,
-                        baseline_offset=g[0],
-                        scale=g[1],
-                        baseline_row=spec.baseline_row,
-                    )
-                )
-                for s, g in zip(segments, geoms)
-            ]
-        )
-
-    def _classify_backend(
+    def _chosen_geometry(
         self,
-        candidates: list[VisualCandidate],
-        glyphs: NDArray[np.uint8],
-        result,
-        allowed: set[int] | None,
-    ) -> list[tuple[str, float]]:
-        """Map a backend result to (char, confidence), masking disallowed picks."""
-        n = len(candidates)
-        if n == 0:
-            return []
-        pairs: list[tuple[str, float] | None] = [None] * n
-        remask: list[int] = []
-        for i, (_, char_id, score) in enumerate(
-            zip(candidates, result.char_ids, result.scores)
+        candidate: VisualCandidate,
+        char_id: int,
+    ) -> float:
+        """Geometry for the decoder-chosen ``(candidate, char_id)`` pair.
+
+        Mirrors the decoder: candidate-level geometry is precomputed on the
+        lattice candidate, while the character-specific half is computed for
+        this particular char_id.
+        """
+
+        base = candidate.candidate_geometry
+        if base is None:
+            # Legacy/manual candidates only carry the old full Top-1 scalar.
+            return float(candidate.geometry_score)
+        score = candidate.score
+        if (
+            score is not None
+            and getattr(score, "char_id", -1) == int(char_id)
+            and getattr(score, "score_type", "") == "template"
+            and getattr(score, "template_raw_score", 0.0) >= 1.0 - 1e-9
+            and candidate.geometry_score == 0.0
         ):
-            if allowed is None or int(char_id) in allowed:
-                pairs[i] = (
-                    self.model.charset[int(char_id)],
-                    calibrate_visual(
-                        to_confidence(float(score), "cnn"),
-                        self._scorer.calibration,
-                    ),
-                )
-            else:
-                remask.append(i)
-        if remask:
-            idx = np.asarray(remask, dtype=np.int64)
-            x = glyphs[idx].astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
-            logits = forward(x, self.model.weights)
-            for k, i in enumerate(remask):
-                char, conf = pick(logits[k], self.model.charset, allowed)
-                pairs[i] = (
-                    char,
-                    calibrate_visual(
-                        to_confidence(conf, "cnn"),
-                        self._scorer.calibration,
-                    ),
-                )
-        return [p for p in pairs if p is not None]
-
-    def _classify_hybrid(
-        self,
-        candidates: list[VisualCandidate],
-        glyphs: NDArray[np.uint8],
-        allowed: set[int] | None,
-        soft: NDArray[np.uint8] | None = None,
-        geometries: list[tuple[float, float] | None] | None = None,
-        geometry_scores: list[float] | None = None,
-    ) -> list[tuple[str, float]]:
-        """Three-level strategy: template (margin-gated) -> CNN -> unknown."""
-        if not candidates:
-            return []
-        scores = self._scorer.score(
-            [c.segment for c in candidates],
-            allowed,
-            soft=soft,
-            geometries=geometries,
+            return 0.0
+        total = base + char_geometry(
+            candidate,
+            int(char_id),
+            self.model.geometry,
+            normalize_geometry=candidate.normalize_geometry,
         )
-        if geometry_scores is not None:
-            scores = [
-                self._scorer.finalize_score(score, geometry_scores[i])
-                for i, score in enumerate(scores)
-            ]
-        pairs: list[tuple[str, float]] = []
-        for score in scores:
-            if score.char_id < 0:
-                char = UNKNOWN_CHAR
-                conf = 0.0
-            elif score.score_type == "cnn" and score.raw_score < self._cnn_threshold:
-                char = UNKNOWN_CHAR  # Level 3: unknown
-                conf = score.public_confidence
-            else:
-                char = self.model.charset[int(score.char_id)]
-                conf = score.public_confidence
-            pairs.append((char, conf))
-        return pairs
+        return float(max(total, -0.12))
+
+    def _path_char_result(
+        self,
+        candidate: VisualCandidate,
+        char_id: int,
+    ) -> tuple[str, float]:
+        """Project one decoded candidate into ``(char, confidence)``.
+
+        This performs no classifier work. It keeps the model's unknown gate
+        (no allowed class / below CNN threshold) authoritative, then uses
+        the chosen character's own Top-K visual score and its per-character
+        geometry.
+        """
+
+        if (
+            char_id < 0
+            or int(char_id) >= len(self.model.charset)
+            or self._candidate_char(candidate) == UNKNOWN_CHAR
+        ):
+            return UNKNOWN_CHAR, 0.0
+        cid = int(char_id)
+        geometry = self._chosen_geometry(candidate, cid)
+        _visual, confidence = self._scorer.finalize_char_score(
+            candidate, cid, geometry
+        )
+        return self.model.charset[cid], confidence
 
     def _candidate_char(self, candidate: VisualCandidate) -> str:
         """Visible character for one chosen lattice candidate."""

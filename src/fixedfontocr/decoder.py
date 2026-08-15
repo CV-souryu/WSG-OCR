@@ -40,9 +40,10 @@ Two search algorithms are provided:
   terms are being explored;
 * :func:`decode_beam` -- the beam-search upgrade (``beam_width`` 8..32,
   default 16) that explores complete-path hypotheses and returns the
-  runner-up texts as ``alternatives``, ranked with the full formula. The
-  exact DP stays authoritative for the best path so a fragmented
-  look-alike path cannot overturn the frozen CPU segmentation.
+  runner-up texts as ``alternatives``. Every complete path retained by the
+  beam (plus the exact-DP path as a safety net) is re-ranked with the full
+  crop-aware :func:`score_path` formula, so the complete path score -- not
+  the DP's local prefix/term bonuses -- is the final authority for ``best``.
 
 Both return a :class:`DecodePath` whose ``text`` is the visible string,
 ``char_ids`` records the chosen charset id per candidate, and
@@ -59,7 +60,7 @@ from typing import Iterable
 
 import numpy as np
 
-from .geometry import FontGeometryDatabase
+from .geometry import FontGeometryDatabase, char_geometry
 from .lexicon import Lexicon
 from .types import DecodePath, VisualCandidate, VisualLattice
 
@@ -266,35 +267,70 @@ def _candidate_geometry(
 ) -> float:
     """Geometry evidence for one candidate/character choice.
 
-    The segmentation pipeline stores the full Goal 8 geometry score on the
-    candidate; when a manually-constructed lattice omits it, the decoder
-    derives a compact bbox/aspect/ink agreement from the font geometry
-    database itself so ``geometry`` is a real decoder input.
+    Goal 20 split:
+
+    * ``candidate.candidate_geometry`` is the identity-independent half
+      computed by the segmentation pipeline (alignment, gaps, segmentation
+      width). It is computed once per candidate.
+    * ``char_geometry(candidate, char_id, ...)`` is the character-specific
+      half and is evaluated here for *every* character alternative, so a
+      lexicon-selected Top-2/Top-3 character never inherits the Top-1
+      character's bbox/aspect/ink/component geometry.
+
+    Legacy/manually-built lattices that only provide ``geometry_score`` keep
+    the old scalar full-geometry behaviour.
     """
+
+    base = candidate.candidate_geometry
+    if base is not None:
+        # Pipeline candidates have the identity-independent half precomputed.
+        # Preserve the legacy exact-template override for the top-1 char: an
+        # exact visual match proves the candidate is a real glyph, so the
+        # whole geometry term is zero for that char.
+        if _exact_template_geometry_override(candidate, int(char_id)):
+            return 0.0
+        return float(
+            max(
+                base
+                + char_geometry(
+                    candidate,
+                    int(char_id),
+                    geometry,
+                    normalize_geometry=candidate.normalize_geometry,
+                ),
+                -0.12,
+            )
+        )
 
     if candidate.geometry_score != 0.0:
         return float(candidate.geometry_score)
     if geometry is None or char_id < 0:
         return 0.0
-    entry = geometry.get(int(char_id))
     seg = candidate.segment
-    if entry is None or seg is None or seg.h < 2 or seg.w < 1:
+    if seg is None or seg.h < 2 or seg.w < 1:
         return 0.0
-    h = max(seg.h, 1)
-    w = max(seg.w, 1)
-    em = max(
-        h / max(entry.bbox_height, 1e-6),
-        w / max(entry.bbox_width, 1e-6),
-        1.0,
+    # Manual lattices without pipeline geometry still get the character-
+    # specific database agreement as a real decoder input.
+    return char_geometry(
+        candidate,
+        int(char_id),
+        geometry,
+        normalize_geometry=candidate.normalize_geometry,
     )
-    width_err = abs(w / em - entry.bbox_width) / max(entry.bbox_width, 1e-3)
-    height_err = abs(h / em - entry.bbox_height) / max(entry.bbox_height, 1e-3)
-    ink_ratio = float(seg.ink) / float(w * h)
-    ink_err = abs(ink_ratio - entry.ink_ratio) / max(entry.ink_ratio, 0.05)
-    return float(
-        -min(0.05, width_err * 0.04)
-        - min(0.04, height_err * 0.03)
-        - min(0.03, ink_err * 0.01)
+
+
+def _exact_template_geometry_override(
+    candidate: VisualCandidate,
+    char_id: int,
+) -> bool:
+    """True when the pipeline zeroed geometry for an exact template Top-1."""
+    score = candidate.score
+    return bool(
+        score is not None
+        and getattr(score, "char_id", -1) == char_id
+        and getattr(score, "score_type", "") == "template"
+        and getattr(score, "template_raw_score", 0.0) >= 1.0 - 1e-9
+        and candidate.geometry_score == 0.0
     )
 
 
@@ -579,22 +615,20 @@ def _hypothesis_path(
     return _decode_path(hyp.candidates, hyp.char_ids, charset, lattice)
 
 
-def _beam_alternatives(
+def _beam_complete_paths(
     lattice: VisualLattice | list[VisualCandidate],
     charset: list[str],
     lexicon: Lexicon | None,
     config: DecoderConfig,
     n_atoms: int,
     geometry: FontGeometryDatabase | None,
-    exclude: str,
-) -> tuple[str, ...]:
-    """Beam-search alternatives over complete paths (Goal 13 upgrade).
+) -> list[DecodePath]:
+    """All complete paths retained by the beam search.
 
-    The exact DP remains the authority for the best path (matching the
-    frozen CPU reference); this beam explores complete-path hypotheses and
-    returns the runner-up texts ranked by the public :func:`score_path`
-    formula, which is where lexicon/word-prior evidence contributes to
-    ``DecodePath.alternatives``.
+    The beam itself still uses the partial Goal 13 score as a look-ahead,
+    but this helper returns complete ``DecodePath`` objects (not just text)
+    so the caller can rank every retained path with the canonical
+    :func:`score_path` formula.
     """
 
     lat = lattice if isinstance(lattice, VisualLattice) else None
@@ -640,23 +674,20 @@ def _beam_alternatives(
         beam = new_beam[: config.beam_width]
 
     complete = [h for h in beam if h.end == n_atoms]
-    scored: list[tuple[float, DecodePath]] = []
-    seen_text: set[str] = set()
+    paths: list[DecodePath] = []
+    seen: set[tuple[str, tuple[int, ...], tuple[int, ...]]] = set()
     for hyp in complete:
         path = _hypothesis_path(hyp, charset, lat)
-        if path.text in seen_text:
+        key = (
+            path.text,
+            tuple(id(c) for c in path.candidates),
+            tuple(int(cid) for cid in path.char_ids),
+        )
+        if key in seen:
             continue
-        seen_text.add(path.text)
-        ps = score_path(path, charset, lexicon, config, geometry)
-        scored.append((ps.total, path))
-    scored.sort(key=lambda row: -row[0])
-    alternatives: list[str] = []
-    for _total, path in scored:
-        if path.text and path.text != exclude:
-            alternatives.append(path.text)
-        if len(alternatives) >= config.num_alternatives:
-            break
-    return tuple(alternatives)
+        seen.add(key)
+        paths.append(path)
+    return paths
 
 
 def decode_beam(
@@ -669,18 +700,21 @@ def decode_beam(
 ) -> DecodePath:
     """Beam-search decoder over the visual lattice (Goal 13 upgrade).
 
-    The exact DP (:func:`decode_dp`) stays the authority for the best path
-    so the frozen CPU segmentation is never overturned by a fragmented
-    look-alike path; the beam search (``beam_width`` 8..32) explores
-    complete-path hypotheses and supplies the runner-up texts as
-    ``DecodePath.alternatives``, ranked with the full Goal 13 formula.
+    The beam explores complete-path hypotheses and returns both the best
+    path and runner-up texts. Every retained complete path -- including the
+    exact-DP path as a safety net -- is ranked with the canonical complete
+    :func:`score_path` formula, so the complete crop-aware lexicon score
+    decides ``best``. The previous behaviour (the DP result always winning
+    over the beam alternatives) is intentionally gone: local DP prefix/term
+    bonuses are only a look-ahead, never the final authority.
     """
 
     lat, candidates, n_atoms = _prepare(lattice, n_components)
     if not candidates or n_atoms == 0:
         return _empty_path(lat)
     cfg = config or DecoderConfig()
-    best = decode_dp(
+
+    dp_path = decode_dp(
         lattice,
         charset,
         lexicon,
@@ -688,16 +722,59 @@ def decode_beam(
         n_components,
         geometry,
     )
-    alternatives = _beam_alternatives(
+    beam_paths = _beam_complete_paths(
         lattice,
         charset,
         lexicon,
         cfg,
         n_atoms,
         geometry,
-        exclude=best.text,
     )
-    return replace(best, alternatives=alternatives)
+
+    scored: list[tuple[float, PathScore, DecodePath]] = []
+    seen: set[tuple[str, tuple[int, ...], tuple[int, ...]]] = set()
+    for path in [dp_path, *beam_paths]:
+        if not path.candidates:
+            continue
+        key = (
+            path.text,
+            tuple(id(c) for c in path.candidates),
+            tuple(int(cid) for cid in path.char_ids),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        ps = score_path(path, charset, lexicon, cfg, geometry)
+        scored.append((ps.total, ps, path))
+    if not scored:
+        return dp_path
+
+    # Full-path score is the only final authority. Tie-break deterministically
+    # toward fewer candidates and then lexicographically by visible text.
+    scored.sort(
+        key=lambda row: (
+            -row[0],
+            len(row[2].candidates),
+            row[2].text,
+        )
+    )
+    best_total, best_ps, best_path = scored[0]
+    alternatives: list[str] = []
+    for _total, _ps, path in scored:
+        if (
+            path.text
+            and path.text != best_path.text
+            and path.text not in alternatives
+        ):
+            alternatives.append(path.text)
+        if len(alternatives) >= cfg.num_alternatives:
+            break
+    return replace(
+        best_path,
+        mean_score=float(best_total),
+        confidence=float(np.clip(best_ps.visual, 0.0, 1.0)),
+        alternatives=tuple(alternatives),
+    )
 
 
 def decode_lattice(

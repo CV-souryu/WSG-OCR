@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from .backends import Backend, CPUBackend
 from .classifier import (
     DOWNSAMPLE_CLEAN,
     TemplateClassifier,
@@ -35,7 +36,7 @@ from .preprocess import (
     normalize,
     normalize_grayscale,
 )
-from .types import CandidateScore, ClassificationBatch, VisualScores
+from .types import CandidateScore, ClassificationBatch, VisualCandidate, VisualScores
 
 
 @dataclass(frozen=True)
@@ -477,9 +478,16 @@ def _soft_glyph_batch(
 
 
 class SegmentScorer:
-    """Batch-scorer used by the segmentation DP for one model."""
+    """Batch-scorer used by the segmentation DP for one model.
 
-    def __init__(self, model: OCRModel):
+    ``cnn_backend`` is the CNN executor for TinyCNN/hybrid models. The CPU
+    reference passes :class:`CPUBackend`; WGPU runs use :class:`WGPUBackend`
+    (or :class:`AutoBackend`) with the exact same OCR algorithm. This class
+    never imports/calls ``cnn.forward`` directly -- all CNN evidence enters
+    through the backend boundary.
+    """
+
+    def __init__(self, model: OCRModel, cnn_backend: Backend | None = None):
         self.model = model
         self.input_size = model.input_size
         self.normalize_spec = model.normalize_spec
@@ -500,6 +508,12 @@ class SegmentScorer:
         else:
             self.template = None
         self.weights = prepare_weights(model.weights) if model.weights else None
+        if self.weights is not None:
+            self.cnn_backend: Backend | None = cnn_backend or CPUBackend(
+                model.weights, model.input_size
+            )
+        else:
+            self.cnn_backend = None
         self.template_threshold = float(model.config.get("template_threshold", 0.90))
         self.template_margin_threshold = float(
             model.config.get("template_margin_threshold", 0.04)
@@ -897,8 +911,6 @@ class SegmentScorer:
         allowed_ids: set[int] | None,
         soft_batch: np.ndarray | None = None,
     ) -> ClassificationBatch:
-        from .cnn import forward
-
         if allowed_ids is not None and not allowed_ids:
             n = soft_batch.shape[0] if soft_batch is not None else glyphs.shape[0]
             return ClassificationBatch(
@@ -911,9 +923,10 @@ class SegmentScorer:
                 topk_logits=np.empty((n, 0), dtype=np.float32),
                 logits=None,
             )
+        if self.cnn_backend is None:
+            raise ValueError("CNN backend is required for a TinyCNN/hybrid model")
         cnn_input = soft_batch if soft_batch is not None else glyphs
-        x = cnn_input.astype(np.float32)[:, None, :, :] * (1.0 / 255.0)
-        logits = forward(x, self.weights)
+        logits = self.cnn_backend.forward_logits(cnn_input)
         if allowed_ids is not None:
             masked = np.full_like(logits, -np.inf)
             idx = np.fromiter(sorted(allowed_ids), dtype=np.int64)
@@ -978,3 +991,64 @@ class SegmentScorer:
             geometry_contribution=geometry_contribution,
             visual_scores=vs,
         )
+
+    def classifier_score_for(
+        self,
+        candidate: VisualCandidate,
+        char_id: int,
+    ) -> float:
+        """Classifier-only fused score of one chosen ``(candidate, char_id)``.
+
+        This is the Top-K entry from ``candidate.scores`` (before the
+        geometry term), so choosing the decoder's Top-2/Top-3 character
+        reports that character's own visual score -- never the Top-1 score
+        with a different label attached.
+        """
+
+        scores = candidate.scores
+        if scores is not None and scores.char_ids:
+            logits = scores.logits or ()
+            for i, cid in enumerate(scores.char_ids):
+                if int(cid) == int(char_id):
+                    if i < len(logits):
+                        return float(logits[i])
+                    # Manual VisualScores may only carry the finalized Top-1
+                    # scalar; remove the geometry contribution before the
+                    # caller adds the chosen character's geometry back.
+                    if i == 0:
+                        visual = float(scores.visual_score)
+                        if scores.geometry_included:
+                            visual -= (
+                                self.visual_weights.geometry
+                                * float(scores.geometry_score)
+                            )
+                        return visual
+                    return 0.0
+        score = candidate.score
+        if score is not None and getattr(score, "char_id", -1) == int(char_id):
+            return float(score.classifier_visual_score)
+        return 0.0
+
+    def finalize_char_score(
+        self,
+        candidate: VisualCandidate,
+        char_id: int,
+        geometry_score: float,
+    ) -> tuple[float, float]:
+        """Return ``(visual_score, confidence)`` for a chosen character.
+
+        The decoder owns *which* character was chosen; this method only adds
+        the geometry term and calibration to that character's own Top-K
+        visual score, without running any classifier a second time.
+        """
+
+        classifier_score = self.classifier_score_for(candidate, char_id)
+        visual = float(
+            np.clip(
+                classifier_score
+                + self.visual_weights.geometry * float(geometry_score),
+                0.0,
+                1.0,
+            )
+        )
+        return visual, self.calibration(visual)

@@ -206,13 +206,13 @@ def test_recognize_feeds_soft_glyphs_to_cnn(font_path, monkeypatch):
         pytest.skip("cnn_digits fixture not generated; run scripts/train_tinycnn.py")
 
     captured: dict[str, np.ndarray | None] = {}
-    original = CPUBackend.classify
+    original = CPUBackend.forward_logits
 
     def spy(self, glyphs):
         captured["glyphs"] = np.asarray(glyphs)
         return original(self, glyphs)
 
-    monkeypatch.setattr(CPUBackend, "classify", spy)
+    monkeypatch.setattr(CPUBackend, "forward_logits", spy)
     ocr = FixedFontOCR(model_path=model_dir, backend="cpu")
     image = render_text("42", font_path)
     result = ocr.recognize(image)

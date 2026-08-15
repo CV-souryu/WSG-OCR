@@ -147,6 +147,17 @@ class VisualCandidate:
     geometry_score: float = 0.0
     scores: VisualScores | None = None
     score: Any | None = None
+    # Goal 20 geometry split: identity-independent candidate geometry
+    # (alignment / gaps / segmentation width) is computed once during
+    # segmentation. ``None`` means "not computed" (legacy/manual lattices);
+    # character-specific geometry is always evaluated by the decoder for
+    # the chosen ``(candidate, char_id)`` pair. These fields intentionally
+    # live after the pre-existing positional fields for compatibility.
+    candidate_geometry: float | None = None
+    # Negative generic merge-width penalty used by candidate_geometry.
+    # char_geometry adds it back when the font database says the chosen
+    # glyph is legitimately multi-component.
+    segmentation_width_penalty: float = 0.0
 
     def __post_init__(self) -> None:
         if self.bbox is None and self.segment is not None:

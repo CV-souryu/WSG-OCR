@@ -25,8 +25,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .decoder import DecoderConfig, decode_beam
-from .geometry import FontGeometryDatabase
+from .decoder import DecoderConfig, decode_beam, decode_dp
+from .geometry import FontGeometryDatabase, char_geometry
 from .lexicon import Lexicon, load_lexicon
 from .preprocess import (
     Segment,
@@ -410,35 +410,32 @@ def _vertical_gap(a: Component, b: Component) -> int:
     return max(a.y, b.y) - min(a.y + a.h, b.y + b.h)
 
 
-def geometry_score(
+def candidate_geometry(
     candidate: VisualCandidate,
     comps: list[Component],
     profile: Profile,
-    geometry: FontGeometryDatabase | None = None,
-    char_id: int | None = None,
-    normalize_geometry: tuple[float, float] | None = None,
 ) -> float:
-    """Small geometric adjustments on top of the classifier visual score.
+    """Identity-independent geometry evidence for one lattice candidate.
 
-    Penalties are deliberately small (<= 0.06) so the classifier remains the
-    dominant signal, but they break ties between a fragmented glyph path and
-    its merged candidate and keep clearly-adjacent characters apart. With a
-    Goal 8 database the score also compares the candidate's bbox, ink ratio,
-    component count and baseline against the classifier's Top-1 character:
-    a narrow ``1/I/l`` prior is never treated like a full-width CJK glyph.
+    This half of the Goal 8 geometry score is deliberately independent of
+    the chosen character: vertical alignment with the line band, internal
+    gaps inside a merged candidate, and a generic segmentation-width
+    penalty. Character-specific evidence (bbox / aspect / ink ratio /
+    component count / baseline) is computed separately by
+    :func:`fixedfontocr.geometry.char_geometry` for every
+    ``(candidate, char_id)`` choice made by the decoder.
+
+    The generic merge-width penalty is recorded on the candidate
+    (``segmentation_width_penalty``); ``char_geometry`` adds it back when
+    the font database identifies the chosen glyph as legitimately
+    multi-component.
     """
 
     score = 0.0
+    candidate.segmentation_width_penalty = 0.0
     seg = candidate.segment
     if seg is None:
         return score
-    if char_id is None and candidate.score is not None:
-        char_id = getattr(candidate.score, "char_id", None)
-    entry = (
-        geometry.get(int(char_id))
-        if geometry is not None and char_id is not None and char_id >= 0
-        else None
-    )
 
     # Vertical alignment: character centers should sit in one band.
     centers = [c.y + c.h / 2 for c in comps]
@@ -457,88 +454,56 @@ def geometry_score(
         score -= min(0.04, excess * 0.01)
 
         # Merged candidates much wider than the line's typical glyph are
-        # almost always two adjacent characters. Goal 14 exception: a font
-        # glyph whose database entry is itself multi-component (小/鲃/潜 are
-        # 3-4 components in this font) is legitimately much wider than any
-        # single fragment of it; the generic heuristic would double-penalize
-        # the correct merged candidate and let a fragmented look-alike path
-        # win at small sizes. The database's component count is the
-        # authoritative prior here.
-        expected_cc = max(1, entry.component_count) if entry is not None else 1
-        actual_cc = max(1, len(candidate.components))
-        if expected_cc <= 1 or actual_cc <= 1:
-            heights = [c.h for c in comps]
-            median_h = float(np.median(heights))
-            typical = [
-                c.w for c in comps if c.h >= max(2, 0.5 * median_h)
-            ]
-            expected = float(np.median(typical)) if typical else float(median_h)
-            if seg.w > expected * 1.9:
-                score -= 0.05
+        # almost always two adjacent characters. The character-specific
+        # exception (a font glyph that is itself multi-component) is handled
+        # by char_geometry using segmentation_width_penalty.
+        heights = [c.h for c in comps]
+        median_h = float(np.median(heights))
+        typical = [
+            c.w for c in comps if c.h >= max(2, 0.5 * median_h)
+        ]
+        expected = float(np.median(typical)) if typical else float(median_h)
+        if seg.w > expected * 1.9:
+            width_penalty = -0.05
+            score += width_penalty
+            candidate.segmentation_width_penalty = width_penalty
 
+    return max(score, -0.10)
+
+
+def geometry_score(
+    candidate: VisualCandidate,
+    comps: list[Component],
+    profile: Profile,
+    geometry: FontGeometryDatabase | None = None,
+    char_id: int | None = None,
+    normalize_geometry: tuple[float, float] | None = None,
+) -> float:
+    """Small geometric adjustments on top of the classifier visual score.
+
+    Compatibility wrapper around the Goal 20 geometry split:
+
+        total = candidate_geometry(candidate, comps, profile)
+              + char_geometry(candidate, char_id, geometry, normalize_geometry)
+
+    Candidate geometry is identity-independent; the second term is evaluated
+    for the chosen ``char_id``. The decoder never calls this wrapper -- it
+    uses the stored candidate geometry and computes ``char_geometry`` for
+    every ``(candidate, char_id)`` alternative itself.
+    """
+
+    score = candidate_geometry(candidate, comps, profile)
     if geometry is None:
-        return max(score, -0.10)
-    if char_id is None or char_id < 0:
-        return max(score, -0.10)
-    if entry is None:
-        return max(score, -0.10)
-
-    h = max(seg.h, 1)
-    w = max(seg.w, 1)
-    em = max(
-        h / max(entry.bbox_height, 1e-6),
-        w / max(entry.bbox_width, 1e-6),
-        1.0,
-    )
-    w_ratio = w / em
-    h_ratio = h / em
-    width_err = abs(w_ratio - entry.bbox_width) / max(entry.bbox_width, 1e-3)
-    height_err = abs(h_ratio - entry.bbox_height) / max(entry.bbox_height, 1e-3)
-    aspect = w / h
-    aspect_err = (
-        abs(np.log(max(aspect / max(entry.aspect_ratio, 1e-3), 1e-3)))
-        if entry.aspect_ratio > 0
-        else 0.0
-    )
-    score -= min(0.05, width_err * 0.04)
-    score -= min(0.04, height_err * 0.03)
-    score -= min(0.03, aspect_err * 0.02)
-    advance_err = abs(w_ratio - entry.advance) / max(entry.advance, 1e-3)
-    score -= min(0.02, advance_err * 0.01)
-
-    ink_ratio = float(seg.mask.sum()) / float(w * h)
-    ink_err = abs(ink_ratio - entry.ink_ratio) / max(entry.ink_ratio, 0.05)
-    score -= min(0.03, ink_err * 0.01)
-
-    # Component-count prior: a fragmented glyph whose Top-1 needs 3
-    # components is penalized; a merge whose components match the glyph is
-    # not. Split whole-component alternatives (atoms > components) are
-    # exempt because they still represent the original connected glyph.
-    expected_cc = max(1, entry.component_count)
-    actual_cc = max(1, len(candidate.components))
-    start, end = candidate.atom_span
-    is_split_whole = end - start > actual_cc
-    if not is_split_whole:
-        if actual_cc > 1 and expected_cc == 1:
-            score -= min(0.04, (actual_cc - 1) * 0.02)
-        elif actual_cc == 1 and expected_cc > 1:
-            score -= min(0.03, (expected_cc - 1) * 0.015)
-        elif expected_cc == actual_cc and actual_cc > 1:
-            # Goal 14 merge agreement: the chosen character's database
-            # entry expects exactly the number of components this candidate
-            # merged (小/鲃/获/得 at low resolution). That agreement is
-            # positive evidence for a real fragmented glyph, so it offsets
-            # the generic merge penalties above; without it the correct
-            # whole-glyph candidate keeps losing to look-alike single-char
-            # fragments (小 -> fj\, 鲃 -> $8) at 12-18 px.
-            score += min(0.05, (actual_cc - 1) * 0.025)
-
-    if normalize_geometry is not None:
-        baseline_offset = float(normalize_geometry[0])
-        if 0.0 < baseline_offset <= h * 1.5 and 0.0 < entry.baseline_ratio <= 1.5:
-            cand_ratio = baseline_offset / h
-            score -= min(0.02, abs(cand_ratio - entry.baseline_ratio) * 0.02)
-
+        return score
+    if char_id is None and candidate.score is not None:
+        char_id = getattr(candidate.score, "char_id", None)
+    if char_id is not None and int(char_id) >= 0:
+        score += char_geometry(
+            candidate,
+            int(char_id),
+            geometry,
+            normalize_geometry=normalize_geometry,
+        )
     return max(score, -0.12)
 
 
@@ -554,6 +519,14 @@ def build_lattice(
         width=line.w if line is not None else 0,
         height=line.h if line is not None else 0,
     )
+
+
+def _top_candidate_char_id(candidate: VisualCandidate) -> int:
+    if candidate.scores is not None and candidate.scores.char_ids:
+        return int(candidate.scores.char_ids[0])
+    if candidate.score is not None:
+        return int(getattr(candidate.score, "char_id", -1))
+    return -1
 
 
 def decode(
@@ -625,6 +598,7 @@ def decode(
     return DecodePath(
         candidates=tuple(chosen),
         mean_score=float(dp_sum[n_atoms] / dp_cnt[n_atoms]),
+        char_ids=tuple(_top_candidate_char_id(c) for c in chosen),
         lattice=lattice,
     )
 
@@ -645,12 +619,13 @@ def segment_line(
     is passed to the scorer so the TinyCNN scores soft-normalized glyphs
     while the template path keeps using binary glyphs.
 
-    Goal 13: when ``lexicon`` or ``decoder_config`` is provided the line is
-    decoded with the joint decoder (beam search by default) over the scored
-    lattice, so lexicon/word-prior evidence and the segmentation penalty
-    participate in the path choice and ``DecodePath.alternatives`` is
-    populated. Without either argument the legacy visual DP
-    (:func:`decode`) is kept for callers that only score segmentation.
+    Goal 13/P0-3: with a ``lexicon`` the line is decoded by
+    :func:`decode_beam` over the scored lattice, and the beam's complete
+    ``score_path()`` ranking is authoritative. With ``decoder_config`` but
+    no lexicon, the joint formula is evaluated by the exact
+    :func:`decode_dp` (no beam-only segmentation artefacts). Without either
+    argument the legacy visual DP (:func:`decode`) is kept for callers that
+    only score segmentation.
     """
 
     comps = connected_components(line)
@@ -707,27 +682,39 @@ def segment_line(
     else:
         geometries = [None] * len(candidates)
     scores = scorer.score(segments, allowed_ids, soft=soft, geometries=geometries)
+    geometry_db = getattr(scorer, "geometry", None)
     for cand, raw_score, geom in zip(candidates, scores, geometries):
-        geometry = geometry_score(
+        # Goal 20 geometry split: compute the identity-independent half once
+        # here, then store only that half on the candidate. The decoder asks
+        # char_geometry(candidate, char_id) for every character alternative,
+        # so a Top-2/Top-3 lexicon choice never reuses the Top-1 geometry.
+        cand_base = candidate_geometry(cand, comps, profile)
+        char_geom = char_geometry(
             cand,
-            comps,
-            profile,
-            geometry=getattr(scorer, "geometry", None),
-            char_id=raw_score.char_id,
+            raw_score.char_id,
+            geometry_db,
             normalize_geometry=geom,
         )
+        geometry = max(cand_base + char_geom, -0.12)
         # An exact visual match (template distance 0) is authoritative: the
         # candidate *is* a real glyph, so merge/split geometry penalties must
-        # not let a fragmented path of weaker look-alikes win the DP.
-        if (
+        # not let a fragmented path of weaker look-alikes win the DP. This
+        # compatibility override only freezes the candidate-level half (and
+        # the legacy Top-1 total); the decoder still evaluates the character-
+        # specific half for alternative char_ids.
+        exact_match = (
             raw_score.score_type == "template"
             and raw_score.template_raw_score >= 1.0 - 1e-9
-        ):
+        )
+        if exact_match:
             geometry = 0.0
+            cand_base = 0.0
+            cand.segmentation_width_penalty = 0.0
         score = scorer.finalize_score(raw_score, geometry)
+        cand.candidate_geometry = cand_base
         cand.score = score
         cand.scores = score.visual_scores
-        cand.geometry = geometry
+        cand.geometry_score = geometry
         cand.normalize_geometry = geom
     candidates = _drop_weak_merges(candidates, scorer, comps, profile)
     if not candidates:
@@ -737,13 +724,12 @@ def segment_line(
             lattice=build_lattice(comps, [], line),
         )
     lattice = build_lattice(comps, candidates, line)
-    if lexicon is not None or decoder_config is not None:
+    geometry_db = getattr(scorer, "geometry", None)
+    if lexicon is not None:
         lex = (
             lexicon
             if isinstance(lexicon, Lexicon)
             else load_lexicon(lexicon)
-            if lexicon is not None
-            else None
         )
         cfg = decoder_config or DecoderConfig()
         return decode_beam(
@@ -751,7 +737,18 @@ def segment_line(
             scorer.model.charset,
             lex,
             cfg,
-            geometry=getattr(scorer, "geometry", None),
+            geometry=geometry_db,
+        )
+    if decoder_config is not None:
+        # Explicit joint decoding without a lexicon uses the exact DP. The
+        # beam is reserved for lexicon decoding, where the complete
+        # score_path() lexicon term is the final authority (P0-3).
+        return decode_dp(
+            lattice,
+            scorer.model.charset,
+            None,
+            decoder_config,
+            geometry=geometry_db,
         )
     return decode(lattice)
 

@@ -27,7 +27,10 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from .defaults import compute_font_sha256, resolve_font
+from .types import VisualCandidate
 
 FORMAT = "goal8-geometry-v1"
 
@@ -198,6 +201,100 @@ class FontGeometryDatabase:
     @classmethod
     def load(cls, path: str | Path) -> "FontGeometryDatabase":
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def char_geometry(
+    candidate: VisualCandidate,
+    char_id: int,
+    geometry: FontGeometryDatabase | None,
+    normalize_geometry: tuple[float, float] | None = None,
+) -> float:
+    """Character-specific geometry agreement for one ``(candidate, char_id)``.
+
+    This is the identity-dependent half of the Goal 8 geometry score:
+    expected bbox / aspect / advance / ink ratio / component count /
+    baseline are compared against the font geometry entry of the character
+    actually chosen by the decoder. Candidate-level evidence (alignment,
+    component gaps, segmentation width) lives in
+    :func:`fixedfontocr.segmentation.candidate_geometry` and is intentionally
+    absent here.
+    """
+
+    if geometry is None or char_id is None or int(char_id) < 0:
+        return 0.0
+    entry = geometry.get(int(char_id))
+    seg = candidate.segment
+    if entry is None or seg is None or seg.h < 1 or seg.w < 1:
+        return 0.0
+    if normalize_geometry is None:
+        normalize_geometry = candidate.normalize_geometry
+
+    h = max(seg.h, 1)
+    w = max(seg.w, 1)
+    em = max(
+        h / max(entry.bbox_height, 1e-6),
+        w / max(entry.bbox_width, 1e-6),
+        1.0,
+    )
+    w_ratio = w / em
+    h_ratio = h / em
+    width_err = abs(w_ratio - entry.bbox_width) / max(entry.bbox_width, 1e-3)
+    height_err = abs(h_ratio - entry.bbox_height) / max(entry.bbox_height, 1e-3)
+    aspect = w / h
+    aspect_err = (
+        abs(np.log(max(aspect / max(entry.aspect_ratio, 1e-3), 1e-3)))
+        if entry.aspect_ratio > 0
+        else 0.0
+    )
+    score = 0.0
+    score -= min(0.05, width_err * 0.04)
+    score -= min(0.04, height_err * 0.03)
+    score -= min(0.03, aspect_err * 0.02)
+    advance_err = abs(w_ratio - entry.advance) / max(entry.advance, 1e-3)
+    score -= min(0.02, advance_err * 0.01)
+
+    ink_ratio = float(seg.mask.sum()) / float(w * h)
+    ink_err = abs(ink_ratio - entry.ink_ratio) / max(entry.ink_ratio, 0.05)
+    score -= min(0.03, ink_err * 0.01)
+
+    # Component-count prior: a fragmented glyph whose chosen character needs
+    # several components is penalized; a merge whose components match the
+    # glyph is rewarded. Split whole-component alternatives (atoms >
+    # components) are exempt because they still represent the original
+    # connected glyph.
+    expected_cc = max(1, entry.component_count)
+    actual_cc = max(1, len(candidate.components))
+    # If candidate_geometry penalized a merged candidate for being wider
+    # than the line's typical glyph, that generic penalty is identity-
+    # independent evidence. A database entry with a multi-component glyph
+    # (小/鲃/潜) is the authoritative exception: add the penalty back here,
+    # exactly matching the Goal 14 split between the two geometry halves.
+    if len(candidate.components) > 1 and expected_cc > 1:
+        score -= candidate.segmentation_width_penalty
+    start, end = candidate.atom_span
+    is_split_whole = end - start > actual_cc
+    if not is_split_whole:
+        if actual_cc > 1 and expected_cc == 1:
+            score -= min(0.04, (actual_cc - 1) * 0.02)
+        elif actual_cc == 1 and expected_cc > 1:
+            score -= min(0.03, (expected_cc - 1) * 0.015)
+        elif expected_cc == actual_cc and actual_cc > 1:
+            # Goal 14 merge agreement: the chosen character's database
+            # entry expects exactly the number of components this candidate
+            # merged (小/鲃/获/得 at low resolution). That agreement is
+            # positive evidence for a real fragmented glyph, so it offsets
+            # the generic merge penalties; without it the correct
+            # whole-glyph candidate keeps losing to look-alike single-char
+            # fragments (小 -> fj\, 鲃 -> $8) at 12-18 px.
+            score += min(0.05, (actual_cc - 1) * 0.025)
+
+    if normalize_geometry is not None:
+        baseline_offset = float(normalize_geometry[0])
+        if 0.0 < baseline_offset <= h * 1.5 and 0.0 < entry.baseline_ratio <= 1.5:
+            cand_ratio = baseline_offset / h
+            score -= min(0.02, abs(cand_ratio - entry.baseline_ratio) * 0.02)
+
+    return float(score)
 
 
 def _connected_count(mask) -> int:

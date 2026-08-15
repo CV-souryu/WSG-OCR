@@ -22,6 +22,7 @@ import pytest
 from PIL import Image
 
 from fixedfontocr import FixedFontOCR
+from fixedfontocr.backends import Backend
 from fixedfontocr.cnn import TinyCNNClassifier, forward
 from fixedfontocr.defaults import (
     CPU_FREEZE,
@@ -34,8 +35,9 @@ from fixedfontocr.frontend import extract_frontend
 from fixedfontocr.model import load_model
 from fixedfontocr.postprocess import topk
 from fixedfontocr.preprocess import find_lines
+from fixedfontocr.scorer import SegmentScorer
 from fixedfontocr.segmentation import build_candidates, connected_components
-from fixedfontocr.types import profile_from_dict
+from fixedfontocr.types import Component, profile_from_dict
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -294,3 +296,59 @@ def test_regression_dataset_complete():
             assert sample.get("known_failure_note"), sample["file"]
     known = [s for s in samples if s.get("known_failure")]
     assert known, "corpus must keep honest known-failure entries"
+
+
+def test_recognize_classifies_lattice_once_and_never_reclassifies(make_ocr, monkeypatch):
+    """P0-1: classification happens for all lattice candidates, not again
+    for the few candidates selected by the decoder."""
+
+    sample = _sample("synthetic/mixed_16.png")
+    ocr = make_ocr(sample)
+    calls: list[int] = []
+    original = SegmentScorer.score
+
+    def spy(self, segments, *args, **kwargs):
+        calls.append(len(segments))
+        return original(self, segments, *args, **kwargs)
+
+    monkeypatch.setattr(SegmentScorer, "score", spy)
+    result = ocr.recognize(_image(sample["file"]))
+    assert result.text == sample["expected"]
+    # One line -> exactly one batched scoring pass (over the full lattice).
+    # The pre-P0-1 pipeline made a second pass here over just the chosen
+    # path candidates.
+    assert len(calls) == 1
+    assert calls[0] > len(result.path.candidates)
+
+
+def test_segment_scorer_uses_injected_cnn_backend(monkeypatch):
+    """P0-4: SegmentScorer never reaches around its backend to cnn.forward."""
+
+    model_dir = ROOT / "tests" / "fixtures" / "cnn_digits"
+    if not (model_dir / "config.json").exists():
+        pytest.skip("cnn_digits fixture not generated")
+    model = load_model(model_dir)
+
+    class DummyBackend(Backend):
+        def __init__(self):
+            self.calls = 0
+
+        def classify(self, glyphs):
+            raise AssertionError("SegmentScorer must not use backend.classify")
+
+        def forward_logits(self, glyphs):
+            self.calls += 1
+            return np.zeros((glyphs.shape[0], 10), dtype=np.float32)
+
+    backend = DummyBackend()
+    scorer = SegmentScorer(model, cnn_backend=backend)
+    glyph = Component(
+        mask=np.ones((12, 8), dtype=bool),
+        x=0,
+        y=0,
+        w=8,
+        h=12,
+    )
+    scores = scorer.score([glyph])
+    assert len(scores) == 1
+    assert backend.calls == 1

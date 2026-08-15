@@ -221,13 +221,18 @@ total = visual + geometry + lexicon + word_prior - segmentation_penalty
 `decode_dp` is the first-version exact dynamic program (its state keeps the
 lexicon prefix trie node); `decode_beam` is the beam-search upgrade
 (`beam_width` 8..32, default 16) that supplies `DecodePath.alternatives`.
-The exact DP stays authoritative for the best path so the frozen CPU
-segmentation regressions are never overturned by a fragmented look-alike
-path; the beam's runner-up texts are ranked with the full formula.
-`recognize(..., lexicon=...)` runs the joint decoder and the chosen
-characters (`DecodePath.char_ids`) are authoritative, while `apply_lexicon`
-still handles strict mode and the Goal 12 `matched_term`/`matched_span`
-annotation.
+`decode_beam` re-ranks every retained complete path with the full
+crop-aware `score_path` formula, so a path whose complete partial-word
+lexicon score is higher can overturn a path that only looked better from
+DP-local prefix/term bonuses. `segment_line` invokes the beam when a
+lexicon is supplied; without a lexicon it uses the exact DP path as the
+frozen CPU segmentation reference.
+
+`segment_line` classifies the whole candidate lattice once; `recognize`
+then projects `DecodePath.char_ids` and the chosen `candidate.scores`
+entries straight into `CharResult` -- there is no second classification of
+the decoder-selected glyphs. `apply_lexicon` still handles strict mode and
+the Goal 12 `matched_term`/`matched_span` annotation.
 
 ## Cross-frame tracking (Goal 16)
 

@@ -570,18 +570,17 @@ class TemplateV2Classifier(Classifier):
         bottom = np.empty(n, dtype=np.uint8)
         right = np.empty(n, dtype=np.uint8)
         for ci in range(c):
-            # NOTE: the historical batch version unpacked along axis=1 of
-            # the [C, P, B] payload (the prototype axis), which scrambles
-            # the bit layout of the coarse features. That layout is only a
-            # prefilter (the exact XOR/popcount fallback decides the real
-            # Top-K), but it is reproduced exactly here per character
-            # (axis=0 of the [P, B] slice) so the features stay
-            # byte-identical.
+            # Unpack along the byte axis so each feature row/column is a
+            # real pixel row/column of the prototype bitmap. (The historical
+            # batch version unpacked along the prototype axis, which
+            # scrambled the positional features and made the coarse filter
+            # reject every real-game glyph -- every candidate then fell
+            # through to the full ink-band exact scan.)
             bits = (
-                np.unpackbits(self.data.bits[ci], axis=0, bitorder="little")[
-                    : self.input_size * self.input_size
+                np.unpackbits(self.data.bits[ci], axis=1, bitorder="little")[
+                    :, : self.input_size * self.input_size
                 ]
-                .reshape(-1, self.input_size, self.input_size)
+                .reshape(p, self.input_size, self.input_size)
                 .astype(np.bool_)
             )
             sl = slice(ci * p, (ci + 1) * p)

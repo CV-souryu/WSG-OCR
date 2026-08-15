@@ -713,13 +713,23 @@ spacing, and normalized size. Pass a custom profile to
   (8 B/char) and numpy ≥ 2.0 uses `bitwise_count` instead of the 64 KiB
   popcount table; `tools/benchmark/footprint.py` reports storage/memory.
 - Template matching streams its XOR/popcount pass in 2048-prototype
-  chunks and the coarse-filter features are fetched once per batch
-  instead of once per candidate, and the load-time prototype unpack runs
-  one character at a time. Peak RSS for recognizing a full roster line
-  dropped from ~258 MB to ~109 MB (model load from ~163 MB to ~59 MB)
-  with byte-identical features and scores, while the template stage got
-  ~27% faster (133.6 → 97.7 ms median on the recorded benchmark; total
-  168.3 → 129.2 ms).
+  chunks, the coarse-filter features are fetched once per batch instead
+  of once per candidate, and the load-time prototype unpack runs one
+  character at a time. Peak RSS for recognizing a full roster line
+  dropped from ~258 MB to ~109 MB (model load from ~163 MB to ~59 MB).
+- CPU speedups (byte-identical outputs; 628 tests + the 235-crop corpus
+  regression hold): the FontGeometryDatabase narrow/full aggregate ratios
+  are cached once instead of recomputed per access (lattice_generation
+  13.2 → 0.36 ms), per-char minima use `np.minimum.reduceat` over the
+  char-ordered prototype blocks (~0.17 → ~0.01 ms per call), and the
+  coarse filter's feature unpack now runs along the byte axis — the
+  historical prototype-axis unpack scrambled the positional features so
+  real-game glyphs never passed the filter and every candidate fell
+  through to the full ink-band exact scan. Recorded benchmark total
+  168.3 → 95.3 ms (template 133.6 → 80.3 ms); real-game corpus: items
+  14.6 → 10.2 ms/张, full lines 108.1 → 72.6 ms. The exact scan remains
+  ink-band bound (~57k of 92.8k prototypes per candidate on game crops),
+  so further CPU gains need parallelism or the WGPU path (Goal 20).
 - Next milestones (after the Goal 19 CPU freeze): Goal 20 WGPU phase 2
   (DP-selected candidates back into the WGSL classifier, shader fusion,
   GPU preprocessing) and real-screenshot corpus accumulation to 500+/1000+.

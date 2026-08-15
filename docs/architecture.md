@@ -59,6 +59,15 @@ the source font's SHA256 as `font_sha256`.
 | `src/fixedfontocr/cli.py` | `fixedfontocr-generate` command-line entry point. |
 | `tools/register_font.py` | Adds a font under `fonts/` to `fonts/registry.json` with its SHA256. |
 
+The word lists consumed by the lexicon come from the raw game corpus in
+`data/cn/`: `ship_h.json` (`title`, original ship names) →
+`charsets/words/ship_names.txt`, `ship.json` (`title`, harmonized ship
+names) → `charsets/words/ship_names_harmonized.txt`, `equip.json`
+(`title`) → `charsets/words/equipment_names.txt`, and `language.json`
+(`schinese`) → `charsets/words/ui_texts.txt`. `tools/charset/export_names.py`
+regenerates these word lists (deduplicated, one word per line,
+rich-text color codes stripped); see the README "Game corpus" section.
+
 ## Pipeline
 
 ```

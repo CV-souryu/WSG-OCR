@@ -36,6 +36,7 @@ and a WGPU compute backend, and the engine benchmarks them at startup so
 ├── charsets/            # charset assets (English names, no spaces)
 │   ├── words/           #   generated word lists: one word per line
 │   └── sets/            #   single-line OCR charsets (combined.txt default)
+├── data/                # raw game config dumps + generated training datasets
 ├── tools/               # dev-only pipeline (PyTorch + Pillow), grouped:
 │   ├── charset/         #   export_names.py + extract_charset.py
 │   ├── dataset/         #   generate_font_dataset.py + collect_real_samples.py
@@ -340,6 +341,31 @@ ocr.recognize(frame, allowed_chars=None)             # full charset
 
 Characters outside the set are never emitted; positions with no surviving
 candidate become `"?"` with confidence 0.
+
+## Game corpus（游戏语料）
+
+The raw game corpus is `data/cn/`, a set of Unity `JsonUtility` config dumps
+(numeric dict keys are unquoted, so they are read with the tolerant parser in
+`tools/charset/extract_charset.py`). Each file contributes one extracted word
+list and one OCR charset:
+
+| raw source (`data/cn/`) | field | extracted word list | runtime domain |
+| --- | --- | --- | --- |
+| `ship_h.json` | `title`（原版舰名） | `charsets/words/ship_names.txt` | `ships` |
+| `ship.json` | `title`（和谐后舰名） | `charsets/words/ship_names_harmonized.txt` | `ships` |
+| `equip.json` | `title`（装备名） | `charsets/words/equipment_names.txt` | `equipment` |
+| `language.json` | `schinese`（UI 文案） | `charsets/words/ui_texts.txt` | `ui` |
+
+`tools/charset/export_names.py` regenerates the word lists: it strips
+rich-text color codes (`^C...`), deduplicates strings in first-seen order and
+writes one word per line. `tools/charset/extract_charset.py` then derives the
+single-line OCR charsets in `charsets/sets/` from those word lists, and
+`src/fixedfontocr/lexicon.py` loads the word lists by domain at runtime
+(`ships` merges the original and harmonized ship-name lists).
+
+`data/cn/` also holds generated training artifacts (`.npz` synthetic/real
+glyph datasets, `.pth` checkpoints, `game_cn` runtime models); those are
+derived data, not the source corpus.
 
 ## Training and export pipeline
 

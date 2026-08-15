@@ -630,7 +630,7 @@ spacing, and normalized size. Pass a custom profile to
   corroborate a low-margin CNN pick instead of discarding it, the font
   geometry score stops double-penalizing multi-component glyphs (小/鲃/潜)
   and rewards an exact component-count match, and the game-sample corpus
-  grew to 37 images with per-sample lexicon annotations.
+  carries per-sample lexicon annotations for the Goal 14/15 battery.
 - Goal 15 lexicon/visual priority is implemented: the lexicon may annotate
   or help only when the visual evidence is uncertain. Confident visible
   text is never rewritten, dictionary corrections require the target to be
@@ -648,6 +648,13 @@ spacing, and normalized size. Pass a custom profile to
   pure single-frame API. `tests/test_goal16_cross_frame.py` pins caching,
   ROI change flags, the `巴尔的摩 / 巴你的摩 / 巴尔的摩` stabilization
   example and tracker reset.
+- Goal 19 CPU freeze is complete: the numpy CPU pipeline is the canonical
+  implementation (`src/fixedfontocr/defaults.py`: `CPU_FREEZE = True`,
+  version 1.0, 2026-08-15). `tests/test_goal19_cpu_freeze.py` pins every
+  freeze checkbox — segmentation lattice stability, 鲃/小, low-res
+  `Z17`/`巴尔的摩`, mixed charset, Top-K API, lexicon decoder,
+  partial-word, the complete CPU benchmark and the complete regression
+  dataset — so WGPU work (Goal 20) starts from a stable reference.
 - Template (with coarse candidate filtering), TinyCNN CPU and TinyCNN WGPU
   are implemented and tested on Latin and CJK.
 - `backend="auto"` benchmarks CPU vs WGPU at construction and selects per
@@ -657,5 +664,6 @@ spacing, and normalized size. Pass a custom profile to
 - Template coarse features are stored in compact uint8/uint16 arrays
   (8 B/char) and numpy ≥ 2.0 uses `bitwise_count` instead of the 64 KiB
   popcount table; `tools/benchmark/footprint.py` reports storage/memory.
-- Next milestones: real-screenshot collection at scale, shader fusion
-  (fewer dispatches) and GPU preprocessing.
+- Next milestones (after the Goal 19 CPU freeze): Goal 20 WGPU phase 2
+  (DP-selected candidates back into the WGSL classifier, shader fusion,
+  GPU preprocessing) and real-screenshot corpus accumulation to 500+/1000+.

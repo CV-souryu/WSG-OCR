@@ -22,6 +22,30 @@ CHARSET_PATH = PROJECT_ROOT / "charsets" / "sets" / "combined.txt"
 MODEL_PATH = PROJECT_ROOT / "model" / "game_cn"
 TEMPLATE_MODEL_PATH = PROJECT_ROOT / "model" / "game_cn_template"
 
+# Goal 19: CPU Freeze.
+#
+# The numpy CPU pipeline is the canonical implementation of the OCR
+# contract: the model format, the public API, the regression corpus and the
+# benchmark suite below define the reference that any optional backend
+# (e.g. WGPU, Goal 20) must match. Formal WGPU work starts only after this
+# freeze; ``CPU_FREEZE_CONDITIONS`` mirrors the ten checkboxes in
+# ``fonts/goal`` and each one is pinned by ``tests/test_goal19_cpu_freeze.py``.
+CPU_FREEZE = True
+CPU_FREEZE_VERSION = "1.0"
+CPU_FREEZE_DATE = "2026-08-15"
+CPU_FREEZE_CONDITIONS = (
+    "segmentation_lattice_stable",
+    "fragmented_glyphs_solved",
+    "low_res_z17_stable",
+    "baltimore_stable",
+    "mixed_charset_stable",
+    "topk_api_stable",
+    "lexicon_decoder_stable",
+    "partial_word_stable",
+    "cpu_benchmark_complete",
+    "regression_dataset_complete",
+)
+
 
 @functools.lru_cache(maxsize=64)
 def compute_font_sha256(font_path: str | Path) -> str:

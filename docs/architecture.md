@@ -712,14 +712,23 @@ The level badges are also training data:
 at one pixel, forming a single connected component at both scales, so they
 are excluded from the passing set.
 
-## CPU freeze checklist
+## Goal 19: CPU freeze (complete)
 
-The CPU route is the golden reference for future WGPU TinyCNN work,
-dictionary decoding and beam search. Freeze criteria and where each is
+The numpy CPU route is the canonical implementation of the OCR contract:
+the model format, the public API, the regression corpus and the benchmark
+suite define the reference that every optional backend must match. Goal 19
+is frozen (`src/fixedfontocr/defaults.py`:
+`CPU_FREEZE = True`, version `1.0`, 2026-08-15) and
+`tests/test_goal19_cpu_freeze.py` is the gate that re-checks every
+checkbox: segmentation lattice stability, 鲃/小, low-res Z17/巴尔的摩,
+mixed charset, Top-K, lexicon decoder, partial-word, the complete CPU
+benchmark and the complete regression dataset. Formal WGPU work
+(Goal 20) starts only from this freeze. Freeze criteria and where each is
 verified:
 
 | Criterion | Evidence |
 | --- | --- |
+| Goal 19 freeze gate | `tests/test_goal19_cpu_freeze.py` (19 tests: marker + checklist, lattice, 鲃/小, Z17, 巴尔的摩, mixed charset, Top-K API, lexicon decoder, partial-word, benchmark JSON, manifest) |
 | 鲃/小 no longer need morphology special-casing | `tests/test_segmentation.py::test_acceptance_does_not_need_stroke_width_special_case` |
 | Adjacent Chinese characters are not merged | `tests/test_segmentation.py::test_adjacent_chinese_characters_not_merged` |
 | Template + TinyCNN stable | margin-aware hybrid gate (`tests/test_scorer.py`), full suite green |

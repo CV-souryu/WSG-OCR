@@ -26,7 +26,10 @@ know which backend is active.
 The production recognizer now segments with the candidate lattice + visual
 DP (see `architecture.md`); the WGPU re-integration that feeds the
 DP-selected candidates back into the WGSL classifier is the next phase and
-is intentionally not part of this CPU freeze.
+is intentionally not part of this CPU freeze. The Goal 19 CPU freeze is
+complete: the numpy CPU pipeline is the canonical implementation, and this
+re-integration is the formal WGPU phase (Goal 20) that starts from that
+freeze.
 
 ## Data layout
 

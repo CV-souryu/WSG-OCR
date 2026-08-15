@@ -708,6 +708,14 @@ spacing, and normalized size. Pass a custom profile to
 - Template coarse features are stored in compact uint8/uint16 arrays
   (8 B/char) and numpy ≥ 2.0 uses `bitwise_count` instead of the 64 KiB
   popcount table; `tools/benchmark/footprint.py` reports storage/memory.
+- Template matching streams its XOR/popcount pass in 2048-prototype
+  chunks and the coarse-filter features are fetched once per batch
+  instead of once per candidate, and the load-time prototype unpack runs
+  one character at a time. Peak RSS for recognizing a full roster line
+  dropped from ~258 MB to ~109 MB (model load from ~163 MB to ~59 MB)
+  with byte-identical features and scores, while the template stage got
+  ~27% faster (133.6 → 97.7 ms median on the recorded benchmark; total
+  168.3 → 129.2 ms).
 - Next milestones (after the Goal 19 CPU freeze): Goal 20 WGPU phase 2
   (DP-selected candidates back into the WGSL classifier, shader fusion,
   GPU preprocessing) and real-screenshot corpus accumulation to 500+/1000+.

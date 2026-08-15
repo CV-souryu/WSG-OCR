@@ -18,6 +18,11 @@ DOWNSAMPLE_BILINEAR = 0
 DOWNSAMPLE_AREA = 1
 DOWNSAMPLE_CLEAN = 2
 
+# Prototypes per XOR/popcount pass in the streamed exact-distance scan.
+# Keeps the transient diff (uint64 [chunk, 9]) at ~150 KB while a full
+# 92k-prototype scan stays vectorized and cache-resident.
+_TEMPLATE_DIST_CHUNK = 2048
+
 
 @dataclass(frozen=True)
 class TemplateBatch:
@@ -544,32 +549,64 @@ class TemplateV2Classifier(Classifier):
         return base + off
 
     def _build_features(self) -> dict[str, NDArray]:
-        """Coarse per-prototype features (same compact dtypes as V1)."""
-        bits = (
-            np.unpackbits(self.data.bits, axis=1, bitorder="little")[
-                :, : self.input_size * self.input_size
-            ]
-            .reshape(-1, self.input_size, self.input_size)
-            .astype(np.bool_)
-        )
-        ink = bits.sum(axis=(1, 2))
-        rows = bits.any(axis=2)
-        cols = bits.any(axis=1)
-        ys = np.argmax(rows, axis=1)
-        xs = np.argmax(cols, axis=1)
-        bottom = np.full(len(bits), self.input_size - 1, dtype=np.int32)
-        right = np.full(len(bits), self.input_size - 1, dtype=np.int32)
-        for i in range(len(bits)):
-            bottom[i] = int(np.where(rows[i])[0][-1])
-            right[i] = int(np.where(cols[i])[0][-1])
+        """Coarse per-prototype features (same compact dtypes as V1).
+
+        Prototypes are unpacked one character at a time, so the load-time
+        transient stays at ~28 KB instead of one full ``[C*P, 24, 24]``
+        bool expansion (~53 MB for the 1894-char game model). The output
+        arrays are byte-identical to the batch version.
+        """
+
+        c = self.data.num_classes
+        p = self.data.prototypes_per_char
+        n = c * p
+        last_ink_row = np.empty(n, dtype=np.int32)
+        last_ink_col = np.empty(n, dtype=np.int32)
+        ink = np.empty(n, dtype=np.uint16)
+        h = np.empty(n, dtype=np.uint8)
+        w = np.empty(n, dtype=np.uint8)
+        top = np.empty(n, dtype=np.uint8)
+        left = np.empty(n, dtype=np.uint8)
+        bottom = np.empty(n, dtype=np.uint8)
+        right = np.empty(n, dtype=np.uint8)
+        for ci in range(c):
+            # NOTE: the historical batch version unpacked along axis=1 of
+            # the [C, P, B] payload (the prototype axis), which scrambles
+            # the bit layout of the coarse features. That layout is only a
+            # prefilter (the exact XOR/popcount fallback decides the real
+            # Top-K), but it is reproduced exactly here per character
+            # (axis=0 of the [P, B] slice) so the features stay
+            # byte-identical.
+            bits = (
+                np.unpackbits(self.data.bits[ci], axis=0, bitorder="little")[
+                    : self.input_size * self.input_size
+                ]
+                .reshape(-1, self.input_size, self.input_size)
+                .astype(np.bool_)
+            )
+            sl = slice(ci * p, (ci + 1) * p)
+            rows = bits.any(axis=2)
+            cols = bits.any(axis=1)
+            ys = np.argmax(rows, axis=1)
+            xs = np.argmax(cols, axis=1)
+            ink[sl] = bits.sum(axis=(1, 2)).astype(np.uint16)
+            for i in range(p):
+                last_ink_row[ci * p + i] = int(np.where(rows[i])[0][-1])
+                last_ink_col[ci * p + i] = int(np.where(cols[i])[0][-1])
+            top[sl] = ys
+            left[sl] = xs
+        h[:] = (last_ink_row - top + 1).astype(np.uint8)
+        w[:] = (last_ink_col - left + 1).astype(np.uint8)
+        bottom[:] = (self.input_size - 1 - last_ink_row).astype(np.uint8)
+        right[:] = (self.input_size - 1 - last_ink_col).astype(np.uint8)
         return {
-            "ink": ink.astype(np.uint16),
-            "h": (bottom - ys + 1).astype(np.uint8),
-            "w": (right - xs + 1).astype(np.uint8),
-            "top": ys.astype(np.uint8),
-            "left": xs.astype(np.uint8),
-            "bottom": (self.input_size - 1 - bottom).astype(np.uint8),
-            "right": (self.input_size - 1 - right).astype(np.uint8),
+            "ink": ink,
+            "h": h,
+            "w": w,
+            "top": top,
+            "left": left,
+            "bottom": bottom,
+            "right": right,
         }
 
     def _glyph_features_impl(
@@ -597,10 +634,26 @@ class TemplateV2Classifier(Classifier):
     def _distances(
         self, bits_row: NDArray[np.uint64], prototypes: NDArray[np.int64]
     ) -> NDArray[np.int32]:
-        """Exact XOR + popcount distances for one glyph vs prototype subset."""
-        template_bits = self._template_bits[prototypes]
-        diff = np.asarray(bits_row).reshape(1, -1) ^ template_bits
-        return self._popcount16(diff).sum(axis=1).astype(np.int32)
+        """Exact XOR + popcount distances for one glyph vs prototype subset.
+
+        The XOR is streamed in chunks so the transient never exceeds a few
+        hundred KB even for a full-charset scan (a [P, 9] uint64 diff over
+        all 92k prototypes is ~6.7 MB per candidate); the chunked pass also
+        stays cache-resident. The popcount sum is an exact integer total,
+        so chunking cannot change any score.
+        """
+
+        if prototypes.size <= _TEMPLATE_DIST_CHUNK:
+            diff = np.asarray(bits_row).reshape(1, -1) ^ self._template_bits[
+                prototypes
+            ]
+            return self._popcount16(diff).sum(axis=1).astype(np.int32)
+        parts: list[NDArray[np.int32]] = []
+        for s in range(0, prototypes.size, _TEMPLATE_DIST_CHUNK):
+            seg = prototypes[s : s + _TEMPLATE_DIST_CHUNK]
+            diff = np.asarray(bits_row).reshape(1, -1) ^ self._template_bits[seg]
+            parts.append(self._popcount16(diff).sum(axis=1))
+        return np.concatenate(parts).astype(np.int32)
 
     def _popcount16(self, words: NDArray[np.uint64]) -> NDArray[np.int32]:
         if self._popcount_table is None:
@@ -616,28 +669,56 @@ class TemplateV2Classifier(Classifier):
             + self._popcount_table[top]
         ).astype(np.int32)
 
+    def _filter_features(
+        self, prototypes: NDArray[np.int64]
+    ) -> tuple[
+        NDArray[np.int32],
+        NDArray[np.int16],
+        NDArray[np.int16],
+        NDArray[np.int16],
+        NDArray[np.int16],
+        NDArray[np.int16],
+        NDArray[np.int16],
+    ]:
+        """Pre-fetched coarse features for a prototype subset.
+
+        The arrays depend only on the prototype set, so a batch computes
+        them once and reuses them for every candidate (fancy-indexing six
+        ~92k-element arrays per candidate was ~1.5 MB of transient churn
+        per glyph).
+        """
+
+        f = self._features
+        return (
+            f["ink"][prototypes].astype(np.int32),
+            f["h"][prototypes].astype(np.int16),
+            f["w"][prototypes].astype(np.int16),
+            f["top"][prototypes].astype(np.int16),
+            f["left"][prototypes].astype(np.int16),
+            f["bottom"][prototypes].astype(np.int16),
+            f["right"][prototypes].astype(np.int16),
+        )
+
     def _filter_mask(
         self,
         feats: dict[str, int],
         ink_tol: int,
-        prototypes: NDArray[np.int64],
+        f_ink: NDArray[np.int32],
+        f_h: NDArray[np.int16],
+        f_w: NDArray[np.int16],
+        f_top: NDArray[np.int16],
+        f_left: NDArray[np.int16],
+        f_bottom: NDArray[np.int16],
+        f_right: NDArray[np.int16],
     ) -> NDArray[np.bool_]:
-        f = self._features
-        ink = f["ink"][prototypes].astype(np.int32)
-        h = f["h"][prototypes].astype(np.int16)
-        w = f["w"][prototypes].astype(np.int16)
-        top = f["top"][prototypes].astype(np.int16)
-        left = f["left"][prototypes].astype(np.int16)
-        bottom = f["bottom"][prototypes].astype(np.int16)
-        right = f["right"][prototypes].astype(np.int16)
         return (
-            (np.abs(ink - feats["ink"]) <= ink_tol)
-            & (np.abs(h - feats["h"]) <= 1)
-            & (np.abs(w - feats["w"]) <= 1)
-            & (np.abs(top - feats["top"]) <= 2)
-            & (np.abs(left - feats["left"]) <= 2)
-            & (np.abs(bottom - feats["bottom"]) <= 2)
-            & (np.abs(right - feats["right"]) <= 2)
+            (np.abs(f_ink - feats["ink"]) <= ink_tol)
+            & (np.abs(f_h - feats["h"]) <= 1)
+            & (np.abs(f_w - feats["w"]) <= 1)
+            & (np.abs(f_top - feats["top"]) <= 2)
+            & (np.abs(f_left - feats["left"]) <= 2)
+            & (np.abs(f_bottom - feats["bottom"]) <= 2)
+            & (np.abs(f_right - feats["right"]) <= 2)
         )
 
     @staticmethod
@@ -722,6 +803,10 @@ class TemplateV2Classifier(Classifier):
         fill = area + 1
         proto_ink = self._features["ink"][proto_ids].astype(np.int32)
         glyph_bool = glyphs > 0
+        filter_feats = (
+            self._filter_features(proto_ids) if self.candidate_filter else None
+        )
+        dists = np.full(proto_ids.size, fill, dtype=np.int32)
 
         out_ids = np.empty((n, k), dtype=np.int32)
         out_scores = np.empty((n, k), dtype=np.float32)
@@ -736,9 +821,9 @@ class TemplateV2Classifier(Classifier):
 
         for i in range(n):
             feats, ink_tol = self._glyph_features_impl(glyph_bool[i])
-            dists = np.full(proto_ids.size, fill, dtype=np.int32)
+            dists[:] = fill
             if self.candidate_filter:
-                ok = self._filter_mask(feats, ink_tol, proto_ids)
+                ok = self._filter_mask(feats, ink_tol, *filter_feats)
                 tight = proto_ids[ok]
                 if tight.size:
                     dists[ok] = self._distances(words[i], tight)
@@ -756,7 +841,7 @@ class TemplateV2Classifier(Classifier):
                     dists[idx] = self._distances(words[i], proto_ids[idx])
                 self.last_candidates = int(tight.size)
             else:
-                dists = self._distances(words[i], proto_ids)
+                dists[:] = self._distances(words[i], proto_ids)
                 kth = fill
 
             per_char = self._char_min(

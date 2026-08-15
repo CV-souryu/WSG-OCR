@@ -167,3 +167,64 @@ def test_touching_zdigit_crops_resolve_in_dict_mode():
             f"{name}: expected {expected[name]!r} from the CSV, "
             f"got matched_term={result.matched_term!r} text={result.text!r}"
         )
+
+
+def test_ncc_evidence_cached_per_glyph_and_char():
+    """NCC evidence is memoized: each (glyph, char) pair is scanned once.
+
+    The 乌戈里尼 crop's visible text (，2*维瓦尔迪) puts ~94 terms on the
+    candidate table; the uncached arbitration re-scanned the same prototype
+    stacks thousands of times. The counting proxy pins the cache contract:
+    no (glyph, char) pair may be evaluated twice, and the result must equal
+    the real bank's.
+    """
+
+    if not (BANK.is_file() and (CROPS / "1_y400_y428_item1.png").is_file()):
+        pytest.skip("crops_items corpus/bank not present (local dataset)")
+    from PIL import Image
+
+    from fixedfontocr import FixedFontOCR
+    from fixedfontocr.frontend import extract_frontend
+    from fixedfontocr.lexicon import _ncc_assoc_match, load_lexicon
+    from fixedfontocr.realglyphs import resize24
+
+    ocr = FixedFontOCR(model_path=ROOT / "model" / "game_cn", backend="cpu")
+    bank = load_real_glyphs(BANK)
+    assert bank is not None
+    img = np.asarray(
+        Image.open(CROPS / "1_y400_y428_item1.png").convert("RGB"),
+        dtype=np.uint8,
+    )
+    frontend = extract_frontend(img, ocr.profile)
+    result = ocr.recognize(img)
+    soft_glyphs = [
+        resize24(
+            frontend.soft_foreground[
+                cand.segment.y : cand.segment.y + cand.segment.h,
+                cand.segment.x : cand.segment.x + cand.segment.w,
+            ]
+        )
+        for cand in result.path.candidates
+    ]
+    lex = load_lexicon("ship_names")
+    expected = _ncc_assoc_match(result, lex, bank, soft_glyphs)
+
+    calls: list[tuple[int, str]] = []
+
+    class CountingBank:
+        def best_evidence(self, glyph, char):
+            calls.append((id(glyph), char))
+            return bank.best_evidence(glyph, char)
+
+    got = _ncc_assoc_match(result, lex, CountingBank(), soft_glyphs)
+    assert got == expected
+    assert calls, "arbitration must evaluate some evidence"
+    assert len(set(calls)) == len(calls), (
+        "each (glyph, char) pair must be evaluated exactly once: "
+        f"{len(calls)} calls, {len(set(calls))} unique"
+    )
+    # The crop's visible text shares characters with ~94 terms; without the
+    # cache the same evidence would be re-evaluated once per term per
+    # position (~3900 scans). The memoized pass evaluates exactly
+    # glyphs x union-of-term-chars pairs (1169 for this crop).
+    assert len(calls) < 2000

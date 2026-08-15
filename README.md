@@ -623,7 +623,11 @@ spacing, and normalized size. Pass a custom profile to
   `tools/lexicon/build_real_glyph_bank.py` from labeled crops) runs the
   same alignment with NCC evidence from real game glyphs -- game renders
   vs game renders, no font-render domain gap (resolves the 初雪/白雪/
-  夕雾 same-shape ties). On the 244 real ship-name crops it annotates 235/244
+  夕雾 same-shape ties). NCC evidence is memoized per (glyph, character)
+  pair, so crops whose visible characters are common (尔/维 → ~94 candidate
+  terms) scan each prototype stack once instead of once per term
+  (乌戈里尼 crop arbitration 115.8 → 21.1 ms). On the 244 real ship-name
+  crops it annotates 235/244
   correctly with zero wrong associations (the rest are rejected as
   unreadable). `tests/test_dict_mode.py` pins the contract.
 - Touching-game-glyph merges are vetoed for hybrid models: real-game

@@ -994,6 +994,20 @@ def _ncc_assoc_match(
     for ch in set(text):
         candidates |= index.get(ch, set())
 
+    # NCC evidence is a pure function of (glyph position, character), and
+    # dozens of candidate terms share the same visible characters (common
+    # chars like 尔/维 put ~100 terms on the table for one crop). Without
+    # the cache every term re-scans the same prototype stacks, which turned
+    # the 乌戈里尼 crop's arbitration into a ~116 ms scan of ~3900 repeated
+    # NCC evaluations instead of ~200 unique ones.
+    evidence: dict[tuple[int, str], float | None] = {}
+
+    def glyph_evidence(i: int, ch: str) -> float | None:
+        key = (i, ch)
+        if key not in evidence:
+            evidence[key] = bank.best_evidence(soft_glyphs[i], ch)
+        return evidence[key]
+
     best: tuple[float, str, int, int, int] | None = None
     second = -1.0
     for term in candidates:
@@ -1003,7 +1017,7 @@ def _ncc_assoc_match(
         for i in range(m):
             d: dict[str, float] = {}
             for ch in term_chars:
-                ev = bank.best_evidence(soft_glyphs[i], ch)
+                ev = glyph_evidence(i, ch)
                 if ev is not None:
                     d[ch] = ev
             positions.append(d)

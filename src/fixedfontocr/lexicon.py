@@ -39,6 +39,7 @@ import numpy as np
 
 from .defaults import PROJECT_ROOT
 from .types import CharResult, LexiconMatch, OCRResult
+from . import realglyphs as _realglyphs
 
 WORDS_DIR = PROJECT_ROOT / "charsets" / "words"
 
@@ -71,10 +72,32 @@ SHIP_LEXICON_FILES: tuple[str, ...] = (
     "ship_names_harmonized.txt",
 )
 
-LEXICON_MODES = ("none", "prefer", "topk", "strict")
+LEXICON_MODES = ("none", "prefer", "topk", "strict", "dict")
 TOP_K_GUESS = 3
 TOP_K_GUESS_MIN_SCORE = 0.6
 TOP_K_GUESS_UNIQUE_MARGIN = 0.02
+
+# ``dict`` mode (associative dictionary inference): the visible text is
+# scanned position by position and every dictionary term that can explain
+# it -- exact, cropped, confusable or partially damaged -- competes as a
+# word hypothesis. The winner becomes ``matched_term``; without any
+# surviving hypothesis the whole result is rejected (empty output).
+DICT_GAP_PEN = 0.18          # dictionary char with no visible evidence
+DICT_SUB_PEN = 0.06          # visible char replaced by a Top-K confusable
+DICT_DROP_PEN = 0.18         # per dropped residue char, scaled by the
+                             # explained term span (mprime)
+DICT_LEN_PEN = 0.15          # per-char penalty when term is shorter than text
+DICT_MIN_SCORE = 0.50        # acceptance floor for multi-char terms
+DICT_MIN_SCORE_SINGLE = 0.80  # stricter floor for single-char terms
+DICT_UNIQUE_MARGIN = 0.02    # best hypothesis must beat the runner-up term
+DICT_FORCE_FLOOR = 0.32      # evidence floor for forced (unverified) chars
+DICT_FORCE_CONF_CAP = 2      # max conflicting visible positions when forcing
+DICT_FORCE_NEED_MATCH = 0.75  # matched-position mean required for forcing
+DICT_MAX_DROPS = 2           # max visible chars dropped anywhere
+DICT_MATCH_MEAN_MIN = 0.70   # matched-char mean evidence floor (regular)
+DICT_CONTEXT_BONUS = 0.04    # tie-break bonus for caller-supplied context terms
+DICT_VERIFY_TEMPLATE_MIN = 0.60  # forced target must be template-plausible
+DICT_TOP_K = 5               # per-position visual Top-K consulted
 
 
 def normalize_text(text: str) -> str:
@@ -537,6 +560,492 @@ def _topk_rank_weight(
     return 0.35
 
 
+# ---------------------------------------------------------------------------
+# ``dict`` mode: associative dictionary inference (triggered whole-word match)
+# ---------------------------------------------------------------------------
+#
+# Scanning C2 (or a confusable of C2) must put the whole term C1C2C3 on the
+# table: every term that can explain the visible string -- exact, cropped at
+# either edge, confusable (substitution) or partially damaged (forced
+# completion of a unique prefix/suffix) -- competes as one word hypothesis.
+# The visible ``text`` is never rewritten; the winner is annotated as
+# ``matched_term``/``matched_span`` and, when no hypothesis survives, the
+# whole result is rejected (dictionary mode emits nothing unless a word
+# matches).
+
+
+def _dict_evidence(
+    result: OCRResult,
+    charset: list[str] | None,
+) -> list[dict[str, float]]:
+    """Per-position visual support for the decoded path (Goal 1 Top-K).
+
+    Each visible position maps candidate characters to a rank/confidence
+    weight: rank 0 -> 1.0, rank 1 -> 0.85, rank 2 -> 0.70, rank 3 -> 0.55,
+    rank 4 -> 0.40, scaled by ``0.5 + 0.5 * confidence``.
+    """
+
+    n = len(result.text)
+    positions: list[dict[str, float]] = [{} for _ in range(n)]
+    if not n:
+        return positions
+    if (
+        charset
+        and result.path is not None
+        and len(result.path.candidates) == n
+    ):
+        for i, cand in enumerate(result.path.candidates):
+            scores = cand.scores
+            if scores is None or not scores.char_ids:
+                continue
+            conf = (
+                float(result.chars[i].confidence)
+                if i < len(result.chars)
+                else 0.5
+            )
+            for rank, cid in enumerate(scores.char_ids[:DICT_TOP_K]):
+                cid = int(cid)
+                if 0 <= cid < len(charset):
+                    positions[i][charset[cid]] = _dict_rank_weight(
+                        rank, conf
+                    )
+    return positions
+
+
+def _dict_rank_weight(rank: int, confidence: float) -> float:
+    """Visual support of one Top-K rank, softened by the char confidence."""
+
+    table = (1.0, 0.85, 0.70, 0.55, 0.40)
+    return table[min(rank, len(table) - 1)] * (0.5 + 0.5 * confidence)
+
+
+def _dict_char_index(lex: Lexicon) -> dict[str, set[str]]:
+    """char -> set of terms containing it (candidate-term prefilter)."""
+
+    index: dict[str, set[str]] = {}
+    for term in lex.terms:
+        for ch in set(term):
+            index.setdefault(ch, set()).add(term)
+    return index
+
+
+def _dict_align(
+    inner: str,
+    inner_pos: list[dict[str, float]],
+    term: str,
+    k: int,
+) -> tuple[float, int, int, float, int] | None:
+    """Align ``inner`` into ``term[k:]`` with confusable/drop/gap tolerance.
+
+    Returns ``(score, mprime, drops, matched_mean, subs)`` of the best
+    alignment or ``None``: a visible char matches its term char, is
+    substituted by a Top-K confusable (``DICT_SUB_PEN``, at most two), is
+    dropped as a residue *anywhere* in the string (``DICT_DROP_PEN``, at
+    most ``DICT_MAX_DROPS`` -- a glyph fragmented into two positions drops
+    its sliver), or skips a dictionary char as a gap (``DICT_GAP_PEN``, at
+    most two gaps). ``matched_mean`` is the mean evidence of the visible
+    chars that actually matched (drops do not dilute it), and ``subs``
+    counts the confusable substitutions.
+    """
+
+    mi = len(inner)
+    best: tuple[float, int, int, float, int] | None = None
+    # mprime term chars are covered: every non-dropped visible char matches
+    # (or substitutes) one term position, plus ``g`` dictionary gaps.
+    for mprime in range(
+        max(1, mi - DICT_MAX_DROPS),
+        min(len(term) - k, mi + 2) + 1,
+    ):
+        net = mprime - mi  # gaps - drops
+        for g in range(max(0, net), min(2, net + DICT_MAX_DROPS) + 1):
+            v = g - net
+            if v < 0 or v > DICT_MAX_DROPS:
+                continue
+            inf = -1e9
+            dp = np.full((mi + 1, g + 1, v + 1, 3), inf)
+            dp[0, 0, 0, 0] = 0.0
+            for i in range(mi):
+                for gg in range(g + 1):
+                    for vv in range(v + 1):
+                        for ss in range(3):
+                            cur = dp[i, gg, vv, ss]
+                            if cur <= inf / 2:
+                                continue
+                            # Term position after i visible chars: drops do
+                            # not consume term chars, gaps do.
+                            pos = i - vv + gg
+                            if pos < mprime:
+                                target = term[k + pos]
+                                ev = inner_pos[i].get(target)
+                                if ev is not None:
+                                    if target == inner[i]:
+                                        dp[i + 1, gg, vv, ss] = max(
+                                            dp[i + 1, gg, vv, ss], cur + ev
+                                        )
+                                    elif ss < 2:
+                                        dp[i + 1, gg, vv, ss + 1] = max(
+                                            dp[i + 1, gg, vv, ss + 1],
+                                            cur + ev - DICT_SUB_PEN,
+                                        )
+                            if vv < v:
+                                dp[i + 1, gg, vv + 1, ss] = max(
+                                    dp[i + 1, gg, vv + 1, ss],
+                                    cur - DICT_DROP_PEN,
+                                )
+                            if gg < g:
+                                dp[i, gg + 1, vv, ss] = max(
+                                    dp[i, gg + 1, vv, ss],
+                                    cur - DICT_GAP_PEN,
+                                )
+            for ss in range(3):
+                if dp[mi, g, v, ss] > inf / 2:
+                    score = dp[mi, g, v, ss] / mprime
+                    n_matched = mi - v
+                    matched_mean = (
+                        dp[mi, g, v, ss]
+                        + DICT_DROP_PEN * v
+                        + DICT_GAP_PEN * g
+                        + DICT_SUB_PEN * ss
+                    ) / max(1, n_matched)
+                    if best is None or score > best[0]:
+                        best = (score, mprime, v, matched_mean, ss)
+    return best
+
+
+def _dict_kind(text: str, term: str, k: int, mprime: int) -> str:
+    """Goal 11/12 alignment kind of an associative hypothesis.
+
+    In ``dict`` mode ``"exact"`` covers the whole term (possibly through a
+    Top-K confusable), while the crop kinds name which term side is cut off
+    by the visible crop.
+    """
+
+    if text == term:
+        return "exact"
+    if k == 0 and k + mprime == len(term):
+        # Whole term covered by a substitution-corrected visible string.
+        return "exact"
+    if k == 0:
+        return "prefix_crop"
+    if k + mprime == len(term):
+        return "suffix_crop"
+    return "inner_crop"
+
+
+def assoc_match(
+    result: OCRResult,
+    lex: Lexicon,
+    charset: list[str] | None = None,
+    context_terms: Iterable[str] = (),
+) -> LexiconMatch | None:
+    """Best associative dictionary hypothesis for one decoded result.
+
+    Combines the regular alignment (edge residues dropped, confusables
+    substituted, small gaps) with forced completion: when the matched part
+    is strong and the term is the unique continuation of a scanned
+    prefix/suffix, up to ``DICT_FORCE_CONF_CAP`` conflicting visible
+    positions and a few unverified term characters are accepted at the
+    ``DICT_FORCE_FLOOR`` evidence level. Returns ``None`` when no unique
+    hypothesis clears the floors. ``context_terms`` (e.g. the neighboring
+    list rows' already-resolved terms) receive a small ranking bonus that
+    only breaks near-ties.
+    """
+
+    matched, _forced, _conflicts = _assoc_match(
+        result, lex, charset, context_terms
+    )
+    return matched
+
+
+def _assoc_match(
+    result: OCRResult,
+    lex: Lexicon,
+    charset: list[str] | None = None,
+    context_terms: Iterable[str] = (),
+) -> tuple[LexiconMatch | None, bool, tuple[tuple[int, str], ...]]:
+    """``assoc_match`` plus the winner's source.
+
+    Returns ``(match, forced, conflicts)``: ``forced`` marks a winner from
+    forced completion, and ``conflicts`` lists the ``(position, target
+    char)`` pairs that had no visual Top-K evidence (used by the caller's
+    image-verification pass).
+    """
+
+    text = normalize_text(result.text)
+    if not text:
+        return None, False, ()
+    positions = _dict_evidence(result, charset)
+    m = len(text)
+    if m != len(positions):
+        return None, False, ()
+    context: frozenset[str] = frozenset(context_terms)
+
+    index = _dict_char_index(lex)
+    candidates: set[str] = set()
+    for ch in set(text):
+        candidates |= index.get(ch, set())
+
+    # term -> list of (score, k, mprime, drops, forced, subs) hypotheses.
+    hypotheses: dict[str, list[tuple[float, int, int, int, int, int]]] = {}
+
+    for term in candidates:
+        n = len(term)
+        rows: list[tuple[float, int, int, int, int, int]] = []
+        # --- regular alignment: confusables substituted, residues dropped
+        # anywhere (a glyph fragmented into two positions drops its
+        # sliver), small dictionary gaps ---
+        for k in range(0, n):
+            aligned = _dict_align(text, positions, term, k)
+            if aligned is None:
+                continue
+            score, mprime, drops, matched_mean, subs = aligned
+            # A single aligned char must not free-ride the middle of a
+            # longer term (e.g. 灶 alone can never explain 女灶神), but a
+            # prefix/suffix crop of one char stays valid.
+            if m - drops < 2 and k > 0 and k + mprime < n:
+                continue
+            # Most of the visible string must be explained: residues may be
+            # dropped, but the matched part must stay the majority, so a
+            # lucky 2-char overlap cannot claim a 4-char garbage string.
+            # Exactly half is accepted only when every matched char is
+            # exact (a pure split-garbage crop like 灶7 -> Z17).
+            frac = (m - drops) / m
+            if frac < 0.5 or (frac == 0.5 and subs > 0):
+                continue
+            # Drops may explain residues, never weak matches: the chars
+            # that DID match must be visually strong on their own.
+            if matched_mean < DICT_MATCH_MEAN_MIN:
+                continue
+            # Term shorter than the *effective* visible length (drops are
+            # already penalized per character, so they do not count twice).
+            if n < m - drops:
+                score -= DICT_LEN_PEN * (m - drops - n)
+            rows.append((score, k, mprime, drops, 0, subs, ()))
+        # --- forced completion: prefix/suffix window, conflict-aware ---
+        for k in (0, max(0, n - m)):
+            matched = 0.0
+            n_matched = 0
+            conflicts = 0
+            for i in range(min(m, n - k)):
+                ev = positions[i].get(term[k + i])
+                if ev is not None:
+                    matched += ev - (
+                        DICT_SUB_PEN if term[k + i] != text[i] else 0.0
+                    )
+                    n_matched += 1
+                else:
+                    conflicts += 1
+            if n_matched == 0:
+                continue
+            unseen = n - (k + min(m, n - k))
+            mean_ok = matched / n_matched >= DICT_FORCE_NEED_MATCH
+            conf_ok = conflicts <= DICT_FORCE_CONF_CAP
+            # A forced completion must not free-ride: one matched char may
+            # only close at most one unseen char, two matched chars at most
+            # two, and four matched chars up to four (long prefix crops).
+            unseen_ok = (
+                (unseen <= 1)
+                or (unseen <= 2 and n_matched >= 2)
+                or (n_matched >= 4 and unseen <= 4)
+            )
+            if mean_ok and conf_ok and unseen_ok:
+                score = (
+                    matched + DICT_FORCE_FLOOR * (conflicts + unseen)
+                ) / n
+                score -= 0.02 * conflicts
+                if n < m:
+                    score -= DICT_LEN_PEN * (m - n)
+                confs = tuple(
+                    (i, term[k + i])
+                    for i in range(min(m, n - k))
+                    if term[k + i] not in positions[i]
+                )
+                rows.append((score, k, min(m, n - k), 0, 1, -1, confs))
+        if rows:
+            hypotheses[term] = rows
+
+    if not hypotheses:
+        return None, False, ()
+
+    def _exact_whole(hyp_rows, term: str) -> bool:
+        """A hypothesis where the visible text IS the whole term."""
+        n = len(term)
+        if text != term:
+            return False
+        return any(
+            h[1] == 0 and h[2] == n and h[3] == 0 for h in hyp_rows
+        )
+
+    def _drop_only(hyp_rows, term: str) -> float:
+        """Best score of a pure-residue hypothesis: the visible string is
+        the term minus dropped residues (no substitution, no gap)."""
+        n = len(term)
+        best_d = -1.0
+        for h in hyp_rows:
+            s_h, kk, mp, dd, ff, ss, _ = h
+            gaps = mp - (m - dd)
+            if not ff and ss == 0 and gaps == 0 and kk == 0 and mp == n:
+                best_d = max(best_d, s_h)
+        return best_d
+
+    # A pure-residue explanation (visible ⊆ term, no rewrite) is the safest
+    # inference: when one exists near the top, prefer the shortest such
+    # term, exactly like the matcher's shorter-term rule for crops.
+    # 波*特 explains 波特 even when a longer term scores the same.
+    top_overall = max(
+        max(h[0] for h in hypotheses[t])
+        + (DICT_CONTEXT_BONUS if t in context else 0.0)
+        for t in hypotheses
+    )
+    drop_only_candidates = [
+        (t, s) for t in hypotheses
+        if (s := _drop_only(hypotheses[t], t)) >= top_overall - 0.06
+    ]
+    if drop_only_candidates:
+        best_term = min(
+            drop_only_candidates, key=lambda ts: (len(ts[0]), -ts[1])
+        )[0]
+    else:
+        # Term ranking uses each term's strongest hypothesis; the
+        # uniqueness margin compares term maxima, so a tie cannot hide
+        # behind one term's preferred output span. On a score tie the
+        # exact whole-term match wins: two different terms can never both
+        # be exact. Caller-supplied context terms (neighboring resolved
+        # rows) get a small bonus that only breaks near-ties.
+        best_term = max(
+            hypotheses,
+            key=lambda t: (
+                max(h[0] for h in hypotheses[t]) + (
+                    DICT_CONTEXT_BONUS if t in context else 0.0
+                ),
+                _exact_whole(hypotheses[t], t),
+            ),
+        )
+    rows = hypotheses[best_term]
+    best_score = max(h[0] for h in rows)
+    # Same-term preference: within a generous window prefer the hypothesis
+    # that is not forced, drops fewer visible chars and covers more of the
+    # term, so a whole-term confusable explanation wins over discarding
+    # the residue.
+    rows = [h for h in rows if h[0] >= best_score - 0.15]
+    score, k, mprime, drops, forced, subs, conflicts = min(
+        rows, key=lambda h: (h[3], -h[2], -h[0])
+    )
+    second = max(
+        (max(h[0] for h in hypotheses[t]))
+        for t in hypotheses
+        if t != best_term
+    ) if len(hypotheses) > 1 else -1.0
+    floor = DICT_MIN_SCORE_SINGLE if len(best_term) == 1 else DICT_MIN_SCORE
+    if score < floor:
+        return None, False, ()
+    # An exact whole-term winner needs no uniqueness margin (no rewrite is
+    # involved; e.g. 约克 exact vs the 约克城 prefix crop at equal score).
+    # The same holds when the visible string is the term minus pure
+    # residues (subs == 0, no gaps): 波*特 explains 波特, and 波特兰's
+    # prefix crop at the same score must not veto it.
+    gaps = mprime - (m - drops)
+    drop_only = (
+        not forced and subs == 0 and gaps == 0
+        and k == 0 and mprime == len(best_term)
+    )
+    exact_win = (
+        k == 0 and mprime == len(best_term) and drops == 0 and text == best_term
+    ) or drop_only
+    if not exact_win and second > best_score - DICT_UNIQUE_MARGIN:
+        return None, False, ()
+    return (
+        _match(
+            best_term,
+            (k, k + mprime),
+            float(score),
+            _dict_kind(text, best_term, k, mprime),
+            text,
+            (0, m),
+        ),
+        bool(forced),
+        conflicts,
+    )
+
+
+def _ncc_assoc_match(
+    result: OCRResult,
+    lex: Lexicon,
+    bank: _realglyphs.RealGlyphBank,
+    soft_glyphs: list[np.ndarray],
+) -> LexiconMatch | None:
+    """NCC arbitration over real-glyph prototypes (same gates as assoc).
+
+    Runs the associative alignment a second time with per-position evidence
+    from real-game prototype NCC instead of classifier Top-K, so game
+    renders are compared with game renders. Used only when the Top-K based
+    match produced nothing, so existing hits are never re-arbitrated.
+    """
+
+    text = normalize_text(result.text)
+    if not text:
+        return None
+    m = len(text)
+    if m != len(soft_glyphs):
+        return None
+
+    index = _dict_char_index(lex)
+    candidates: set[str] = set()
+    for ch in set(text):
+        candidates |= index.get(ch, set())
+
+    best: tuple[float, str, int, int, int] | None = None
+    second = -1.0
+    for term in candidates:
+        n = len(term)
+        term_chars = set(term)
+        positions: list[dict[str, float]] = []
+        for i in range(m):
+            d: dict[str, float] = {}
+            for ch in term_chars:
+                ev = bank.best_evidence(soft_glyphs[i], ch)
+                if ev is not None:
+                    d[ch] = ev
+            positions.append(d)
+        for k in range(0, n):
+            aligned = _dict_align(text, positions, term, k)
+            if aligned is None:
+                continue
+            score, mprime, drops, matched_mean, subs = aligned
+            if m - drops < 2 and k > 0 and k + mprime < n:
+                continue
+            frac = (m - drops) / m
+            if frac < 0.5 or (frac == 0.5 and subs > 0):
+                continue
+            if matched_mean < _realglyphs.NCC_MEAN_FLOOR:
+                continue
+            if n < m - drops:
+                score -= DICT_LEN_PEN * (m - drops - n)
+            if best is None or score > best[0]:
+                if best is not None and best[1] != term:
+                    second = max(second, best[0])
+                best = (score, term, k, mprime, drops)
+            elif term != best[1]:
+                second = max(second, score)
+
+    if best is None:
+        return None
+    score, term, k, mprime, drops = best
+    floor = DICT_MIN_SCORE_SINGLE if len(term) == 1 else DICT_MIN_SCORE
+    if score < floor:
+        return None
+    if second > score - DICT_UNIQUE_MARGIN:
+        return None
+    return _match(
+        term,
+        (k, k + mprime),
+        float(score),
+        _dict_kind(text, term, k, mprime),
+        text,
+        (0, m),
+    )
+
+
 def _promote_term_alternative(
     result: OCRResult,
     lex: Lexicon,
@@ -784,23 +1293,32 @@ def apply_lexicon(
     mode: str | None = None,
     *,
     charset: list[str] | None = None,
+    context_terms: Iterable[str] = (),
+    template=None,
+    soft_glyphs: list[np.ndarray] | None = None,
+    real_bank: _realglyphs.RealGlyphBank | None = None,
     prefer_threshold: float = 0.9,
     correction_min_score: float = 0.0,
     correction_unique_margin: float = 0.02,
 ) -> OCRResult:
     """Apply the Goal 11 lexicon modes to an OCR result.
 
-    ``mode`` may be ``"none"``, ``"prefer"``, ``"topk"`` or ``"strict"``. With
-    ``"prefer"`` the best dictionary match is attached to the result and a
-    visually uncertain character is corrected only when the dictionary
-    target is already among that character's Top-K alternatives and the
-    correction is unique (a second, differently-worded correction within
-    ``correction_unique_margin`` keeps the visible OCR text, Goal 15).
-    With ``"topk"`` a non-term visible text is rewritten from the lexicon
-    when an exact term is the first supported decoder alternative or is
-    fully covered by each position's visual Top-3 (unique match only).
+    ``mode`` may be ``"none"``, ``"prefer"``, ``"topk"``, ``"strict"`` or
+    ``"dict"``. With ``"prefer"`` the best dictionary match is attached to
+    the result and a visually uncertain character is corrected only when the
+    dictionary target is already among that character's Top-K alternatives
+    and the correction is unique (a second, differently-worded correction
+    within ``correction_unique_margin`` keeps the visible OCR text, Goal
+    15). With ``"topk"`` a non-term visible text is rewritten from the
+    lexicon when an exact term is the first supported decoder alternative or
+    is fully covered by each position's visual Top-3 (unique match only).
     With ``"strict"`` only an exact dictionary term is accepted; anything
-    else is rejected as empty output.
+    else is rejected as empty output. With ``"dict"`` the decoded result is
+    matched associatively against the dictionary (exact / cropped /
+    confusable / uniquely forced word hypotheses, see :func:`assoc_match`);
+    the visible text is never rewritten, the winning word is annotated as
+    ``matched_term`` and a result without any word hypothesis is rejected
+    as empty output ("return nothing unless a word matches").
     """
 
     if mode is None:
@@ -808,7 +1326,8 @@ def apply_lexicon(
     normalized_mode = mode.strip().lower()
     if normalized_mode not in LEXICON_MODES:
         raise ValueError(
-            f"lexicon_mode {mode!r} is not supported; use 'none', 'prefer' or 'strict'"
+            f"lexicon_mode {mode!r} is not supported; "
+            "use 'none', 'prefer', 'topk', 'strict' or 'dict'"
         )
     if normalized_mode == "none" or lexicon is None:
         return result
@@ -873,6 +1392,55 @@ def apply_lexicon(
         if guessed is not None:
             return guessed
         return out
+
+    if normalized_mode == "dict":
+        matched, forced, conflicts = _assoc_match(
+            result, lex, charset, context_terms
+        )
+        # 命中后回图验证: a forced-completion hit must be template-
+        # plausible on the crop itself -- every conflict position is
+        # re-matched with the registered font's templates, and a target
+        # whose template score is too low rejects the whole hit.
+        if (
+            matched is not None
+            and forced
+            and conflicts
+            and template is not None
+            and charset
+        ):
+            cid_map = {c: i for i, c in enumerate(charset)}
+            for i, ch in conflicts:
+                if i >= len(result.path.candidates):
+                    continue
+                mask = result.path.candidates[i].segment.mask
+                target = cid_map.get(ch)
+                if target is None:
+                    continue
+                _out, tpl_score = template.match(mask, None, {target})
+                if tpl_score < DICT_VERIFY_TEMPLATE_MIN:
+                    matched = None
+                    break
+        # Top-K 无解时, 用真实字形库做 NCC 仲裁 (游戏渲染 vs 游戏渲染)。
+        if matched is None and real_bank is not None and soft_glyphs:
+            matched = _ncc_assoc_match(result, lex, real_bank, soft_glyphs)
+        if matched is None:
+            return replace(
+                result,
+                text="",
+                confidence=0.0,
+                chars=(),
+                matched_term=None,
+                matched_span=None,
+                lexicon_match=None,
+                alternatives=(),
+            )
+        matched = replace(matched, mode="dict")
+        return replace(
+            result,
+            matched_term=matched.term,
+            matched_span=matched.span,
+            lexicon_match=matched,
+        )
 
     # strict
     if top is not None and top.kind == "exact":

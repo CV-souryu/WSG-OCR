@@ -599,11 +599,50 @@ spacing, and normalized size. Pass a custom profile to
 - Goal 11 lexicon layer is implemented: `charsets/words/` is loaded by
   domain (`ships`, `equipment`, `ui`, plus `all` or explicit paths), and
   `recognize(..., lexicon=..., lexicon_mode=...)` supports
-  `none`/`prefer`/`strict`. The matcher handles exact and full-term-in-text
-  alignments; `prefer` only rewrites visually
+  `none`/`prefer`/`strict`/`topk`/`dict`. The matcher handles exact and
+  full-term-in-text alignments; `prefer` only rewrites visually
   uncertain characters when the dictionary target is already in the
   candidate's Top-K, and `strict` rejects non-dictionary text.
   `tests/test_goal11_lexicon.py` covers loading, matching and the modes.
+- Associative dictionary mode (`lexicon_mode="dict"`) is implemented:
+  the decoded visible text is scanned position by position and every
+  dictionary term that can explain it — exact, cropped at either edge,
+  confusable (Top-K substitution, e.g. 14px `波`/`彼`), or partially
+  damaged (forced completion of a unique prefix/suffix, e.g.
+  `华盛蜂` → `华盛顿`) — competes as one word hypothesis scored from the
+  per-position visual Top-K evidence. The visible `text` is never
+  rewritten; the winning word is annotated as `matched_term` /
+  `matched_span`, and a result without any surviving word hypothesis is
+  rejected as empty output ("return nothing unless a word matches").
+  Single-char terms need stronger evidence, uniqueness is enforced with
+  a margin, and clear visual text is never rewritten (Goal 15, `潜乙`
+  stays `潜乙`). A forced-completion hit is verified against the crop
+  itself (every conflict position re-matched with the registered font's
+  templates); when no hypothesis survives, an optional real-glyph bank
+  (`recognize(..., real_glyph_bank=...)`, built by
+  `tools/lexicon/build_real_glyph_bank.py` from labeled crops) runs the
+  same alignment with NCC evidence from real game glyphs -- game renders
+  vs game renders, no font-render domain gap (resolves the 初雪/白雪/
+  夕雾 same-shape ties). On the 244 real ship-name crops it annotates 235/244
+  correctly with zero wrong associations (the rest are rejected as
+  unreadable). `tests/test_dict_mode.py` pins the contract.
+- Touching-game-glyph merges are vetoed for hybrid models: real-game
+  `Z+1`, `Z+2`, `4+7` pairs glue into one wide blob that the CNN reads as
+  one character (`灶`, `“`), and the mean-visual path score alone prefers
+  that merge over the correct split (`Z17` crops decoded as `灶7`).
+  `_drop_weak_merges` now down-weights a multi-atom candidate whose Top-1
+  is not template-confirmed when the blob spans ≥ 1.5x the line's typical
+  glyph width and either (a) its components are strictly side-by-side
+  (glyph-internal radicals overlap horizontally; adjacent characters do
+  not) and one full-size atom alone is already a better character than
+  the blob, or (b) the blob has zero template support and ≥ 2 of its
+  atoms are full-size confident glyphs. Real glyphs keep their template-
+  confirmed whole (raw score ≥ 0.9 / template-chosen Top-1). On the
+  labeled `fonts/SourceHanSansSC/crops/crops_items` corpus this fixes
+  `Z17`/`Z28`/`Z1`/`47工程` in every lexicon mode with zero regressions
+  against the CSV baseline, and dict+real-glyph-bank mode now resolves
+  233/235 labeled items (remaining rejects: a `4+3` blob read as `“` and
+  a crop missing half of `乌戈里尼·维瓦尔迪`).
 - Goal 12 partial-word support is implemented: a screen crop of a
   dictionary term is matched as `prefix_crop` / `suffix_crop` / `inner_crop`
   while internally missing characters are ranked as `gap_crop` with a

@@ -21,7 +21,7 @@ fragment contributes positive score.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -759,35 +759,53 @@ def _drop_weak_merges(
     comps: list[Component],
     profile: Profile,
 ) -> list[Candidate]:
-    """Drop low-confidence multi-atom candidates (CNN-only models).
+    """Drop low-confidence multi-atom candidates (CNN-only + hybrid models).
 
     The pure visual DP can merge adjacent characters when the CNN's margin
     for a combined blob is only slightly better than its margin for each
     part (e.g. three ``0``s merged into one ``0``), or when a split wide
-    component's whole blob scores like one character. Template/hybrid models
-    get a confident template score for real glyphs, so they do not need this
-    gate. CNN-only models only allow a merge when:
+    component's whole blob scores like one character. CNN-only models only
+    allow a merge when:
 
     * the merged candidate looks like a real character
       (``cnn_merge_threshold``);
     * it scores at least as well as every single atom inside it; and
     * the atoms are in glyph-internal proximity (the old merger's
       overlap rule), so unrelated characters such as ``1000`` cannot merge.
+
+    Hybrid (template + CNN) models get one more gate for *fake* merges:
+    two touching real-game glyphs glued into one blob that merely looks
+    like some character (``Z+1`` read as ``灶``, ``4+7`` read as ``“``).
+    A real glyph's merged whole is a confident template match, so a merge
+    whose Top-1 pick is not template-confirmed is vetoed when
+
+    * one single atom inside it is already a better character than the
+      blob (the part beats the whole: ``1`` 0.964 > ``灶`` 0.898), or
+    * the blob has no template support at all (template raw score ~0):
+      it is not any glyph of the registered font, only a CNN look-alike.
     """
 
     threshold = getattr(scorer, "cnn_merge_threshold", 0.0)
-    if threshold <= 0.0 or not candidates:
+    has_templates = getattr(scorer, "template", None) is not None
+    if not candidates or (threshold <= 0.0 and not has_templates):
         return candidates
     single_visual: dict[int, float] = {}
+    atom_info: dict[int, tuple[float, int, int]] = {}
     for cand in candidates:
-        if len(cand.components) == 1 and cand.score is not None:
-            i = cand.components[0]
-            single_visual[i] = max(
-                single_visual.get(i, -1.0),
-                getattr(
-                    cand.score, "classifier_visual_score", cand.score.visual_score
-                ),
+        start, end = cand.atom_span
+        if end - start == 1 and cand.score is not None:
+            vis = getattr(
+                cand.score, "classifier_visual_score", cand.score.visual_score
             )
+            if cand.scores is not None and cand.scores.logits:
+                vis = float(cand.scores.logits[0])
+            prev = atom_info.get(start)
+            if prev is None or vis > prev[0]:
+                atom_info[start] = (vis, cand.segment.w, cand.segment.h)
+            if len(cand.components) == 1:
+                i = cand.components[0]
+                single_visual[i] = max(single_visual.get(i, -1.0), vis)
+    line_h = max((c.h for c in comps), default=1)
     out = []
     for cand in candidates:
         start, end = cand.atom_span
@@ -795,18 +813,132 @@ def _drop_weak_merges(
             visual = getattr(
                 cand.score, "classifier_visual_score", cand.score.visual_score
             )
-            if visual < threshold:
-                continue
-            if not _proximity_merge_ok(cand, comps, profile):
-                continue
-            parts = [
-                single_visual.get(i, threshold)
-                for i in range(cand.components[0], cand.components[-1] + 1)
-            ]
-            if any(p > visual + 0.02 for p in parts):
-                continue
+            scores = cand.scores
+            if scores is not None and scores.logits:
+                visual = float(scores.logits[0])
+            if threshold > 0.0:
+                # CNN-only models: the original gate, unchanged.
+                if visual < threshold:
+                    continue
+                if not _proximity_merge_ok(cand, comps, profile):
+                    continue
+                parts = [
+                    single_visual.get(i, threshold)
+                    for i in range(cand.components[0], cand.components[-1] + 1)
+                ]
+                if any(p > visual + 0.02 for p in parts):
+                    continue
+            elif scores is not None:
+                penalty = _hybrid_fake_merge_penalty(
+                    scores, cand, comps, atom_info, start, line_h
+                )
+                if penalty > 0.0:
+                    cand.scores = replace(
+                        scores,
+                        logits=tuple(
+                            max(0.0, float(v) - penalty) for v in scores.logits
+                        ),
+                    )
         out.append(cand)
     return out
+
+
+HYBRID_FAKE_MERGE_PENALTY = 0.12
+
+
+def _hybrid_fake_merge_penalty(
+    scores,
+    cand: Candidate,
+    comps: list[Component],
+    atom_info: dict[int, tuple[float, int, int]],
+    start: int,
+    line_h: int,
+) -> float:
+    """Penalty for a merged blob that is not a single registered glyph.
+
+    Hybrid models get a confident template score for real glyphs, so a
+    multi-atom merge whose Top-1 pick is not template-confident is suspect.
+    Two evidence patterns veto it (by down-weighting its Top-K logits, never
+    by removing it, so the lattice stays coverable):
+
+    * two or more of its atoms are already full-size, confident glyphs and
+      the blob has *no* template support at all (template raw score ~0):
+      the blob is not any glyph of the registered font (real-game ``Z+2``
+      glued into one component read as ``灶``);
+    * its components are strictly side-by-side (no x-overlap -- glyph-
+      internal radicals overlap horizontally, adjacent characters do not)
+      and one atom alone is already a better character than the blob
+      (``1`` 0.964 beats ``灶`` 0.898 for the glued ``Z+1``).
+
+    Both patterns require the blob to be wide enough to hold two of its own
+    atoms (>= 1.6x the widest atom; >= 1.7x for the zero-template pattern),
+    measured against the candidate's own atoms instead of the line-wide
+    glyph width so mixed CJK+Latin lines (``Z18 Z17 岛风...``) work too.
+    A template-confident whole (raw score >= 0.9 or template-chosen Top-1)
+    is always trusted.
+    """
+
+    score_type = getattr(scores, "score_type", "")
+    tpl_raw = float(getattr(scores, "template_raw_score", 0.0))
+    if score_type == "template" or tpl_raw >= 0.9:
+        return 0.0
+    seg = cand.segment
+    if seg is None:
+        return 0.0
+    end = cand.atom_span[1]
+    infos = [atom_info[a] for a in range(start, end) if a in atom_info]
+    if len(infos) < 2:
+        return 0.0
+    widths = [w for _, w, _ in infos]
+    max_w = max(widths)
+    if seg.w < 1.6 * max_w:
+        return 0.0
+    median_w = float(np.median(widths))
+
+    def qualifying(floor: float) -> list[tuple[float, int, int]]:
+        return [
+            info
+            for info in infos
+            if info[0] >= floor
+            and info[1] >= 0.7 * median_w
+            and info[2] >= 0.5 * line_h
+        ]
+
+    q = qualifying(0.7)
+    if not q:
+        return 0.0
+    visual = float(scores.logits[0]) if scores.logits else 0.0
+
+    def penalty() -> float:
+        # Push the blob's Top-1 down to at most ~0.60 so a decent split
+        # wins even when the path mean is diluted by a long line prefix
+        # (the mean of a 19-char line moves only ~0.005 per char), but
+        # keep the flat floor for weak blobs so fragile coverage paths
+        # (e.g. T-23's ``T`` + tiny ``-``) are not disturbed.
+        return float(
+            min(0.45, max(HYBRID_FAKE_MERGE_PENALTY, visual - 0.60))
+        )
+
+    if (
+        tpl_raw <= 1e-6
+        and seg.w >= 1.7 * max_w
+        and len(qualifying(0.75)) >= 2
+    ):
+        return penalty()
+    if len(cand.components) >= 2:
+        idx = list(cand.components)
+        if any(
+            min(comps[i].x + comps[i].w, comps[j].x + comps[j].w)
+            - max(comps[i].x, comps[j].x)
+            > 0
+            for i in idx
+            for j in idx
+            if i < j
+        ):
+            return 0.0
+        if any(info[0] > visual for info in q):
+            return penalty()
+    return 0.0
 
 
 def _proximity_merge_ok(

@@ -24,6 +24,7 @@ from .postprocess import allowed_ids as build_allowed_ids
 from .preprocess import find_lines
 from .scorer import SegmentScorer
 from .segmentation import segment_line
+from . import realglyphs as _realglyphs
 from .types import (
     CharResult,
     DecodePath,
@@ -153,6 +154,8 @@ class FixedFontOCR:
         *lexicon_args,
         lexicon: str | Path | Lexicon | None = None,
         lexicon_mode: str | None = None,
+        context_terms: Iterable[str] = (),
+        real_glyph_bank: str | Path | None = None,
     ) -> OCRResult:
         """Recognize horizontal, single-line text in ``image``.
 
@@ -207,10 +210,10 @@ class FixedFontOCR:
         if lexicon_mode is None:
             lexicon_mode = "prefer" if lexicon is not None else "none"
         lexicon_mode = str(lexicon_mode).strip().lower()
-        if lexicon_mode not in ("none", "prefer", "topk", "strict"):
+        if lexicon_mode not in ("none", "prefer", "topk", "strict", "dict"):
             raise ValueError(
                 f"lexicon_mode {lexicon_mode!r} is not supported; "
-                "use 'none', 'prefer', 'topk' or 'strict'"
+                "use 'none', 'prefer', 'topk', 'strict' or 'dict'"
             )
         if lexicon_mode != "none" and lexicon is None:
             raise ValueError(
@@ -230,6 +233,9 @@ class FixedFontOCR:
         mask = frontend.binary_mask
         paths: list[DecodePath] = []
         decoded: list[tuple[VisualCandidate, str, float]] = []
+        # ``dict`` mode decodes lexicon-free: the associative dictionary
+        # layer runs on the decoded result afterwards (apply_lexicon), so
+        # the frozen decoder never sees dictionary evidence in this mode.
         for line in find_lines(mask, self.profile):
             path = segment_line(
                 line,
@@ -237,7 +243,11 @@ class FixedFontOCR:
                 self._scorer,
                 allowed,
                 soft=frontend.soft_foreground,
-                lexicon=lexicon if lexicon_mode != "none" else None,
+                lexicon=(
+                    lexicon
+                    if lexicon_mode not in ("none", "dict")
+                    else None
+                ),
                 decoder_config=DecoderConfig(),
             )
             if not path.candidates:
@@ -285,11 +295,30 @@ class FixedFontOCR:
             lexicon_match=None,
             path=paths[0] if len(paths) == 1 else None,
         )
+        # ``dict`` 模式的 NCC 仲裁: 软字形补丁 + 真实字形库(可选)。
+        bank_obj = None
+        soft_glyphs = None
+        if lexicon_mode == "dict" and real_glyph_bank is not None:
+            bank_obj = _realglyphs.load_real_glyphs(Path(real_glyph_bank))
+            if bank_obj is not None and len(paths) == 1 and paths[0].candidates:
+                soft_glyphs = [
+                    _realglyphs.resize24(
+                        frontend.soft_foreground[
+                            cand.segment.y : cand.segment.y + cand.segment.h,
+                            cand.segment.x : cand.segment.x + cand.segment.w,
+                        ]
+                    )
+                    for cand in paths[0].candidates
+                ]
         return apply_lexicon(
             result,
             lexicon,
             lexicon_mode,
             charset=self.model.charset,
+            context_terms=context_terms,
+            template=self._scorer.template,
+            soft_glyphs=soft_glyphs,
+            real_bank=bank_obj,
         )
 
     def _top_char_id(self, candidate: VisualCandidate) -> int:

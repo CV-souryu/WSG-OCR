@@ -37,6 +37,7 @@ from .lexicon import (
     Lexicon,
     LexiconLayer,
     apply_lexicon,
+    assoc_match,
     load_lexicon,
 )
 from .model import write_hybrid_model
@@ -78,6 +79,7 @@ __all__ = [
     "LEXICON_DOMAINS",
     "load_lexicon",
     "apply_lexicon",
+    "assoc_match",
     "extract_frontend",
     "Profile",
     "TemplateClassifier",

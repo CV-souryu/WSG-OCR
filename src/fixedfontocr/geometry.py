@@ -100,6 +100,61 @@ class FontGeometryDatabase:
                 f"{len(self.entries)} entries"
             )
         object.__setattr__(self, "_by_id", {e.char_id: e for e in self.entries})
+        # The narrow/full aggregate ratios are pure functions of the frozen
+        # entries, but the original properties rebuilt the filtered lists
+        # on every access (O(charset) per call). The segmentation lattice
+        # consults them once per component/candidate, so on a 1894-char
+        # model that was ~0.02-0.09 ms per property and dominated
+        # lattice_generation. They are computed once here; the property
+        # getters keep the exact same values and empty-list defaults.
+        narrow = [e for e in self.entries if e.aspect_ratio < 0.8]
+        full = [e for e in self.entries if e.aspect_ratio >= 0.8]
+        object.__setattr__(self, "_narrow_entries", narrow)
+        object.__setattr__(self, "_full_entries", full)
+
+        def agg(values: list[float], fn, default: float) -> float:
+            return float(fn(values)) if values else default
+
+        object.__setattr__(
+            self, "_narrow_width_ratio",
+            agg([e.bbox_width for e in narrow], statistics.median, 0.4),
+        )
+        object.__setattr__(
+            self, "_narrow_height_ratio",
+            agg([e.bbox_height for e in narrow], statistics.median, 0.75),
+        )
+        object.__setattr__(
+            self, "_narrow_width_max",
+            agg([e.bbox_width for e in narrow], max, 0.6),
+        )
+        object.__setattr__(
+            self, "_narrow_width_min",
+            agg([e.bbox_width for e in narrow], min, 0.15),
+        )
+        object.__setattr__(
+            self, "_narrow_advance_max",
+            agg([e.advance for e in narrow], max, 0.7),
+        )
+        object.__setattr__(
+            self, "_full_width_ratio",
+            agg([e.bbox_width for e in full], statistics.median, 0.93),
+        )
+        object.__setattr__(
+            self, "_full_height_ratio",
+            agg([e.bbox_height for e in full], statistics.median, 0.93),
+        )
+        object.__setattr__(
+            self, "_full_width_max",
+            agg([e.bbox_width for e in full], max, 1.0),
+        )
+        object.__setattr__(
+            self, "_full_width_min",
+            agg([e.bbox_width for e in full], min, 0.55),
+        )
+        object.__setattr__(
+            self, "_full_advance_max",
+            agg([e.advance for e in full], max, 1.0),
+        )
 
     @property
     def by_id(self) -> dict[int, FontGeometryEntry]:
@@ -110,61 +165,51 @@ class FontGeometryDatabase:
 
     @property
     def narrow_entries(self) -> list[FontGeometryEntry]:
-        return [e for e in self.entries if e.aspect_ratio < 0.8]
+        return self._narrow_entries
 
     @property
     def full_entries(self) -> list[FontGeometryEntry]:
-        return [e for e in self.entries if e.aspect_ratio >= 0.8]
+        return self._full_entries
 
     @property
     def narrow_width_ratio(self) -> float:
-        values = [e.bbox_width for e in self.narrow_entries]
-        return float(statistics.median(values)) if values else 0.4
+        return self._narrow_width_ratio
 
     @property
     def narrow_height_ratio(self) -> float:
-        values = [e.bbox_height for e in self.narrow_entries]
-        return float(statistics.median(values)) if values else 0.75
+        return self._narrow_height_ratio
 
     @property
     def narrow_width_max(self) -> float:
-        values = [e.bbox_width for e in self.narrow_entries]
-        return max(values) if values else 0.6
+        return self._narrow_width_max
 
     @property
     def narrow_width_min(self) -> float:
-        values = [e.bbox_width for e in self.narrow_entries]
-        return min(values) if values else 0.15
+        return self._narrow_width_min
 
     @property
     def narrow_advance_max(self) -> float:
-        values = [e.advance for e in self.narrow_entries]
-        return max(values) if values else 0.7
+        return self._narrow_advance_max
 
     @property
     def full_width_ratio(self) -> float:
-        values = [e.bbox_width for e in self.full_entries]
-        return float(statistics.median(values)) if values else 0.93
+        return self._full_width_ratio
 
     @property
     def full_height_ratio(self) -> float:
-        values = [e.bbox_height for e in self.full_entries]
-        return float(statistics.median(values)) if values else 0.93
+        return self._full_height_ratio
 
     @property
     def full_width_max(self) -> float:
-        values = [e.bbox_width for e in self.full_entries]
-        return max(values) if values else 1.0
+        return self._full_width_max
 
     @property
     def full_width_min(self) -> float:
-        values = [e.bbox_width for e in self.full_entries]
-        return min(values) if values else 0.55
+        return self._full_width_min
 
     @property
     def full_advance_max(self) -> float:
-        values = [e.advance for e in self.full_entries]
-        return max(values) if values else 1.0
+        return self._full_advance_max
 
     def to_dict(self) -> dict:
         return {

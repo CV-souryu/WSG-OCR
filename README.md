@@ -741,7 +741,13 @@ spacing, and normalized size. Pass a custom profile to
   workgroup shared memory). `WGPUBackend.classify()`/`forward_logits()`
   each submit exactly one dispatch with a single final readback — zero
   intermediate copy-backs. The 8-sync `forward_logits` wall
-  (12-17 ms) is gone (1.4-2.7 ms) and end-to-end `recognize()` on
-  `model/game_cn` is now at CPU parity (0.97-1.03x); the remaining
-  end-to-end cost is the CPU template scan (~40-50 ms/line), which is the
-  next GPU target (G2 in `docs/goal20.md`).
+  (12-17 ms) is gone (1.4-2.7 ms).
+- Goal 20 G2 landed: `shaders/template_match.wgsl` runs the whole
+  Template V2 cascade (coarse filter, XOR+popcount, ink-band fallback,
+  deterministic Top-K, winner prototype) in one dispatch per glyph batch,
+  byte-exact against the CPU reference (`tests/test_goal20_template_gpu.py`).
+  `backend="wgpu"` uses it always, `backend="auto"` picks per batch
+  (crossover 4). End-to-end `recognize()` on `model/game_cn` is now
+  **3.2-4.7x faster on GPU/auto** than CPU with identical text output.
+  Remaining 全链路 steps: G3 GPU preprocessing and G4 visual-DP decode
+  (`docs/goal20.md`).

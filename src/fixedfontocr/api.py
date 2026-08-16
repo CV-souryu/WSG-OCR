@@ -10,11 +10,14 @@ from numpy.typing import NDArray
 
 from .backends import (
     AutoBackend,
+    AutoTemplateMatcher,
     Backend,
     CPUBackend,
     WGPUBackend,
+    WGPUTemplateMatcher,
     benchmark_backends,
 )
+from .classifier import TemplateV2Classifier
 from .decoder import DecoderConfig
 from .frontend import extract_frontend
 from .geometry import char_geometry
@@ -90,11 +93,69 @@ class FixedFontOCR:
             raise ValueError(
                 "WGPU backend requires a tinycnn model; template models run on CPU"
             )
-        self._scorer = SegmentScorer(self.model, cnn_backend=self._backend)
+        self._template_backend = self._make_template_backend()
+        self._scorer = SegmentScorer(
+            self.model,
+            cnn_backend=self._backend,
+            template_backend=self._template_backend,
+        )
 
     # ------------------------------------------------------------------
     # Backend selection
     # ------------------------------------------------------------------
+
+    def _make_template_backend(self):
+        """GPU Template V2 matcher for hybrid models (G2).
+
+        The template scan is the dominant CPU cost of ``recognize``, so
+        ``backend="wgpu"`` runs it in one dispatch per batch. ``"auto"``
+        benchmarks both matchers at construction and picks per actual glyph
+        count (the GPU wins from ~batch 4 on the game model; smaller lines
+        stay on the CPU matcher). Falls back to the CPU matcher when the
+        model has no V2 templates, the backend is ``"cpu"``, or the GPU
+        matcher cannot be built.
+        """
+
+        if self.model.templates_v2 is None or self.backend == "cpu":
+            return None
+        if self._backend is None:
+            return None
+        gpu = (
+            self._backend.gpu
+            if isinstance(self._backend, AutoBackend)
+            else self._backend
+        )
+        if not isinstance(gpu, WGPUBackend):
+            return None
+        try:
+            gpu_matcher = WGPUTemplateMatcher(
+                gpu,
+                self.model.templates_v2,
+                self.model.charset,
+                self.model.input_size,
+            )
+        except Exception as exc:  # no adapter / unsupported shape
+            self._benchmark_error = (
+                (self._benchmark_error + "; " if self._benchmark_error else "")
+                + f"gpu template unavailable: {exc}"
+            )
+            return None
+        if self.backend == "wgpu":
+            return gpu_matcher
+        cpu_matcher = TemplateV2Classifier(
+            data=self.model.templates_v2,
+            charset=self.model.charset,
+            input_size=self.model.input_size,
+            normalize_spec=self.model.normalize_spec,
+        )
+        try:
+            return AutoTemplateMatcher(cpu_matcher, gpu_matcher)
+        except Exception as exc:  # benchmark failure -> CPU matcher only
+            self._benchmark_error = (
+                (self._benchmark_error + "; " if self._benchmark_error else "")
+                + f"gpu template benchmark failed: {exc}"
+            )
+            return cpu_matcher
 
     def _make_backend(self) -> Backend:
         if self.backend == "wgpu":

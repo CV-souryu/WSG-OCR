@@ -153,31 +153,39 @@ Metal 单设备验证。
 用户指令升级：**全链路塞入 GPU，1 次发射出结果，0 CPU 中间拷回**。
 mega（G1）已把 TinyCNN 整链做成单 dispatch。剩余三段：
 
-- **G2 模板匹配进 GPU**（端到端大头 ~40-50 ms/行在此）：每候选 glyph
-  一个 workgroup，92.8k prototypes 分摊到 64 线程（coarse filter +
-  XOR/popcount，bitset 布局与 CPU 逐字对齐），workgroup 内归约出
-  Top-K + 原始距离；输出与 CPU `TemplateV2Classifier.match_batch`
-  逐分数一致。落地后可把「模板 + CNN」两段放进同一 encoder → 一次
-  submit 出融合分数。
-- **G3 预处理进 GPU**：RGB 整图一次上传，ROI crop + 灰度 +
+- **G2 模板匹配进 GPU** ✅ 完成：`shaders/template_match.wgsl` 单
+  dispatch、每候选 glyph 一个 workgroup（92.8k prototypes 分摊到 64
+  线程：coarse filter + XOR/popcount + per-char min + ink-band 回扫 +
+  确定性 Top-K + 胜者 prototype），输出与 CPU `TemplateV2Classifier`
+  **逐字段精确相等**（距离是精确整数）。CPU 参考同步修正两处：
+  Top-K 并列用 (dist, char_id) 升序确定化（原 argpartition 并列任选），
+  以及 kk<k 时 padding 从 `[kk:]`（原 `[k:]` 留下 np.empty 垃圾 id）。
+  `WGPUTemplateMatcher.match_batch` 单 dispatch 读回 60B/glyph；
+  `backend="wgpu"` 恒用 GPU，`backend="auto"` 经
+  `AutoTemplateMatcher` 按 batch 实测选路（crossover = batch 4）。
+  实测（game_cn）：模板段 batch 4/8/16/32 = 1.3x/1.8x/4.8x/5.7x；
+  **端到端 recognize：GPU 3.2-4.7x（auto 3.4-4.7x），首次真正领先
+  CPU**。测试：`tests/test_goal20_template_gpu.py` 10 个（含逐字段
+  精确 parity、allowed 子集、auto 包装、game_cn 端到端）。
+- **G3 预处理进 GPU**（下一目标）：RGB 整图一次上传，ROI crop + 灰度 +
   nearest-neighbor resize（bit-exact 已论证）+ baseline 放置全在
-  WGSL，输出直接作为 mega 的输入（binary/soft 双变体），CPU 只留
-  CC/bbox。
+  WGSL，输出直接作为 mega/template 的输入（binary/soft 双变体），
+  CPU 只留 CC/bbox。
 - **G4 纯视觉 DP 解码进 GPU**：每行一个 workgroup，lattice 候选分数
   （G2+G3 产出）直接在工作组内跑 DP，读回最终路径 + Top-K —— 一次
   submit 出 OCR 结果。Lexicon beam 仍留 CPU（fonts/goal 边界）；
   CC/lattice 生成暂留 CPU（CC 的 GPU 化是独立研究级任务，单列）。
 
-优先级：G2（最大 CPU 成本）→ G3（与 mega 合并发射）→ G4（收口成
-一次 submit 出结果）。
+优先级：G2 ✅ → G3（与 mega 合并发射）→ G4（收口成一次 submit 出结果）。
 
 ## 5. 实施顺序与依赖
 
 ```text
-G1 mega（✅ 完成）→ G2 模板 GPU → G3 预处理 → G4 视觉 DP → T2 收尾
+G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理 → G4 视觉 DP → T2 收尾
 ```
 
-- G1 mega 已消灭 8-sync 墙；G2 是端到端大头（模板段），优先级最高。
+- G1 mega 已消灭 8-sync 墙；G2 已把端到端大头（模板段）搬上 GPU
+  （端到端 3.2-4.7x）。
 - G2/G3 落地后同 encoder 发射，G4 收口成「一次 submit 出结果」。
 - T2（Top-K 读回裁剪）在 G4 之后做读回字节优化；T3 的 profile 公式
   风险被 G3 分解（先 default profile soft 路径）。
@@ -188,6 +196,8 @@ G1 mega（✅ 完成）→ G2 模板 GPU → G3 预处理 → G4 视觉 DP → T
 
 - [x] mega 单 dispatch：`classify`/`forward_logits` 各 1 个 dispatch
       （`last_dispatch_count == 1`），28 个 parity 测试全绿
+- [x] G2 模板单 dispatch：`tests/test_goal20_template_gpu.py` 10 个
+      全绿（逐字段精确 parity），端到端 GPU/auto 领先 3.2-4.7x
 - [ ] `tests/test_goal20_wgpu.py` 全绿（无 xfail）
 - [ ] `tests/test_wgpu.py` + `tests/test_wgpu_vectors.py` +
       `tests/test_auto_backend.py` 全绿
@@ -238,21 +248,22 @@ G1 mega（✅ 完成）→ G2 模板 GPU → G3 预处理 → G4 视觉 DP → T
 | 32 | 675 µs | 1.37 ms | 0.5x |
 | 128 | 2.61 ms | 2.71 ms | 1.0x |
 
-端到端 `recognize()`（渲染文本，mega 后；parity 全部 text 一致）：
+端到端 `recognize()`（渲染文本，G2 后 GPU/auto 首次真正领先；parity 全部
+text 一致）：
 
-| 文本 | CPU | GPU | speedup |
-| --- | --- | --- | --- |
-| 获得金币1000 | 58.2 ms | 56.3 ms | 1.03x |
-| 巴尔的摩 | 38.6 ms | 40.0 ms | 0.97x |
-| 获得金币1000×3 | 151.2 ms | 153.5 ms | 0.99x |
+| 文本 | CPU | GPU (wgpu) | auto | speedup |
+| --- | --- | --- | --- | --- |
+| 获得金币1000 | 58.3 ms | 18.2 ms | 17.1 ms | 3.2x / 3.4x |
+| 巴尔的摩 | 40.1 ms | 15.8 ms | 16.9 ms | 2.5x / 2.4x |
+| 获得金币1000×3（21 字） | 157.9 ms | 33.7 ms | 33.5 ms | 4.7x / 4.7x |
+
+auto 选路：模板 crossover = (4, "wgpu")，CNN crossover = (64, "wgpu")。
 
 三个事实（对排期的影响）：
 
-1. mega 消灭了 forward_logits 的 8-sync 墙（12-17 ms → 1.4-2.7 ms），
-   端到端 GPU 从慢 ~20% 变为与 CPU 打平（0.97-1.03x）。剩余 GPU 地板
-   是单次 `map_sync`（~1.3-2.7 ms）。
-2. 端到端大头仍是 CPU 模板段（~40-50 ms/行，1894 类全扫描）：两条
-   后端都卡在这里 —— 下一阶段把模板匹配搬进 GPU（G2），才能让 GPU
-   真正领先。
-3. T4 的「单 encoder 单 sync」部分随 mega 顺带完成；`staged=True`
-   双缓冲读回（摊薄多帧地板）保持 xfail。
+1. G1 mega 消灭了 forward_logits 的 8-sync 墙；G2 把端到端大头
+   （模板段）搬上 GPU —— 端到端从打平变为 **GPU 领先 3.2-4.7x**。
+2. 剩余 GPU 地板仍是单次 `map_sync`（~1.3-2.7 ms）：batch < 4 的
+   模板匹配与 batch < 64 的 CNN 由 auto 选路留在 CPU，无回归。
+3. G3（预处理）+ G4（视觉 DP 解码）落地后收口成「一次 submit 出
+   OCR 结果」；T2/T4 的读回裁剪与 staged 双缓冲作为后续优化。

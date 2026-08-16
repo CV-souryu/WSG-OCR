@@ -868,15 +868,26 @@ class TemplateV2Classifier(Classifier):
             kk = min(k, char_vals.size)
             if kk == 0:
                 continue
-            top = np.argpartition(char_vals, kk - 1)[:kk]
-            order = np.lexsort((chars_allowed[top], char_vals[top]))
-            top_chars = chars_allowed[top[order]].astype(np.int32)
-            top_dists = char_vals[top[order]].astype(np.int32)
+            # Deterministic Top-K by (dist, char_id) ascending. np.argpartition
+            # picks an arbitrary subset among ties at the k-th boundary, so
+            # the tied entries are re-selected by char id instead — the GPU
+            # template matcher (Goal 20 G2) uses exactly the same rule, which
+            # keeps CPU/GPU parity exact.
+            boundary = int(np.partition(char_vals, kk - 1)[kk - 1])
+            better = np.flatnonzero(char_vals < boundary)
+            tied = np.flatnonzero(char_vals == boundary)
+            needed = kk - better.size
+            chosen = np.concatenate([better, tied[:needed]])
+            order = np.lexsort((chars_allowed[chosen], char_vals[chosen]))
+            top_chars = chars_allowed[chosen[order]].astype(np.int32)
+            top_dists = char_vals[chosen[order]].astype(np.int32)
             out_ids[i, :kk] = top_chars
             out_scores[i, :kk] = (1.0 - top_dists.astype(np.float32) / area)
             if kk < k:
-                out_ids[i, k:] = -1
-                out_scores[i, k:] = 0.0
+                # Pad from kk (not k): the tail beyond kk was np.empty junk,
+                # which leaked garbage ids/scores into the Top-K entries.
+                out_ids[i, kk:] = -1
+                out_scores[i, kk:] = 0.0
             out_dists[i] = top_dists[0]
             out_second_dists[i] = top_dists[1] if kk > 1 else area
             if kk > 1:

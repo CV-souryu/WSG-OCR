@@ -29,6 +29,7 @@ from importlib import resources
 import numpy as np
 from numpy.typing import NDArray
 
+from .classifier import TemplateBatch, TemplateV2Classifier
 from .cnn import forward, prepare_weights, validate_v1_weights
 from .postprocess import top2
 
@@ -894,3 +895,425 @@ class AutoBackend(Backend):
     def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
         arr, n, _, _ = _check_glyphs(glyphs)
         return self.pick(n).forward_logits(arr)
+
+
+# ----------------------------------------------------------------------
+# GPU Template V2 matcher (Goal 20 G2: template matching in one dispatch)
+# ----------------------------------------------------------------------
+
+_GPU_TEMPLATE_K = 5
+_GPU_TEMPLATE_C_MAX = 7000
+_GPU_TEMPLATE_P_MAX = 256
+_GPU_TEMPLATE_RECORD = 15  # u32 words per glyph result record
+
+
+class WGPUTemplateMatcher:
+    """Template V2 matching on the GPU: one workgroup per glyph, one dispatch.
+
+    Replicates :class:`fixedfontocr.classifier.TemplateV2Classifier`
+    exactly: same coarse-feature tolerances, the same XOR+popcount distances
+    (exact integers), the same ink-band fallback scan and the same
+    ``(dist, char_id)`` Top-K ordering, so ``match_batch`` output is
+    identical to the CPU reference — not just within a tolerance. The host
+    reads back one 60-byte record per glyph.
+    """
+
+    def __init__(
+        self,
+        gpu: "WGPUBackend",
+        data: object,
+        charset: list[str],
+        input_size: int = 24,
+        default_top_k: int = 5,
+    ):
+        expected = (input_size * input_size + 7) // 8
+        if data.bytes_per_template != expected:
+            raise ValueError(
+                "TemplateV2Data bytes_per_template does not match input_size"
+            )
+        if input_size != 24:
+            raise ValueError("GPU template matcher supports 24x24 glyphs")
+        num_classes = int(data.num_classes)
+        if num_classes > _GPU_TEMPLATE_C_MAX:
+            raise ValueError(
+                f"GPU template matcher supports up to {_GPU_TEMPLATE_C_MAX} "
+                f"classes, got {num_classes}"
+            )
+        p = int(data.prototypes_per_char)
+        if p > _GPU_TEMPLATE_P_MAX:
+            raise ValueError(
+                f"GPU template matcher supports up to {_GPU_TEMPLATE_P_MAX} "
+                f"prototypes per char, got {p}"
+            )
+        if len(charset) != num_classes:
+            raise ValueError("charset and TemplateV2Data must have the same length")
+
+        self._gpu = gpu
+        self._wgpu = gpu._wgpu
+        self.device = gpu.device
+        self.data = data
+        self.charset = list(charset)
+        self.input_size = input_size
+        self.num_classes = num_classes
+        self.prototypes_per_char = p
+        self.default_top_k = max(2, int(default_top_k))
+        self.last_candidates: int | None = None
+        self.last_dispatch_count: int | None = None
+        self._allowed_words = (num_classes + 31) // 32
+
+        # Coarse features come from the CPU builder (byte-identical arrays).
+        ref = TemplateV2Classifier(data, charset, input_size)
+        feats = ref._features
+
+        self._tbits = gpu._device_create_buffer(
+            data=data.bits.reshape(-1).view(np.uint32).tobytes(),
+            usage=gpu._U_STORAGE,
+        )
+        ink = feats["ink"].astype(np.uint32)
+        w0 = (
+            ink
+            | (feats["h"].astype(np.uint32) << 16)
+            | (feats["w"].astype(np.uint32) << 24)
+        )
+        w1 = (
+            feats["top"].astype(np.uint32)
+            | (feats["left"].astype(np.uint32) << 8)
+            | (feats["bottom"].astype(np.uint32) << 16)
+            | (feats["right"].astype(np.uint32) << 24)
+        )
+        fused = np.stack([w0, w1], axis=1).reshape(-1).astype(np.uint32)
+        self._feats = gpu._device_create_buffer(
+            data=fused.tobytes(), usage=gpu._U_STORAGE
+        )
+        rs = data.render_sizes.reshape(-1).astype(np.uint32)
+        meta = (
+            rs
+            | (data.dx.reshape(-1).astype(np.uint32) << 8)
+            | (data.dy.reshape(-1).astype(np.uint32) << 16)
+            | (data.downsample_modes.reshape(-1).astype(np.uint32) << 24)
+        )
+        self._meta = gpu._device_create_buffer(
+            data=meta.tobytes(), usage=gpu._U_STORAGE
+        )
+
+        w = self._wgpu
+        stage = w.ShaderStage.COMPUTE
+        bgl_entries = [
+            {"binding": 0, "visibility": stage, "buffer": {"type": "uniform"}},
+            {"binding": 1, "visibility": stage, "buffer": {"type": "read-only-storage"}},
+            {"binding": 2, "visibility": stage, "buffer": {"type": "read-only-storage"}},
+            {"binding": 3, "visibility": stage, "buffer": {"type": "read-only-storage"}},
+            {"binding": 4, "visibility": stage, "buffer": {"type": "read-only-storage"}},
+            {"binding": 5, "visibility": stage, "buffer": {"type": "read-only-storage"}},
+            {"binding": 6, "visibility": stage, "buffer": {"type": "storage"}},
+        ]
+        layout = self.device.create_bind_group_layout(entries=bgl_entries)
+        pl = self.device.create_pipeline_layout(bind_group_layouts=[layout])
+        shader = self.device.create_shader_module(code=gpu._shader("template_match"))
+        self._pipeline = self.device.create_compute_pipeline(
+            layout=pl, compute={"module": shader, "entry_point": "main"}
+        )
+        self._layout = layout
+
+        self._cap = 0
+        self._glyph_buf = None
+        self._allowed_buf = None
+        self._result_buf = None
+        self._readback = None
+        self._bind_group = None
+
+    def _allowed_prototypes(self, allowed_ids: set[int] | None) -> NDArray[np.int64]:
+        """Global prototype indices for every (optionally restricted) char."""
+        if allowed_ids is None:
+            return np.arange(
+                self.num_classes * self.prototypes_per_char, dtype=np.int64
+            )
+        chars = np.fromiter(sorted(allowed_ids), dtype=np.int64)
+        if chars.size == 0:
+            return np.empty(0, dtype=np.int64)
+        p = self.prototypes_per_char
+        base = np.repeat(chars * p, p)
+        off = np.tile(np.arange(p, dtype=np.int64), chars.size)
+        return base + off
+
+    def _ensure_buffers(self, n: int) -> None:
+        if n <= self._cap:
+            return
+        self._cap = n
+        g = self._gpu
+        u = g._U_STORAGE
+        self._glyph_buf = g._device_create_buffer(
+            size=n * 18 * 4, usage=u | g._U_COPY_DST
+        )
+        self._allowed_buf = g._device_create_buffer(
+            size=self._allowed_words * 4, usage=u | g._U_COPY_DST
+        )
+        self._result_buf = g._device_create_buffer(
+            size=n * _GPU_TEMPLATE_RECORD * 4, usage=u | g._U_COPY_SRC
+        )
+        self._readback = g._device_create_buffer(
+            size=n * _GPU_TEMPLATE_RECORD * 4,
+            usage=g._U_MAP_READ | g._U_COPY_DST,
+        )
+        area = self.input_size * self.input_size
+        uniform = g._device_create_buffer(
+            data=g._uniform(
+                n,
+                self.num_classes,
+                self.prototypes_per_char,
+                0,
+                area,
+                area + 1,
+                self._allowed_words,
+                0,
+            ).tobytes(),
+            usage=self._wgpu.BufferUsage.UNIFORM,
+        )
+        entries = [
+            {"binding": 0, "resource": {"buffer": uniform}},
+            {
+                "binding": 1,
+                "resource": {
+                    "buffer": self._glyph_buf,
+                    "offset": 0,
+                    "size": self._glyph_buf.size,
+                },
+            },
+            {
+                "binding": 2,
+                "resource": {"buffer": self._tbits, "offset": 0, "size": self._tbits.size},
+            },
+            {
+                "binding": 3,
+                "resource": {"buffer": self._feats, "offset": 0, "size": self._feats.size},
+            },
+            {
+                "binding": 4,
+                "resource": {"buffer": self._meta, "offset": 0, "size": self._meta.size},
+            },
+            {
+                "binding": 5,
+                "resource": {
+                    "buffer": self._allowed_buf,
+                    "offset": 0,
+                    "size": self._allowed_buf.size,
+                },
+            },
+            {
+                "binding": 6,
+                "resource": {
+                    "buffer": self._result_buf,
+                    "offset": 0,
+                    "size": self._result_buf.size,
+                },
+            },
+        ]
+        self._bind_group = self.device.create_bind_group(
+            layout=self._layout, entries=entries
+        )
+
+    def _parse_results(
+        self, raw: NDArray[np.uint8], n: int, area: int
+    ) -> TemplateBatch:
+        rec = raw.view("<u4").reshape(n, _GPU_TEMPLATE_RECORD)
+        ids = rec[:, :5].astype(np.int32)
+        dists = rec[:, 5:10].astype(np.int32)
+        valid = ids >= 0
+        kk = valid.sum(axis=1)
+        out_dists = dists[:, 0]
+        second = np.where(kk > 1, dists[:, 1], area).astype(np.int32)
+        second_ids = np.where(kk > 1, ids[:, 1], -1).astype(np.int32)
+        # Float expressions mirror TemplateV2Classifier.match_batch exactly
+        # (f32 division, f64 subtraction, f32 cast).
+        out_scores = np.where(
+            valid, 1.0 - dists.astype(np.float32) / area, 0.0
+        ).astype(np.float32)
+        scores = (1.0 - out_dists.astype(np.float32) / area).astype(np.float32)
+        second_scores = (1.0 - second.astype(np.float32) / area).astype(np.float32)
+        margins = ((second - out_dists).astype(np.float32) / area).astype(np.float32)
+        best_proto = np.where(ids[:, 0] >= 0, rec[:, 10].astype(np.int32), -1)
+        return TemplateBatch(
+            ids=ids[:, 0].copy(),
+            scores=scores,
+            second_scores=second_scores,
+            margins=margins,
+            dists=out_dists,
+            second_dists=second,
+            second_ids=second_ids,
+            top_k_ids=ids.copy(),
+            top_k_scores=out_scores,
+            best_prototypes=best_proto,
+            prototype_render_sizes=rec[:, 11].astype(np.int32),
+            prototype_dx=rec[:, 12].astype(np.int32),
+            prototype_dy=rec[:, 13].astype(np.int32),
+            prototype_downsample_modes=rec[:, 14].astype(np.int32),
+        )
+
+    def match_batch(
+        self,
+        glyphs: NDArray[np.uint8],
+        allowed_ids: set[int] | None = None,
+        top_k: int | None = None,
+    ) -> TemplateBatch:
+        """Top-K template match for a ``uint8 [N, H, W]`` glyph batch (GPU)."""
+        glyphs = np.asarray(glyphs, dtype=np.uint8)
+        if glyphs.ndim != 3:
+            raise ValueError(f"glyphs must be [N, H, W], got {glyphs.shape}")
+        n = glyphs.shape[0]
+        area = self.input_size * self.input_size
+        k = self.default_top_k if top_k is None else int(top_k)
+        if k != _GPU_TEMPLATE_K:
+            raise ValueError(
+                f"GPU template matcher supports top_k={_GPU_TEMPLATE_K}, got {k}"
+            )
+        if n == 0:
+            return TemplateBatch(
+                ids=np.empty(0, dtype=np.int32),
+                scores=np.empty(0, dtype=np.float32),
+                second_scores=np.empty(0, dtype=np.float32),
+                margins=np.empty(0, dtype=np.float32),
+                dists=np.empty(0, dtype=np.int32),
+                second_dists=np.empty(0, dtype=np.int32),
+                second_ids=np.empty(0, dtype=np.int32),
+                top_k_ids=np.empty((0, k), dtype=np.int32),
+                top_k_scores=np.empty((0, k), dtype=np.float32),
+                best_prototypes=np.empty(0, dtype=np.int32),
+                prototype_render_sizes=np.empty(0, dtype=np.int32),
+                prototype_dx=np.empty(0, dtype=np.int32),
+                prototype_dy=np.empty(0, dtype=np.int32),
+                prototype_downsample_modes=np.empty(0, dtype=np.int32),
+            )
+        if glyphs.shape[1:] != (self.input_size, self.input_size):
+            raise ValueError(
+                f"expected {self.input_size}x{self.input_size} glyphs, "
+                f"got {glyphs.shape[1:]}"
+            )
+        proto_ids = self._allowed_prototypes(allowed_ids)
+        if proto_ids.size == 0:
+            return TemplateBatch(
+                ids=np.full(n, -1, dtype=np.int32),
+                scores=np.zeros(n, dtype=np.float32),
+                second_scores=np.zeros(n, dtype=np.float32),
+                margins=np.zeros(n, dtype=np.float32),
+                dists=np.full(n, area, dtype=np.int32),
+                second_dists=np.full(n, area, dtype=np.int32),
+                second_ids=np.full(n, -1, dtype=np.int32),
+                top_k_ids=np.full((n, k), -1, dtype=np.int32),
+                top_k_scores=np.zeros((n, k), dtype=np.float32),
+                best_prototypes=np.full(n, -1, dtype=np.int32),
+                prototype_render_sizes=np.full(n, -1, dtype=np.int32),
+                prototype_dx=np.full(n, -1, dtype=np.int32),
+                prototype_dy=np.full(n, -1, dtype=np.int32),
+                prototype_downsample_modes=np.full(n, -1, dtype=np.int32),
+            )
+
+        bits = np.packbits(glyphs.reshape(n, -1), axis=1, bitorder="little")
+        words = bits.view(np.uint32).reshape(-1)
+        if allowed_ids is None:
+            mask = np.full(self._allowed_words, 0xFFFFFFFF, dtype=np.uint32)
+            rem = self.num_classes % 32
+            if rem:
+                mask[-1] &= np.uint32((1 << rem) - 1)
+        else:
+            mask = np.zeros(self._allowed_words, dtype=np.uint32)
+            for cid in sorted(allowed_ids):
+                mask[cid // 32] |= np.uint32(1 << (cid % 32))
+
+        self._ensure_buffers(n)
+        self.device.queue.write_buffer(self._glyph_buf, 0, words, 0, words.nbytes)
+        self.device.queue.write_buffer(
+            self._allowed_buf, 0, mask, 0, mask.nbytes
+        )
+        enc = self.device.create_command_encoder()
+        p = enc.begin_compute_pass()
+        p.set_pipeline(self._pipeline)
+        p.set_bind_group(0, self._bind_group, [], 0, 99)
+        p.dispatch_workgroups(n, 1, 1)
+        p.end()
+        size = n * _GPU_TEMPLATE_RECORD * 4
+        enc.copy_buffer_to_buffer(self._result_buf, 0, self._readback, 0, size)
+        self.device.queue.submit([enc.finish()])
+        self._readback.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(self._readback.read_mapped(size=size), dtype=np.uint8).copy()
+        self._readback.unmap()
+        self.last_dispatch_count = 1
+        return self._parse_results(raw, n, area)
+
+
+class AutoTemplateMatcher:
+    """Per-batch template backend selection (CPU vs GPU), AutoBackend style.
+
+    The GPU template matcher wins from ~batch 4 on the game model but pays
+    a fixed per-call sync floor, so this wrapper benchmarks both matchers at
+    construction and delegates every ``match_batch`` call to the measured
+    winner for the actual glyph count.
+    """
+
+    def __init__(
+        self,
+        cpu: "TemplateV2Classifier",
+        gpu: "WGPUTemplateMatcher",
+        batch_sizes: tuple[int, ...] = (1, 4, 8, 16, 32),
+        repeat: int = 3,
+        iters: int = 3,
+    ):
+        self.cpu = cpu
+        self.gpu = gpu
+        rng = np.random.default_rng(0)
+        self.measurements: dict[int, dict[str, float]] = {}
+        for batch in batch_sizes:
+            glyphs = (rng.random((batch, 24, 24)) > 0.5).astype(np.uint8) * 255
+            self.measurements[batch] = {
+                "cpu": median_time(
+                    lambda: cpu.match_batch(glyphs), repeat, iters
+                ),
+                "gpu": median_time(
+                    lambda: gpu.match_batch(glyphs), repeat, iters
+                ),
+            }
+        self.batch_sizes = tuple(sorted(self.measurements))
+
+    @property
+    def crossover(self) -> tuple[int, str] | None:
+        """Smallest batch where the GPU matcher is faster (if any)."""
+        for batch in self.batch_sizes:
+            m = self.measurements[batch]
+            if m["gpu"] < m["cpu"]:
+                return batch, "wgpu"
+        return None
+
+    def _estimate(self, table: dict[int, float], n: int) -> float:
+        sizes = self.batch_sizes
+        if len(sizes) == 1:
+            return table[sizes[0]]
+        if n <= sizes[0]:
+            return table[sizes[0]]
+        if n >= sizes[-1]:
+            a, b = sizes[-2], sizes[-1]
+            marginal = (table[b] - table[a]) / (b - a)
+            return max(0.0, table[b] + marginal * (n - b))
+        for a, b in zip(sizes, sizes[1:]):
+            if a <= n <= b:
+                t = (n - a) / (b - a)
+                return table[a] + t * (table[b] - table[a])
+        raise AssertionError("unreachable")
+
+    def pick(self, n: int) -> object:
+        if n <= 0:
+            return self.cpu
+        cpu_t = self._estimate(
+            {b: m["cpu"] for b, m in self.measurements.items()}, n
+        )
+        gpu_t = self._estimate(
+            {b: m["gpu"] for b, m in self.measurements.items()}, n
+        )
+        return self.gpu if gpu_t < cpu_t else self.cpu
+
+    def match_batch(
+        self,
+        glyphs: NDArray[np.uint8],
+        allowed_ids: set[int] | None = None,
+        top_k: int | None = None,
+    ) -> TemplateBatch:
+        n = int(np.asarray(glyphs).shape[0])
+        return self.pick(n).match_batch(glyphs, allowed_ids, top_k)

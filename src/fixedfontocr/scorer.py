@@ -487,12 +487,17 @@ class SegmentScorer:
     through the backend boundary.
     """
 
-    def __init__(self, model: OCRModel, cnn_backend: Backend | None = None):
+    def __init__(
+        self,
+        model: OCRModel,
+        cnn_backend: Backend | None = None,
+        template_backend=None,
+    ):
         self.model = model
         self.input_size = model.input_size
         self.normalize_spec = model.normalize_spec
         if model.templates_v2 is not None:
-            self.template = TemplateV2Classifier(
+            self.template = template_backend or TemplateV2Classifier(
                 data=model.templates_v2,
                 charset=model.charset,
                 input_size=model.input_size,
@@ -638,7 +643,7 @@ class SegmentScorer:
                 (tb.scores < 1.0)
                 & (tb.margins < self.template_margin_threshold)
             )
-            if isinstance(self.template, TemplateV2Classifier):
+            if tb.prototype_downsample_modes is not None:
                 # A pixel-exact low-res prototype can be shared by two
                 # different characters (e.g. '.' and '*' both rasterize to
                 # the same tiny blob at 11 px), so an exact match with zero

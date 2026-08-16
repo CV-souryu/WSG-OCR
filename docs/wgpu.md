@@ -264,6 +264,11 @@ the four tasks:
 - **T1 shader fusion**: DONE as a stronger form — the `mega.wgsl` single
   dispatch (one workgroup per glyph, shared-memory intermediates) replaced
   the eight-dispatch chain for both `classify()` and `forward_logits()`.
+- **G2 template matching on GPU**: DONE — `template_match.wgsl` runs the
+  whole Template V2 cascade (coarse filter, XOR+popcount, ink-band
+  fallback, deterministic Top-K, winner prototype) in one dispatch per
+  glyph batch, byte-exact against the CPU reference. End-to-end
+  `recognize()` on `model/game_cn` is now 3.2-4.7x faster on GPU/auto.
 - **T2 DP Top-K 回灌**: `classify_topk(glyphs, allowed_mask)` +
   `logits_for(glyphs, char_ids)` so the lattice scorer reads back
   ~`N*(K*8+12)` bytes instead of the full `[N, C]` logits.

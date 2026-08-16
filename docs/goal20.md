@@ -139,24 +139,34 @@ CPU 路径。
 CPU offload + 管线简化（tracker 多帧场景整图上传可摊销），基准必须
 诚实记录传输量与每帧耗时。
 
-### T4 — persistent/staged readback（摊薄同步地板）
+### T4 — persistent/staged readback（摊薄同步地板）✅ 完成（含负面结论）
 
 现状：`classify` 已持久 staging + 单 sync；`forward_logits` 每层新建
 staging + 每层 sync。
 
-1. `forward_logits` 改为单 encoder：整条链一个 command encoder，末尾
-   一次 copy 到持久 staging → 单次 `map_sync`；staging 按容量复用。
-2. `staged=True`：双缓冲 readback + `map_async`：等待第 N 帧 map 的
-   同时提交第 N+1 帧 compute（tracker/连续帧场景把 ~1.4 ms 地板摊到
-   帧间）。
-3. `benchmark_wgpu.py` 新增连续帧场景（如 10 帧同 ROI recognize），
-   记录 per-frame steady-state。
+落地：
+
+1. `forward_logits` 早在 G1 mega 已是单 encoder + 持久 staging + 单次
+   `map_sync`（本项第 1 条在 mega 落地时已完成）。
+2. `classify(..., staged=True)` / `forward_logits(..., staged=True)`：
+   `map_async` + `promise.sync_wait()` 异步读回，staging 双缓冲
+   ping-pong（`_ensure_staged_buffers`，按容量复用、槽位交替），结果与
+   同步路径逐位一致；连续调用不会在仍处于 mapped 的缓冲上重 map。
+3. 连续帧测量（Metal M4 / wgpu 0.32，N=16、1894 类，~40 帧）：
+   `map_sync` 循环 1.65 ms/帧、staged 公共 API 1.67 ms/帧、
+   手工延迟等待的流水线（先提交第 N+1 帧再等第 N 帧 map）1.71 ms/帧
+   —— **三种模式持平，每帧地板是 submit→map 往返延迟本身，不是宿主侧
+   停顿**；本机 GPU compute 只有 ~0.1 ms，没有可与之重叠的工作，双缓冲
+   无可测收益。结论如实记录：T4 的 API 与缓冲结构落地、parity 全绿，
+   但「摊薄 sync 地板」在本平台**无收益**（风险节的 Metal 单设备验证
+   结论为负面），收益预期保留给 compute 更重/宿主处理更重的场景。
 
 验收：`classify(..., staged=True)` / `forward_logits(..., staged=True)`
-与同步路径结果一致；连续帧 benchmark 每帧耗时下降；parity 全绿。
+与同步路径结果一致 ✅；连续帧 benchmark 每帧耗时**未下降**（如实记录，
+见上）；parity 全绿 ✅（`tests/test_goal20_wgpu.py` 8 个全绿、无 xfail）。
 
 风险：wgpu-py 同步 API 限制（`map_async` 可用但轮询/回调需自管）；
-Metal 单设备验证。
+Metal 单设备验证 = 本节的负面结论。
 
 ## 4. 全链路 GPU 方向（G2-G4，继 mega 之后）
 
@@ -242,13 +252,16 @@ G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 评分
       （ids 一致、logits <1e-4，实测 ~7.6e-5）；stage 生产路径稀疏读回
       （top-7 + 模板 gather，边界保护回退），读回 N×(60+4C) →
       N×156 B（game_cn 48.9x）；`test_goal20_wgpu.py` 两个 T2 xfail 翻正
-- [ ] `tests/test_goal20_wgpu.py` 全绿（无 xfail）—— 仅剩 T4 staged
-      readback
-- [ ] `tests/test_wgpu.py` + `tests/test_wgpu_vectors.py` +
-      `tests/test_auto_backend.py` 全绿
-- [ ] 全量回归（631 tests + 235-crop corpus + game_samples）在
-      `backend="cpu"` 下与当前 HEAD CPU 输出一致
-- [ ] 端到端 parity：digits / CJK / game_cn 上 `backend="wgpu"` ==
+- [x] T4 staged readback：`classify`/`forward_logits` 的 `staged=True`
+      双缓冲 `map_async` 读回与同步路径逐位一致；连续帧实测每帧地板
+      是 submit→map 往返（1.65-1.71 ms，双缓冲无额外收益，负面结论
+      如实记录）；`test_goal20_wgpu.py` 最后 1 个 xfail 翻正
+- [x] `tests/test_goal20_wgpu.py` 全绿（无 xfail，8 个全绿）
+- [x] `tests/test_wgpu.py` + `tests/test_wgpu_vectors.py` +
+      `tests/test_auto_backend.py` 全绿（28 个）
+- [x] 全量回归（656 tests + 235-crop corpus + game_samples）在
+      `backend="cpu"` 下与当前 HEAD CPU 输出一致（全量套件全绿）
+- [x] 端到端 parity：digits / CJK / game_cn 上 `backend="wgpu"` ==
       `backend="cpu"`（text、char_ids、scores < 1e-4）
 - [x] 一次 submit 出 OCR 结果（G2+G3+G4 同 encoder，读回仅最终记录）：
       binary 混合模型走 `score_line`，soft 混合模型走
@@ -256,9 +269,12 @@ G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 评分
       1 个 submit、1 次 map_sync、1 次读回）；crops_items dict 全语料
       CSV 答案测试 tripwire 全部其他 GPU 入口，断言整行 recognize 只
       经 stage 单次提交且结果与 CPU 一致
-- [ ] 基准更新并写回 `docs/wgpu.md`：dispatch 数、phase 耗时、
-      crossover、连续帧 readback 摊薄
-- [ ] README / `docs/architecture.md` 状态更新（Goal 20 complete）
+- [x] 基准更新并写回 `docs/wgpu.md`：dispatch 数、phase 耗时、
+      crossover、连续帧 readback 摊薄（含 T4 负面结论）
+- [x] README / `docs/architecture.md` 状态更新（Goal 20 complete）
+
+**Goal 20 完成**：G1-G4 + T1-T4 全部落地；`tests/test_goal20_wgpu.py`
+8 个全绿（无 xfail），全量套件 656 passed / 0 failed。
 
 ## 7. 环境与基线（2026-08-16 复核）
 

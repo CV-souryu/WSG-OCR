@@ -760,7 +760,38 @@ spacing, and normalized size. Pass a custom profile to
 - Goal 20 G4 landed: `WGPUScoringStage.score_line` closes the whole
   scoring chain (template match + TinyCNN logits) into ONE submit with
   ONE readback per line (2 syncs -> 1; e.g. 初雪 crop 26.4 -> 21.1 ms).
+  `score_line_from_image` additionally folds the G3 preprocess dispatch
+  into the same encoder for soft-input hybrids, so a full OCR line
+  (G2+G3+G4) comes out of ONE submit / ONE `map_sync` — the whole
+  `recognize()` on the crops_items dict corpus is verified to be a single
+  GPU submission (trip-wired tests) with answers matching
+  `crops_items_recognition.csv` and `backend="wgpu" == backend="cpu"`.
   The visual DP intentionally stays on CPU: `decode_dp` uses f64
   arithmetic with a 1e-12 tie tolerance that f32 WGSL cannot reproduce,
   and it is microsecond-scale — fonts/goal keeps the decoder on the CPU
-  boundary. Remaining: T2 Top-K readback trimming (`docs/goal20.md`).
+  boundary.
+- Goal 20 T2 landed: `Backend.classify_topk` + `logits_for` (GPU: new
+  mega modes with numpy fallbacks on the ABC) and the stage's production
+  path reads back the masked top-7 + template-id gather instead of the
+  full `[N, C]` logits — **48.9x less readback** on game_cn (7,636 B ->
+  156 B per glyph) with a tie-boundary fallback guard; the hybrid fusion
+  algorithm is unchanged (`tests/test_goal20_crops_gpu.py` sparse
+  contract + full-corpus CSV parity).
+- Goal 20 T4 landed: `classify`/`forward_logits` accept `staged=True`
+  (`map_async` on ping-pong staging buffers, byte-identical results).
+  Measured on Metal M4 the per-frame floor is the submit→map round trip
+  itself (1.65-1.71 ms for sync/staged/pipelined alike), so double
+  buffering shows no measurable gain on this platform — documented as an
+  honest negative result; the API is in place for heavier host/GPU
+  scenarios.
+- Goal 20 template scan tuned: `template_match.wgsl` runs 512 threads per
+  workgroup with register-local per-char minima (28 KB `sm_min` shared
+  array removed) — `match_batch` N=1/7: 9.1/11.7 ms -> 4.0/2.7 ms,
+  byte-exact parity unchanged, template auto crossover batch 4 -> 2, and
+  every pinned crops crop now reaches or beats CPU end-to-end (乌戈里尼
+  2.3x).
+- **Goal 20 is complete** (G1-G4 + T1-T4): `tests/test_goal20_wgpu.py` is
+  fully green (no xfail), the full suite is 656 passed / 0 failed on the
+  current HEAD CPU reference, and the design/task/benchmark writeup lives
+  in [`docs/goal20.md`](docs/goal20.md) with the architecture in
+  [`docs/wgpu.md`](docs/wgpu.md).

@@ -6,9 +6,10 @@ Pins the acceptance criteria defined in ``docs/goal20.md``:
   never regress while WGPU work happens against the current repo CPU
   implementation as the parity reference (NOT the Goal 19 version-1.0
   snapshot; see ``docs/goal20.md`` section 1);
-- the remaining ``xfail`` pins T4 staged readback — see
-  ``docs/goal20.md`` section 3. Each one flips to a plain test when its
-  task lands.
+- every phase-2 task (T1 shader fusion, T2 DP Top-K 回灌, T3 GPU
+  preprocessing, T4 staged readback) has landed and its contract test is
+  a plain test here — the file is fully green, see ``docs/goal20.md``
+  section 3 for the task details.
 
 Per-layer numeric parity, exported-vector parity and auto-backend selection
 live in ``tests/test_wgpu.py``, ``tests/test_wgpu_vectors.py`` and
@@ -29,8 +30,6 @@ from fixedfontocr.model import write_cnn_model
 from fixedfontocr.types import Component, default_profile
 
 from conftest import render_text
-
-T4 = "Goal 20 T4 (staged readback) pending: docs/goal20.md"
 
 
 def _random_weights(num_classes: int, seed: int = 0) -> dict[str, np.ndarray]:
@@ -248,7 +247,6 @@ def test_goal20_gpu_preprocess_parity(wgpu) -> None:
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=T4, strict=False)
 def test_goal20_staged_readback_parity(wgpu, random_glyphs) -> None:
     """staged=True readback returns identical results to the sync path."""
     base = wgpu.classify(random_glyphs)
@@ -258,3 +256,8 @@ def test_goal20_staged_readback_parity(wgpu, random_glyphs) -> None:
     logits = wgpu.forward_logits(random_glyphs)
     staged_logits = wgpu.forward_logits(random_glyphs, staged=True)
     assert np.abs(logits - staged_logits).max() < 1e-4
+    # consecutive staged calls alternate the ping-pong buffers
+    again = wgpu.classify(random_glyphs, staged=True)
+    assert np.array_equal(base.char_ids, again.char_ids)
+    again_logits = wgpu.forward_logits(random_glyphs, staged=True)
+    assert np.abs(logits - again_logits).max() < 1e-4

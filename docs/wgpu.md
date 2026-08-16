@@ -314,6 +314,12 @@ the four tasks:
 - **T3 GPU preprocessing**: upload the RGB image once and do ROI crop,
   grayscale, nearest-neighbor resize and normalize in WGSL; keep only
   bounding-box computation on CPU (soft path first, per-profile gated).
-- **T4 persistent/staged readback**: `forward_logits` in one command
-  encoder with a single `map_sync`, double-buffered `staged=True`
-  readback to amortize the ~1.5 ms sync floor across frames.
+- **T4 persistent/staged readback**: DONE with an honest negative result on
+  this platform — `classify`/`forward_logits` gained `staged=True`
+  (`map_async` + `sync_wait` on ping-pong staging buffers, byte-identical
+  results), but the continuous-frame measurement shows the per-frame floor
+  is the submit→map round trip itself (1.65-1.71 ms for sync, staged and a
+  hand-pipelined deferral alike), not host-side stalls — with ~0.1 ms of
+  GPU compute per frame there is nothing to overlap, so double buffering
+  has no measurable gain on Metal M4. The API and buffer structure are in
+  place for scenarios with heavier host or GPU work.

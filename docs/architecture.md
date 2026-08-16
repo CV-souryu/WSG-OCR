@@ -732,14 +732,22 @@ is frozen (`src/fixedfontocr/defaults.py`:
 checkbox: segmentation lattice stability, 鲃/小, low-res Z17/巴尔的摩,
 mixed charset, Top-K, lexicon decoder, partial-word, the complete CPU
 benchmark and the complete regression dataset. Formal WGPU work
-(Goal 20) starts only from this freeze; its phase-2 design, task breakdown
-(T1 shader fusion, T2 DP Top-K 回灌, T3 GPU preprocessing, T4 staged
-readback) and acceptance criteria are prepared in
-[`goal20.md`](goal20.md) with the contract skeleton
-`tests/test_goal20_wgpu.py`. The Goal 20 parity reference is the current
-repo CPU implementation at HEAD (not the version-1.0 snapshot; CPU commits
-after the freeze are part of the baseline). Freeze criteria and where each
-is verified:
+(Goal 20) starts only from this freeze and is now **complete**: G1 mega
+(whole TinyCNN in one dispatch), G2 template matching on GPU (512-thread
+workgroup, register-local minima, byte-exact), G3 GPU preprocessing
+(byte-exact soft batch), G4 single-submit scoring chain (template +
+preprocess + CNN in one encoder, one readback per line), T2 sparse
+Top-K/gather readback (48.9x less than the full `[N, C]` logits on
+game_cn) and T4 staged readback (`staged=True` with ping-pong buffers;
+measured no gain on Metal M4 — the floor is the submit→map round trip,
+documented as an honest negative result). The visual DP stays on the CPU
+(f64 tie semantics). Design, task breakdown and benchmark writeups live
+in [`goal20.md`](goal20.md) and [`wgpu.md`](wgpu.md); the Goal 20 parity
+reference is the current repo CPU implementation at HEAD (not the
+version-1.0 snapshot; CPU commits after the freeze are part of the
+baseline). `tests/test_goal20_wgpu.py` is fully green (no xfail) and the
+full suite (656 tests + the 235-crop corpus + game_samples) passes.
+Freeze criteria and where each is verified:
 
 | Criterion | Evidence |
 | --- | --- |

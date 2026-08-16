@@ -264,6 +264,9 @@ class WGPUBackend(Backend):
         self._bg_cache: dict[tuple, object] = {}
         self._readback = None
         self._logits_readback = None
+        self._staged_readbacks: dict | None = None
+        self._staged_cap = 0
+        self._staged_slot = 0
         self.last_timing: dict[str, float] | None = None
         self.last_dispatch_count: int | None = None
 
@@ -272,7 +275,11 @@ class WGPUBackend(Backend):
     # ------------------------------------------------------------------
 
     def classify(
-        self, glyphs: NDArray[np.uint8], *, profile: bool = False
+        self,
+        glyphs: NDArray[np.uint8],
+        *,
+        profile: bool = False,
+        staged: bool = False,
     ) -> BackendResult:
         arr, n, h, w = _check_glyphs(glyphs)
         if h != self._H or w != self._W:
@@ -290,7 +297,7 @@ class WGPUBackend(Backend):
                 scores=np.empty(0, dtype=np.float32),
             )
         self._ensure_buffers(n)
-        raw, timing = self._mega_run(arr, mode=self._MEGA_CLASSIFY)
+        raw, timing = self._mega_run(arr, mode=self._MEGA_CLASSIFY, staged=staged)
         if profile:
             self.last_timing = timing
         char_ids, scores = self._parse_results(raw)
@@ -304,12 +311,18 @@ class WGPUBackend(Backend):
     _MEGA_TOPK_GATHER = 4
     _MEGA_GATHER_MAX = 64  # requested ids per glyph (logits_for cap)
 
-    def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
+    def forward_logits(
+        self, glyphs: NDArray[np.uint8], staged: bool = False
+    ) -> NDArray[np.float32]:
         """Raw ``[N, C]`` logits through the single-dispatch mega pipeline.
 
         One submission runs the entire TinyCNN per glyph workgroup; the full
         logits row of every glyph is read back once (the DP lattice scorer
-        consumes it). Zero intermediate copy-backs.
+        consumes it). Zero intermediate copy-backs. ``staged=True`` (T4)
+        reads back through the asynchronous map path on ping-pong staging
+        buffers — identical results, and consecutive calls never block on a
+        still-mapped buffer, which is what lets a multi-frame loop overlap
+        the previous frame's readback with the next frame's submission.
         """
 
         arr, n, h, w = _check_glyphs(glyphs)
@@ -317,7 +330,7 @@ class WGPUBackend(Backend):
             raise ValueError(f"expected {self._H}x{self._W} glyphs, got {h}x{w}")
         if n == 0:
             return np.empty((0, self.num_classes), dtype=np.float32)
-        raw, _timing = self._mega_run(arr, mode=self._MEGA_LOGITS)
+        raw, _timing = self._mega_run(arr, mode=self._MEGA_LOGITS, staged=staged)
         return np.ascontiguousarray(
             raw.view("<f4").reshape(n, self.num_classes), dtype=np.float32
         )
@@ -1053,17 +1066,47 @@ class WGPUBackend(Backend):
             self._bg_cache[key] = bg
         return bg
 
+    def _ensure_staged_buffers(self) -> None:
+        """Ping-pong async-readback buffers (T4, sized by the current cap)."""
+        if getattr(self, "_staged_cap", 0) == self._cap and self._staged_readbacks:
+            return
+        self._staged_cap = self._cap
+        n = self._cap
+        u = self._U_MAP_READ | self._U_COPY_DST
+        self._staged_readbacks = {
+            "classify": [
+                self._device_create_buffer(size=n * 12, usage=u) for _ in range(2)
+            ],
+            "logits": [
+                self._device_create_buffer(
+                    size=n * self.num_classes * 4, usage=u
+                )
+                for _ in range(2)
+            ],
+        }
+        self._staged_slot = 0
+
     def _mega_run(
-        self, arr: NDArray[np.uint8], mode: int
+        self,
+        arr: NDArray[np.uint8],
+        mode: int,
+        staged: bool = False,
     ) -> tuple[NDArray[np.uint8], dict[str, float]]:
         """Run the whole TinyCNN in ONE dispatch and read back once.
 
         One workgroup per glyph; every intermediate tensor lives in
         workgroup shared memory, so the host performs no intermediate
         copy-backs and only the final record/logits are staged out.
+
+        ``staged=True`` (T4) uses ``map_async`` on ping-pong staging
+        buffers instead of ``map_sync``; results are identical and the
+        double buffering means a caller can submit the next frame before
+        the previous frame's mapping is consumed.
         """
         n = arr.shape[0]
         self._ensure_buffers(n)
+        if staged:
+            self._ensure_staged_buffers()
         t0 = time.perf_counter()
         self.device.queue.write_buffer(
             self._bufs["input"], 0, arr, 0, arr.nbytes
@@ -1078,19 +1121,32 @@ class WGPUBackend(Backend):
         p.end()
         if mode == self._MEGA_CLASSIFY:
             size = n * 12
-            enc.copy_buffer_to_buffer(self._bufs["result"], 0, self._readback, 0, size)
-            staging = self._readback
+            src = self._bufs["result"]
+            staging = (
+                self._staged_readbacks["classify"][self._staged_slot]
+                if staged
+                else self._readback
+            )
         else:
             size = n * self.num_classes * 4
-            enc.copy_buffer_to_buffer(
-                self._bufs["logits"], 0, self._logits_readback, 0, size
+            src = self._bufs["logits"]
+            staging = (
+                self._staged_readbacks["logits"][self._staged_slot]
+                if staged
+                else self._logits_readback
             )
-            staging = self._logits_readback
+        enc.copy_buffer_to_buffer(src, 0, staging, 0, size)
         self.device.queue.submit([enc.finish()])
         t2 = time.perf_counter()
-        staging.map_sync(self._wgpu.MapMode.READ)
+        if staged:
+            promise = staging.map_async(self._wgpu.MapMode.READ, size=size)
+            promise.sync_wait()
+        else:
+            staging.map_sync(self._wgpu.MapMode.READ)
         raw = np.frombuffer(staging.read_mapped(size=size), dtype=np.uint8).copy()
         staging.unmap()
+        if staged:
+            self._staged_slot ^= 1
         t3 = time.perf_counter()
         self.last_dispatch_count = 1
         return raw, {

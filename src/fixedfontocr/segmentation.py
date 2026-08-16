@@ -845,6 +845,12 @@ def _drop_weak_merges(
 
 
 HYBRID_FAKE_MERGE_PENALTY = 0.12
+# A merged blob is vetoed when a single atom nearly beats it: with the
+# margin, a strong atom (e.g. template-exact ``4`` at 0.941) still vetoes
+# a CNN look-alike blob (``43`` read as ``“`` at 0.977) even though the
+# blob's fused score edges it out by a few points. Template-confident
+# blobs (>= 0.9) stay exempt, so real glyphs are never touched.
+HYBRID_FAKE_ATOM_MARGIN = 0.05
 
 
 def _hybrid_fake_merge_penalty(
@@ -937,7 +943,9 @@ def _hybrid_fake_merge_penalty(
             if i < j
         ):
             return 0.0
-        if any(info[0] > visual for info in q):
+        if any(
+            info[0] + HYBRID_FAKE_ATOM_MARGIN > visual for info in q
+        ):
             return penalty()
     return 0.0
 

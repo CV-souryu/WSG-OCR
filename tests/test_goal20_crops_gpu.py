@@ -440,12 +440,9 @@ def test_crops_gpu_dict_mode_csv_answers_single_submit(game_ocrs) -> None:
     text recorded for the crop and 预期值 is the dict-mode ground truth the
     engine must surface as ``matched_term``. For every labeled crop the GPU
     result must equal the CPU result (text and matched_term), the whole
-    recognize() must be one GPU submit, and — for every crop the current
-    CPU engine can read at all — the answer must equal the CSV row.
-
-    Two crops return '' on the CPU engine today (their CSV rows were
-    recorded by an earlier engine state), so they are excluded from the
-    CSV-match assertion but still asserted wgpu == cpu.
+    recognize() must be one GPU submit, and the answer must equal the CSV
+    row — all 235 crops are read by the current engine (the last two
+    previously-empty rows now decode ``H43`` and ``乌戈里尼·维瓦尔迪``).
     """
     _require_crops_and_bank()
     cpu_ocr, gpu_ocr = game_ocrs
@@ -453,9 +450,6 @@ def test_crops_gpu_dict_mode_csv_answers_single_submit(game_ocrs) -> None:
     assert stage is not None
     with open(CSV, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.reader(f))
-    # Crops the current CPU engine cannot read (returns ''); the CSV answer
-    # for these rows is not reproducible by either backend.
-    KNOWN_CPU_EMPTY = {"0_y226_y254_item2.png", "1_y400_y428_item1.png"}
     parity_bad: list[tuple[str, str, str]] = []
     csv_bad: list[tuple[str, str, str]] = []
     submit_bad: list[str] = []
@@ -479,11 +473,10 @@ def test_crops_gpu_dict_mode_csv_answers_single_submit(game_ocrs) -> None:
             )
         if stage.last_submit_count != 1:
             submit_bad.append(name)
-        if name not in KNOWN_CPU_EMPTY:
-            if got.text != row[2] or got.matched_term != row[3]:
-                csv_bad.append(
-                    (name, f"{got.text}|{got.matched_term}", f"{row[2]}|{row[3]}")
-                )
+        if got.text != row[2] or got.matched_term != row[3]:
+            csv_bad.append(
+                (name, f"{got.text}|{got.matched_term}", f"{row[2]}|{row[3]}")
+            )
     assert checked >= 200, f"corpus shrank? only {checked} labeled crops"
     assert not parity_bad, (
         f"{len(parity_bad)} crops disagree with CPU: {parity_bad[:5]}"

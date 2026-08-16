@@ -271,6 +271,13 @@ the four tasks:
   fallback, deterministic Top-K, winner prototype) in one dispatch per
   glyph batch, byte-exact against the CPU reference. End-to-end
   `recognize()` on `model/game_cn` is now 3.2-4.7x faster on GPU/auto.
+  Later tuned (still byte-exact): the scan is storage-latency bound, so the
+  workgroup went from 64 to 512 threads and the 28 KB `sm_min` workgroup
+  array (which capped occupancy at one threadgroup per core) was replaced
+  by per-thread register-local minima — workgroup storage drops to
+  ~11.6 KB and latency hides. `match_batch` N=1/7: 9.1/11.7 ms -> 4.0/2.7 ms,
+  crops end-to-end 1.3-2.3x (was 0.5-1.9x), template auto crossover
+  batch 4 -> batch 2.
 - **G3 GPU preprocessing**: DONE (soft path) — `preprocess_soft.wgsl`
   uploads the RGB image once and does ROI crop, grayscale, nearest-neighbor
   resize and baseline placement in one dispatch, byte-exact against the
@@ -289,11 +296,11 @@ the four tasks:
   single-submit recognize, and the full CSV answer key (文本值/预期值)
   with backend="wgpu" == backend="cpu".
   Measured on real crops (interleaved median 9x15): merging the second
-  submit saves the extra `map_sync` floor consistently — binary
-  `score_line` and soft `score_line_from_image` are both 1.13-1.21x vs the
-  two-submit equivalent; per-line cost is dominated by the G2 template
-  scan (~6.5-10.5 ms at N<=7, independent of submit count), and end-to-end
-  the big crops win 1.8-1.9x while tiny crops stay on CPU via auto.
+  submit saves the extra `map_sync` floor (~1.3-1.5 ms) — binary
+  `score_line` and soft `score_line_from_image` are 1.07-1.34x vs the
+  two-submit equivalent; with the G2 tuning above the per-line scoring
+  chain is now ~3.9-5.0 ms and end-to-end every pinned crop reaches or
+  beats CPU (乌戈里尼 2.3x, small crops 0.98-1.3x).
 - **T2 DP Top-K 回灌**: `classify_topk(glyphs, allowed_mask)` +
   `logits_for(glyphs, char_ids)` so the lattice scorer reads back
   ~`N*(K*8+12)` bytes instead of the full `[N, C]` logits.

@@ -292,48 +292,70 @@ text 一致）：
 | 巴尔的摩 | 40.1 ms | 15.8 ms | 16.9 ms | 2.5x / 2.4x |
 | 获得金币1000×3（21 字） | 157.9 ms | 33.7 ms | 33.5 ms | 4.7x / 4.7x |
 
-auto 选路：模板 crossover = (4, "wgpu")，CNN crossover = (64, "wgpu")。
+auto 选路：模板 crossover = (2, "wgpu")（模板 shader 提速后，见下方
+「模板扫描瓶颈」），CNN crossover = (64, "wgpu")。
 
-### crops_items dict 模式实测（2026-08-16，+ real-glyph bank，三后端
-text/matched_term 全部一致）
+### crops_items dict 模式实测（2026-08-16 复测，+ real-glyph bank，
+三后端 text/matched_term 全部一致；GPU 为模板 shader 提速后）
 
 | crop | CPU | GPU (wgpu) | auto | speedup |
 | --- | --- | --- | --- | --- |
-| Z17 | 20.7 ms | 19.8 ms | 19.9 ms | 1.05x / 1.04x |
-| Z28 | 18.7 ms | 17.9 ms | 18.6 ms | 1.04x / 1.00x |
-| 初雪（小 crop） | 12.3 ms | 26.4 ms | 12.3 ms | 0.46x / 1.00x |
-| 乌戈里尼（大 crop，~94 词条） | 92.0 ms | 50.8 ms | 49.4 ms | 1.81x / **1.86x** |
+| Z17 | 19.2 ms | 12.8 ms | — | **1.49x** |
+| Z28 | 17.2 ms | 9.1 ms | — | **1.89x** |
+| 初雪（小 crop） | 11.3 ms | 11.5 ms | — | 0.98x |
+| 乌戈里尼（大 crop，~94 词条） | 83.0 ms | 36.6 ms | — | **2.27x** |
+| 47工程 | 15.5 ms | 9.1 ms | — | **1.70x** |
+| Z1 | 14.5 ms | 11.0 ms | — | 1.32x |
+
+soft 混合模型同机复测：Z17 12.8→6.1 ms（2.12x）、初雪 6.9→6.2 ms
+（1.12x）、乌戈里尼 80.4→34.7 ms（**2.32x**）、Z28 14.6→6.2 ms
+（2.34x）——小 crop 也追平/反超 CPU。
 
 auto 后端在所有 crops 上无回归（小 crop 自动留在 CPU，大 crop 走 GPU），
 全语料 238 个标注 crop 的 dict 模式 parity 由
 `tests/test_goal20_crops_gpu.py::test_crops_gpu_dict_mode_csv_answers_single_submit`
 逐张断言（答案以 `crops_items_recognition.csv` 为准，1 submit/行）。
 
-### 单次发射 A/B 实测（2026-08-16，G4 补口后；真实 crops、真实 segments，
-交错测量 median of 9×15；2-submit = 模板 dispatch 与 CNN dispatch 分两次
-submit，1-submit = stage 同 encoder 合并发射）
+### 单次发射 A/B 实测（2026-08-16，模板 shader 提速后复测；真实 crops、
+真实 segments，交错测量 median of 9×15；2-submit = 模板 dispatch 与 CNN
+dispatch 分两次 submit，1-submit = stage 同 encoder 合并发射）
 
 | crop | N | binary 2sub | `score_line` | 收益 | soft 2sub | `score_line_from_image` | 收益 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Z17 | 3 | 7.85 ms | 6.46 ms | 1.21x | 7.93 ms | 6.54 ms | 1.21x |
-| 初雪 | 2 | 11.68 ms | 10.37 ms | 1.13x | 11.71 ms | 10.32 ms | 1.14x |
-| 乌戈里尼 | 7 | 11.83 ms | 10.46 ms | 1.13x | 12.27 ms | 10.71 ms | 1.15x |
-| Z1 | 2 | 7.91 ms | 6.72 ms | 1.18x | 7.92 ms | 6.78 ms | 1.17x |
+| Z17 | 3 | 5.25 ms | 3.91 ms | 1.34x | 5.32 ms | 3.99 ms | 1.33x |
+| 初雪 | 2 | 5.25 ms | 4.83 ms | 1.09x | 5.32 ms | 4.83 ms | 1.10x |
+| 乌戈里尼 | 7 | 5.25 ms | 4.42 ms | 1.19x | 5.33 ms | 4.99 ms | 1.07x |
+| Z1 | 2 | 5.24 ms | 3.91 ms | 1.34x | 5.32 ms | 3.99 ms | 1.33x |
 
-结论：合并发射稳定省掉第二个 `map_sync` 地板（~1.3-1.5 ms/行），binary 与
-soft 路径收益一致（1.13-1.21x）；每行剩余 ~6.5-10.5 ms 大头是 G2 模板
-全量扫描（N≤7 时 workgroup 数少、扫描 92.8k prototypes 的固定 ALU 成本），
-与 sync 数无关。端到端（dict + bank，median of 5×5，见上表同机复测）：
-乌戈里尼 82.3→44.9 ms（1.83x，binary）/ 80.7→42.8 ms（1.89x，soft），
-小 crop 仍受 sync 地板拖累（初雪 0.5-0.67x），由 `backend="auto"` 留在
-CPU。
+结论：合并发射省掉第二个 `map_sync` 地板（~1.3-1.5 ms/行），binary 与
+soft 路径一致（1.07-1.34x）；每行总耗时已从 ~6.5-10.5 ms 降到 ~3.9-5.0 ms
+（见下方模板扫描瓶颈）。
+
+### 模板扫描瓶颈（为什么原来每行 ~10 ms）
+
+原 shader 固定 64 线程/workgroup，且用 `sm_min: array<u32, 7000>`（28 KB）
+做逐字符最小距离——workgroup 共享内存逼近 32 KB 上限 → 每个 GPU core 只能
+驻留 1 个 workgroup、64 线程无法隐藏 storage 加载延迟；每个 prototype 的
+粗筛两次依赖加载喂分支，串行扫描 92,806 个 prototype 变成纯延迟受限
+（实测 ~2,000 cycles/prototype/thread，随类别数线性增长：allowed=50 →
+1.5 ms，allowed=1894 → 13.7 ms@N=7）。
+
+修复（`shaders/template_match.wgsl`，parity 逐字节不变）：
+workgroup 64 → **512 线程**；`sm_min` 28 KB 共享数组删除，改为**每线程
+寄存器局部数组**（每线程只持有自己那份字符的 min，`LOCAL=14` 槽），
+Top-K 仍是「每线程 K 个 key → thread 0 归并」的既有结构。共享内存降到
+~11.6 KB，多 workgroup 可同驻、延迟得以隐藏。实测：`match_batch`
+N=1/7 从 9.1/11.7 ms → 4.0/2.7 ms（2.3-4.4x），端到端全部 crops 反超
+或追平 CPU（乌戈里尼 1.83x→2.27x），auto 模板 crossover 从 batch 4
+降到 batch 2。
 
 三个事实（对排期的影响）：
 
 1. G1 mega 消灭了 forward_logits 的 8-sync 墙；G2 把端到端大头
-   （模板段）搬上 GPU —— 端到端从打平变为 **GPU 领先 3.2-4.7x**。
-2. 剩余 GPU 地板仍是单次 `map_sync`（~1.3-2.7 ms）：batch < 4 的
+   （模板段）搬上 GPU —— 端到端从打平变为 **GPU 领先 3.2-4.7x**，
+   模板 workgroup 提速后再进一步（crops 上 1.3-2.3x）。
+2. 剩余 GPU 地板仍是单次 `map_sync`（~1.3-1.5 ms）：batch < 2 的
    模板匹配与 batch < 64 的 CNN 由 auto 选路留在 CPU，无回归。
 3. G3（预处理）+ G4（评分链）已收口成「一次 submit 出 OCR 结果」；
-   单行再省一次 sync 的边际收益有限（大头是模板扫描），T2 读回裁剪、
-   T4 staged 双缓冲与模板 shader 的粗筛减枝作为后续优化方向。
+   单行再省一次 sync 的边际收益有限（~0.4-1.3 ms），T2 读回裁剪、
+   T4 staged 双缓冲作为后续优化方向。

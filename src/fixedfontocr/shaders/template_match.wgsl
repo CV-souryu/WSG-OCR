@@ -1,6 +1,6 @@
 // template_match.wgsl — GPU Template V2 matching in ONE dispatch.
 //
-// One 64-thread workgroup per glyph replicates TemplateV2Classifier.match_batch
+// One 512-thread workgroup per glyph replicates TemplateV2Classifier.match_batch
 // semantics exactly:
 //
 //   1. glyph coarse features (ink, h/w/top/left/bottom/right, ink tolerance)
@@ -17,17 +17,30 @@
 // All distances are exact integers (XOR + popcount), so the output matches
 // the numpy reference exactly, not within a tolerance.
 //
+// Performance: the per-glyph scan walks all C*P prototypes; with a small
+// workgroup the loop is storage-latency bound (each prototype's filter
+// loads feed a dependent branch, and a 64-thread workgroup cannot hide the
+// load latency). The workgroup is therefore 512 threads, and the per-char
+// minimum lives in per-thread registers (LOCAL slots, each thread owns the
+// chars c = tid + k*WS) instead of a C_MAX-wide workgroup array — that
+// keeps workgroup storage ~11.6 KB (sm_min was 28 KB alone), so several
+// workgroups fit per core and the latency hides. Measured on game_cn
+// (1894 classes x 49 prototypes): 64-thread baseline ~10-13 ms per line,
+// 512-thread version ~2.7-4 ms, byte-exact parity unchanged.
+//
 // Record per glyph (15 x u32):
 //   [0..4]   top-K char ids (-1 = 0xFFFFFFFF padding)
 //   [5..9]   top-K Hamming distances (padding = area+1)
 //   [10]     winning prototype index (global)
 //   [11..14] render_size, dx, dy, downsample_mode
 //
-// Constants: K = 5, C_MAX = 8192, P_MAX = 256 (host enforces).
+// Constants: K = 5, C_MAX = 7000, P_MAX = 256 (host enforces).
 
 const K: u32 = 5u;
 const C_MAX: u32 = 7000u;
 const P_MAX: u32 = 256u;
+const WS: u32 = 512u;
+const LOCAL: u32 = (C_MAX + WS - 1u) / WS;  // max chars owned by one thread
 
 struct Params {
     a: vec4<u32>,  // n, C, p, unused
@@ -42,13 +55,12 @@ struct Params {
 @group(0) @binding(5) var<storage, read> allowed: array<u32>;
 @group(0) @binding(6) var<storage, read_write> results: array<u32>;
 
-var<workgroup> sm_min: array<u32, C_MAX>;
 var<workgroup> sm_row_ink: array<u32, 24>;
 var<workgroup> sm_row_any: array<u32, 24>;
 var<workgroup> sm_col_any: array<u32, 24>;
 var<workgroup> sm_feats: array<u32, 8>;  // ink, h, w, top, left, bottom, right, ink_tol
 var<workgroup> sm_kth: array<u32, 1>;
-var<workgroup> sm_top_key: array<u32, 320>;  // 64 threads x K
+var<workgroup> sm_top_key: array<u32, WS * K>;  // per-thread top-K keys
 var<workgroup> sm_wdist: array<u32, P_MAX>;
 var<workgroup> sm_best_char: array<u32, 1>;
 
@@ -120,7 +132,25 @@ fn insert5(kk_vals: ptr<function, array<u32, 5>>, cnt: ptr<function, u32>, v: u3
     }
 }
 
-@compute @workgroup_size(64)
+// Merge the WS per-thread Top-K lists (WS*K keys) into the global Top-K.
+// Key = dist * C + char, so ascending key order == (dist, char_id) order.
+// count = total inserted keys (= the number of allowed chars).
+struct MergeResult {
+    out: array<u32, 5>,
+    count: u32,
+};
+
+fn merge_top_keys() -> MergeResult {
+    var out: array<u32, 5>;
+    var ocnt = 0u;
+    for (var i = 0u; i < K; i++) { out[i] = 0xffffffffu; }
+    for (var i = 0u; i < WS * K; i++) {
+        insert5(&out, &ocnt, sm_top_key[i]);
+    }
+    return MergeResult(out, ocnt);
+}
+
+@compute @workgroup_size(WS)
 fn main(
     @builtin(workgroup_id) wgid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -207,7 +237,15 @@ fn main(
     workgroupBarrier();
 
     // ---- pass A: coarse filter + exact scan, per-character minimum ----
-    for (var c = tid; c < C; c += 64u) {
+    // Each thread owns the chars c = tid + k*WS; its per-char minima live in
+    // registers (local_min) and its Top-K keys go to sm_top_key for the
+    // thread-0 merge, so no C_MAX-wide workgroup array is needed.
+    var local_min: array<u32, LOCAL>;
+    var keys: array<u32, 5>;
+    var kcnt = 0u;
+    for (var i = 0u; i < K; i++) { keys[i] = 0xffffffffu; }
+    for (var c = tid; c < C; c += WS) {
+        let k = (c - tid) / WS;
         var m = fill;
         if (allowed_bit(c) != 0u) {
             for (var t = 0u; t < p; t++) {
@@ -218,33 +256,36 @@ fn main(
                 }
             }
         }
-        sm_min[c] = m;
+        local_min[k] = m;
+        if (allowed_bit(c) != 0u) {
+            insert5(&keys, &kcnt, m * C + c);
+        }
+    }
+    for (var i = 0u; i < K; i++) {
+        sm_top_key[tid * K + i] = keys[i];
     }
     workgroupBarrier();
 
     // ---- k-th character distance over allowed chars (thread 0) ----
     if (tid == 0u) {
-        var kk_vals: array<u32, 5>;
-        var cnt = 0u;
-        for (var i = 0u; i < K; i++) { kk_vals[i] = 0xffffffffu; }
-        for (var c = 0u; c < C; c++) {
-            if (allowed_bit(c) != 0u) {
-                insert5(&kk_vals, &cnt, sm_min[c]);
-            }
-        }
-        if (cnt == 0u) {
+        let merged = merge_top_keys();
+        if (merged.count == 0u) {
             sm_kth[0u] = fill;
         } else {
-            sm_kth[0u] = kk_vals[min(K, cnt) - 1u];
+            sm_kth[0u] = merged.out[min(K, merged.count) - 1u] / C;
         }
     }
     workgroupBarrier();
 
     // ---- pass B: ink-band fallback scan (|ink delta| <= kth, not filter-ok) ----
     let ink = sm_feats[0u];
-    for (var c = tid; c < C; c += 64u) {
+    var keys2: array<u32, 5>;
+    var kcnt2 = 0u;
+    for (var i = 0u; i < K; i++) { keys2[i] = 0xffffffffu; }
+    for (var c = tid; c < C; c += WS) {
+        let k = (c - tid) / WS;
         if (allowed_bit(c) != 0u) {
-            var m = sm_min[c];
+            var m = local_min[k];
             for (var t = 0u; t < p; t++) {
                 let proto = c * p + t;
                 let f_ink = feats[proto * 2u] & 0xffffu;
@@ -254,33 +295,19 @@ fn main(
                     if (d < m) { m = d; }
                 }
             }
-            sm_min[c] = m;
+            local_min[k] = m;
+            insert5(&keys2, &kcnt2, m * C + c);
         }
+    }
+    for (var i = 0u; i < K; i++) {
+        sm_top_key[tid * K + i] = keys2[i];
     }
     workgroupBarrier();
 
     // ---- Top-K over allowed chars, ordered by (dist, char_id) ----
-    var keys: array<u32, 5>;
-    var kcnt = 0u;
-    for (var i = 0u; i < K; i++) { keys[i] = 0xffffffffu; }
-    for (var c = tid; c < C; c += 64u) {
-        if (allowed_bit(c) != 0u) {
-            let d = sm_min[c];
-            insert5(&keys, &kcnt, d * C + c);
-        }
-    }
-    for (var i = 0u; i < K; i++) {
-        sm_top_key[tid * K + i] = keys[i];
-    }
-    workgroupBarrier();
-
     if (tid == 0u) {
-        var out: array<u32, 5>;
-        var ocnt = 0u;
-        for (var i = 0u; i < K; i++) { out[i] = 0xffffffffu; }
-        for (var i = 0u; i < 320u; i++) {
-            insert5(&out, &ocnt, sm_top_key[i]);
-        }
+        let merged = merge_top_keys();
+        let out = merged.out;
         let base = g * 15u;
         for (var i = 0u; i < K; i++) {
             let key = out[i];

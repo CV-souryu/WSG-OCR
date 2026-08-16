@@ -732,4 +732,16 @@ spacing, and normalized size. Pass a custom profile to
   so further CPU gains need parallelism or the WGPU path (Goal 20).
 - Next milestones (after the Goal 19 CPU freeze): Goal 20 WGPU phase 2
   (DP-selected candidates back into the WGSL classifier, shader fusion,
-  GPU preprocessing) and real-screenshot corpus accumulation to 500+/1000+.
+  GPU preprocessing) — prepared in [`docs/goal20.md`](docs/goal20.md)
+  (design + task breakdown T1-T4 + acceptance criteria) with the contract
+  skeleton `tests/test_goal20_wgpu.py` — and real-screenshot corpus
+  accumulation to 500+/1000+.
+- Goal 20 G1 landed: `shaders/mega.wgsl` runs the ENTIRE TinyCNN in one
+  dispatch (one 64-thread workgroup per glyph, all intermediates in
+  workgroup shared memory). `WGPUBackend.classify()`/`forward_logits()`
+  each submit exactly one dispatch with a single final readback — zero
+  intermediate copy-backs. The 8-sync `forward_logits` wall
+  (12-17 ms) is gone (1.4-2.7 ms) and end-to-end `recognize()` on
+  `model/game_cn` is now at CPU parity (0.97-1.03x); the remaining
+  end-to-end cost is the CPU template scan (~40-50 ms/line), which is the
+  next GPU target (G2 in `docs/goal20.md`).

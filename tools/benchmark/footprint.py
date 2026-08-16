@@ -45,19 +45,19 @@ def fmt_bytes(n: int) -> str:
     return f"{n:,} B"
 
 
-def wgpu_buffers_per_batch(batch: int) -> int:
-    """Persistent classify buffers allocated by WGPUBackend for capacity N."""
+def wgpu_buffers_per_batch(batch: int, classes: int = 0) -> int:
+    """Persistent buffers allocated by WGPUBackend for capacity N.
+
+    The mega shader keeps every intermediate tensor in workgroup shared
+    memory, so only the packed input, the result/logits records and the two
+    staging buffers exist (no per-layer buffers at all).
+    """
     return batch * (
-        24 * 24  # input
-        + 24 * 24 * 4 * 4  # norm (NHWC padded to vec4)
-        + 12 * 12 * 8 * 4  # c1
-        + 12 * 12 * 8 * 4  # d1
-        + 6 * 6 * 16 * 4  # p1
-        + 6 * 6 * 16 * 4  # d2
-        + 3 * 3 * 32 * 4  # p2
-        + 32 * 4  # gap
-        + 12  # result
-        + 12  # readback
+        24 * 24  # input (packed uint8 glyphs)
+        + 12  # result record (best id + top-2 scores)
+        + classes * 4  # logits record (forward_logits)
+        + 12  # result readback staging
+        + classes * 4  # logits readback staging
     )
 
 
@@ -137,7 +137,9 @@ def main() -> None:
     print("\n== WGPU persistent batch buffers (per classify call) ==")
     batch_sizes = [int(v) for v in args.batch_sizes.split(",") if v.strip()]
     for batch in batch_sizes:
-        print(f"  batch {batch:>4d}: {fmt_bytes(wgpu_buffers_per_batch(batch))}")
+        print(
+            f"  batch {batch:>4d}: {fmt_bytes(wgpu_buffers_per_batch(batch, classes=n))}"
+        )
 
     print("\nnotes:")
     print("  - template bitsets are shared with the loaded model (no copy).")

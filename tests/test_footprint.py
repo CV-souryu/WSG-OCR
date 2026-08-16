@@ -28,8 +28,10 @@ def test_compact_feature_dtypes(font_path):
 
 def test_wgpu_buffer_formula():
     per_glyph = wgpu_buffers_per_batch(1)
-    assert per_glyph == 24920
+    assert per_glyph == 24 * 24 + 12 + 12  # input + result + result staging
     assert wgpu_buffers_per_batch(64) == 64 * per_glyph
+    # forward_logits adds the full-logits record + its staging buffer.
+    assert wgpu_buffers_per_batch(1, classes=1894) == per_glyph + 8 * 1894
 
 
 def test_fmt_bytes():

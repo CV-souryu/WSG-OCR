@@ -159,6 +159,7 @@ class WGPUBackend(Backend):
         "linear": "linear",
         "argmax": "argmax",
         "fused": "linear_argmax",
+        "mega": "mega",
     }
 
     def __init__(
@@ -193,7 +194,9 @@ class WGPUBackend(Backend):
         self._uniform_bufs: dict[tuple, object] = {}
         self._bg_cache: dict[tuple, object] = {}
         self._readback = None
+        self._logits_readback = None
         self.last_timing: dict[str, float] | None = None
+        self.last_dispatch_count: int | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -218,86 +221,22 @@ class WGPUBackend(Backend):
                 scores=np.empty(0, dtype=np.float32),
             )
         self._ensure_buffers(n)
-        t0 = time.perf_counter()
-        self.device.queue.write_buffer(self._bufs["input"], 0, arr, 0, arr.nbytes)
-        t1 = time.perf_counter()
-
-        enc = self.device.create_command_encoder()
-        self._dispatch(
-            enc, "normalize", self._classify_bind(
-                "normalize", [self._bufs["input"], self._bufs["norm"]], n
-            ), n * h * w
-        )
-        self._dispatch(
-            enc, "conv1", self._classify_bind(
-                "conv1",
-                [self._bufs["norm"], self._weight_bufs["conv1_w"], self._weight_bufs["conv1_b"], self._bufs["c1"]],
-                n,
-            ), n * 12 * 12 * (self._C1 // 4)
-        )
-        self._dispatch(
-            enc, "dw1", self._classify_bind(
-                "dw1",
-                [self._bufs["c1"], self._weight_bufs["dw1_w"], self._weight_bufs["dw1_b"], self._bufs["d1"]],
-                n,
-            ), n * 12 * 12 * (self._C1 // 4)
-        )
-        self._dispatch(
-            enc, "pw1", self._classify_bind(
-                "pw1",
-                [self._bufs["d1"], self._weight_bufs["pw1_w"], self._weight_bufs["pw1_b"], self._bufs["p1"]],
-                n,
-            ), n * 6 * 6 * (self._C2 // 4)
-        )
-        self._dispatch(
-            enc, "dw2", self._classify_bind(
-                "dw2",
-                [self._bufs["p1"], self._weight_bufs["dw2_w"], self._weight_bufs["dw2_b"], self._bufs["d2"]],
-                n,
-            ), n * 6 * 6 * (self._C2 // 4)
-        )
-        self._dispatch(
-            enc, "pw2", self._classify_bind(
-                "pw2",
-                [self._bufs["d2"], self._weight_bufs["pw2_w"], self._weight_bufs["pw2_b"], self._bufs["p2"]],
-                n,
-            ), n * 3 * 3 * (self._C3 // 4)
-        )
-        self._dispatch(
-            enc, "gap", self._classify_bind("gap", [self._bufs["p2"], self._bufs["gap"]], n), n * (self._C3 // 4)
-        )
-        self._dispatch(
-            enc, "fused", self._classify_bind(
-                "fused",
-                [self._bufs["gap"], self._weight_bufs["fc_w"], self._weight_bufs["fc_b"], self._bufs["result"]],
-                n,
-            ), n, workgroups=n
-        )
-        enc.copy_buffer_to_buffer(self._bufs["result"], 0, self._readback, 0, n * 12)
-        self.device.queue.submit([enc.finish()])
-        t2 = time.perf_counter()
-        self._readback.map_sync(self._wgpu.MapMode.READ)
-        raw = np.frombuffer(
-            self._readback.read_mapped(size=n * 12), dtype=np.uint8
-        ).copy()
-        self._readback.unmap()
-        t3 = time.perf_counter()
+        raw, timing = self._mega_run(arr, mode=self._MEGA_CLASSIFY)
         if profile:
-            self.last_timing = {
-                "upload": t1 - t0,
-                "compute": t2 - t1,
-                "readback": t3 - t2,
-                "total": t3 - t0,
-            }
+            self.last_timing = timing
         char_ids, scores = self._parse_results(raw)
         return BackendResult(char_ids=char_ids, scores=scores)
 
-    def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
-        """Raw ``[N, C]`` logits through the per-layer WGPU pipeline.
+    # Mega-dispatch modes (mega.wgsl).
+    _MEGA_CLASSIFY = 0
+    _MEGA_LOGITS = 1
 
-        The fused classify path only reads back Top-1/Top-2; the lattice
-        scorer needs full logits for Top-K fusion, so this method uses the
-        same verified per-layer entry points and the full ``linear`` shader.
+    def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
+        """Raw ``[N, C]`` logits through the single-dispatch mega pipeline.
+
+        One submission runs the entire TinyCNN per glyph workgroup; the full
+        logits row of every glyph is read back once (the DP lattice scorer
+        consumes it). Zero intermediate copy-backs.
         """
 
         arr, n, h, w = _check_glyphs(glyphs)
@@ -305,16 +244,9 @@ class WGPUBackend(Backend):
             raise ValueError(f"expected {self._H}x{self._W} glyphs, got {h}x{w}")
         if n == 0:
             return np.empty((0, self.num_classes), dtype=np.float32)
-        norm = self.normalize(arr).reshape(n, self._H, self._W, 4)
-        c1 = self.conv1(norm).reshape(n, 12, 12, self._C1)
-        d1 = self.dw1(c1).reshape(n, 12, 12, self._C1)
-        p1 = self.pw1(d1).reshape(n, 6, 6, self._C2)
-        d2 = self.dw2(p1).reshape(n, 6, 6, self._C2)
-        p2 = self.pw2(d2).reshape(n, 3, 3, self._C3)
-        pooled = self.gap(p2).reshape(n, self._C3)
+        raw, _timing = self._mega_run(arr, mode=self._MEGA_LOGITS)
         return np.ascontiguousarray(
-            self.linear(pooled).reshape(n, self.num_classes),
-            dtype=np.float32,
+            raw.view("<f4").reshape(n, self.num_classes), dtype=np.float32
         )
 
     # ------------------------------------------------------------------
@@ -468,6 +400,27 @@ class WGPUBackend(Backend):
             bufs[f"{name}_b"] = self._device_create_buffer(
                 data=arr.astype(np.float32).tobytes(), usage=self._U_STORAGE
             )
+        # One concatenated weight buffer for the mega shader (layout offsets
+        # are hard-coded in ``shaders/mega.wgsl``).
+        fused = np.concatenate(
+            [
+                w["conv1.weight"].reshape(-1),
+                w["conv1.bias"],
+                w["dw1.weight"].reshape(-1),
+                w["dw1.bias"],
+                w["pw1.weight"].reshape(-1),
+                w["pw1.bias"],
+                w["dw2.weight"].reshape(-1),
+                w["dw2.bias"],
+                w["pw2.weight"].reshape(-1),
+                w["pw2.bias"],
+                w["fc.weight"].reshape(-1),
+                w["fc.bias"],
+            ]
+        ).astype(np.float32)
+        self._fused_w = self._device_create_buffer(
+            data=fused.tobytes(), usage=self._U_STORAGE
+        )
         return bufs
 
     def _uniform(self, *values: int) -> NDArray[np.uint8]:
@@ -501,6 +454,7 @@ class WGPUBackend(Backend):
             "linear": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
             "argmax": [uniform_buf(), storage_ro(), storage_rw()],
             "fused": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
+            "mega": [uniform_buf(), storage_ro(), storage_ro(), storage_rw()],
         }
         for name, entries in specs.items():
             bgl_entries = [
@@ -595,31 +549,132 @@ class WGPUBackend(Backend):
     # ------------------------------------------------------------------
 
     def _ensure_buffers(self, n: int) -> None:
+        """Persistent mega-dispatch buffers (input + final records + staging).
+
+        The mega shader keeps every intermediate tensor in workgroup shared
+        memory, so there are no per-layer buffers to allocate at all: input,
+        result/logits records and the two staging buffers are the whole set.
+        """
         if n <= self._cap:
             return
         self._cap = n
-        u = self._U_STORAGE | self._U_COPY_SRC
         self._bufs = {
             "input": self._device_create_buffer(
                 size=n * self._H * self._W,
                 usage=self._U_STORAGE | self._U_COPY_DST,
             ),
-            "norm": self._device_create_buffer(
-                size=n * self._H * self._W * 4 * 4, usage=u
-            ),
-            "c1": self._device_create_buffer(size=n * 12 * 12 * self._C1 * 4, usage=u),
-            "d1": self._device_create_buffer(size=n * 12 * 12 * self._C1 * 4, usage=u),
-            "p1": self._device_create_buffer(size=n * 6 * 6 * self._C2 * 4, usage=u),
-            "d2": self._device_create_buffer(size=n * 6 * 6 * self._C2 * 4, usage=u),
-            "p2": self._device_create_buffer(size=n * 3 * 3 * self._C3 * 4, usage=u),
-            "gap": self._device_create_buffer(size=n * self._C3 * 4, usage=u),
             "result": self._device_create_buffer(
                 size=n * 12, usage=self._U_STORAGE | self._U_COPY_SRC
+            ),
+            "logits": self._device_create_buffer(
+                size=n * self.num_classes * 4,
+                usage=self._U_STORAGE | self._U_COPY_SRC,
             ),
         }
         self._readback = self._device_create_buffer(
             size=n * 12, usage=self._U_MAP_READ | self._U_COPY_DST
         )
+        self._logits_readback = self._device_create_buffer(
+            size=n * self.num_classes * 4, usage=self._U_MAP_READ | self._U_COPY_DST
+        )
+
+    def _mega_uniform(self, mode: int) -> object:
+        key = ("mega", self._cap, mode)
+        buf = self._uniform_bufs.get(key)
+        if buf is None:
+            buf = self._device_create_buffer(
+                data=self._uniform(
+                    self._cap, self.num_classes, mode, 0
+                ).tobytes(),
+                usage=self._wgpu.BufferUsage.UNIFORM,
+            )
+            self._uniform_bufs[key] = buf
+        return buf
+
+    def _mega_bind(self, mode: int) -> object:
+        key = ("mega", self._cap, mode)
+        bg = self._bg_cache.get(key)
+        if bg is None:
+            out = (
+                self._bufs["result"]
+                if mode == self._MEGA_CLASSIFY
+                else self._bufs["logits"]
+            )
+            entries = [
+                {"binding": 0, "resource": {"buffer": self._mega_uniform(mode)}},
+                {
+                    "binding": 1,
+                    "resource": {
+                        "buffer": self._bufs["input"],
+                        "offset": 0,
+                        "size": self._bufs["input"].size,
+                    },
+                },
+                {
+                    "binding": 2,
+                    "resource": {
+                        "buffer": self._fused_w,
+                        "offset": 0,
+                        "size": self._fused_w.size,
+                    },
+                },
+                {
+                    "binding": 3,
+                    "resource": {"buffer": out, "offset": 0, "size": out.size},
+                },
+            ]
+            bg = self.device.create_bind_group(
+                layout=self._layouts["mega"], entries=entries
+            )
+            self._bg_cache[key] = bg
+        return bg
+
+    def _mega_run(
+        self, arr: NDArray[np.uint8], mode: int
+    ) -> tuple[NDArray[np.uint8], dict[str, float]]:
+        """Run the whole TinyCNN in ONE dispatch and read back once.
+
+        One workgroup per glyph; every intermediate tensor lives in
+        workgroup shared memory, so the host performs no intermediate
+        copy-backs and only the final record/logits are staged out.
+        """
+        n = arr.shape[0]
+        self._ensure_buffers(n)
+        t0 = time.perf_counter()
+        self.device.queue.write_buffer(
+            self._bufs["input"], 0, arr, 0, arr.nbytes
+        )
+        t1 = time.perf_counter()
+
+        enc = self.device.create_command_encoder()
+        p = enc.begin_compute_pass()
+        p.set_pipeline(self._pipelines["mega"])
+        p.set_bind_group(0, self._mega_bind(mode), [], 0, 99)
+        p.dispatch_workgroups(n, 1, 1)
+        p.end()
+        if mode == self._MEGA_CLASSIFY:
+            size = n * 12
+            enc.copy_buffer_to_buffer(self._bufs["result"], 0, self._readback, 0, size)
+            staging = self._readback
+        else:
+            size = n * self.num_classes * 4
+            enc.copy_buffer_to_buffer(
+                self._bufs["logits"], 0, self._logits_readback, 0, size
+            )
+            staging = self._logits_readback
+        self.device.queue.submit([enc.finish()])
+        t2 = time.perf_counter()
+        staging.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(staging.read_mapped(size=size), dtype=np.uint8).copy()
+        staging.unmap()
+        t3 = time.perf_counter()
+        self.last_dispatch_count = 1
+        return raw, {
+            "upload": t1 - t0,
+            "compute": t2 - t1,
+            "readback": t3 - t2,
+            "total": t3 - t0,
+        }
 
     def _layer_params(
         self, name: str, n: int, out_c: int | None = None

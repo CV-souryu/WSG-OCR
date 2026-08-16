@@ -732,8 +732,14 @@ is frozen (`src/fixedfontocr/defaults.py`:
 checkbox: segmentation lattice stability, 鲃/小, low-res Z17/巴尔的摩,
 mixed charset, Top-K, lexicon decoder, partial-word, the complete CPU
 benchmark and the complete regression dataset. Formal WGPU work
-(Goal 20) starts only from this freeze. Freeze criteria and where each is
-verified:
+(Goal 20) starts only from this freeze; its phase-2 design, task breakdown
+(T1 shader fusion, T2 DP Top-K 回灌, T3 GPU preprocessing, T4 staged
+readback) and acceptance criteria are prepared in
+[`goal20.md`](goal20.md) with the contract skeleton
+`tests/test_goal20_wgpu.py`. The Goal 20 parity reference is the current
+repo CPU implementation at HEAD (not the version-1.0 snapshot; CPU commits
+after the freeze are part of the baseline). Freeze criteria and where each
+is verified:
 
 | Criterion | Evidence |
 | --- | --- |
@@ -772,10 +778,12 @@ keeps only the small `char_id -> entry` dict plus the median
 narrow/full-width ratios used by pruning.
 
 TinyCNN weights are `4032 + 33·C` f32 bytes (C = classes): ~391 KiB at
-3000 classes; hybrid models store template + CNN. The WGPU backend keeps
-persistent batch buffers of 24,920 B/glyph (input, NHWC-normalized tensor,
-conv stages, GAP, result record and readback staging), e.g. ~1.5 MiB for a
-64-glyph line; the buffers grow to the largest seen batch and are retained.
+3000 classes; hybrid models store template + CNN. Since the Goal 20 mega
+shader every intermediate tensor lives in workgroup shared memory, so the
+WGPU backend keeps only the packed input (576 B/glyph), the 12-byte result
+record, the `C·4`-byte logits record and their two staging buffers
+(~15.8 KiB/glyph at 1894 classes, ~680 B/glyph at 10 classes); buffers grow
+to the largest seen batch and are retained.
 
 ## Profiles
 

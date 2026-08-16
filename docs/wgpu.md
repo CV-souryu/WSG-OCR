@@ -61,13 +61,21 @@ pointwise.wgsl        1x1 stride 2, ReLU
 gap.wgsl              global average pool
 linear.wgsl           dense layer (for layer verification)
 argmax.wgsl           top-1/top-2 reduction over logits (for verification)
-linear_argmax.wgsl    fused dense + top-1/top-2 (used by classify)
+linear_argmax.wgsl    fused dense + top-1/top-2 (for verification)
+mega.wgsl             the WHOLE chain in one dispatch (production path)
 ```
 
-The production path dispatches `normalize -> conv1 -> dw1 -> pw1 -> dw2 ->
-pw2 -> gap -> linear_argmax` in one command encoder. The final shader
-computes all class logits from the 32 features, reduces them inside one
-64-thread workgroup per glyph, and writes a 12-byte record:
+Since the mega rewrite (Goal 20 phase 2) the production path no longer
+dispatches layer by layer: `mega.wgsl` runs one 64-thread workgroup per
+glyph and computes normalize -> conv1 -> dw1 -> pw1 -> dw2 -> pw2 -> gap ->
+dense -> top-2 (classify mode) or full `[C]` logits (logits mode) with every
+intermediate tensor in workgroup shared memory. `classify()` and
+`forward_logits()` each submit exactly ONE dispatch and read back once —
+zero intermediate copy-backs. The per-layer shaders above are kept as the
+verified primitives for the parity tests (`tests/test_wgpu.py`).
+
+The classify-mode record layout is the same 12-byte triple the per-layer
+head used to write (best id + top-2 scores, now packed as three u32s):
 
 ```wgsl
 struct Result {
@@ -247,9 +255,21 @@ export is verified against the GPU without re-training or re-rendering.
 
 ## Next steps (phase 2)
 
-- Shader fusion: combine `conv+ReLU`, `dwconv+pointwise+ReLU`, and collapse
-  the eight dispatches into fewer passes to cut dispatch/barrier overhead.
-- GPU preprocessing: upload the RGB image once and do ROI crop, grayscale,
-  threshold and normalize in WGSL; keep only bounding-box computation on CPU.
-- Persistent/staged readback strategies to amortize the ~1.5 ms sync floor
-  when processing many frames.
+The formal Goal 20 phase is prepared in [`goal20.md`](goal20.md) (design,
+task breakdown T1-T4, acceptance criteria) with the contract skeleton
+`tests/test_goal20_wgpu.py`. Parity baseline = the current repo CPU
+implementation at HEAD, not the Goal 19 version-1.0 snapshot. Summary of
+the four tasks:
+
+- **T1 shader fusion**: DONE as a stronger form — the `mega.wgsl` single
+  dispatch (one workgroup per glyph, shared-memory intermediates) replaced
+  the eight-dispatch chain for both `classify()` and `forward_logits()`.
+- **T2 DP Top-K 回灌**: `classify_topk(glyphs, allowed_mask)` +
+  `logits_for(glyphs, char_ids)` so the lattice scorer reads back
+  ~`N*(K*8+12)` bytes instead of the full `[N, C]` logits.
+- **T3 GPU preprocessing**: upload the RGB image once and do ROI crop,
+  grayscale, nearest-neighbor resize and normalize in WGSL; keep only
+  bounding-box computation on CPU (soft path first, per-profile gated).
+- **T4 persistent/staged readback**: `forward_logits` in one command
+  encoder with a single `map_sync`, double-buffered `staged=True`
+  readback to amortize the ~1.5 ms sync floor across frames.

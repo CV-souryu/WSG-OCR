@@ -188,9 +188,16 @@ mega（G1）已把 TinyCNN 整链做成单 dispatch。剩余三段：
   staging，**1 个 submit、1 次 map_sync、1 次读回**，每行评分从
   2 sync 降为 1（crops 实测：初雪 26.4→21.1 ms，乌戈里尼
   50.8→49.5 ms）。DP/lexicon/NCC 仲裁留 CPU（见边界说明）。
+  补口（soft 混合模型）：`score_line_from_image` 把 G3 预处理 dispatch
+  也记进同一个 encoder —— **preprocess + template + mega 三 dispatch、
+  1 个 submit、1 次读回**（`last_dispatch_count == 3`），soft 路径的
+  整行 OCR 同样一次发射出结果；`score()` 对 fused-soft 输入自动走该
+  入口，CPU 只上传 RGB 图 + 二进制字形 words。
   测试：`tests/test_goal20_crops_gpu.py` 新增 stage 逐位 parity +
-  `last_submit_count == 1`；全语料 dict parity 在生产路径上直接
-  覆盖 stage。
+  `last_submit_count == 1`；二进制生产路径 tripwire 测试（整行
+  recognize 只允许 stage 提交）；soft 副本模型端到端 1 submit/3
+  dispatch parity；全语料 dict parity 在生产路径上直接覆盖 stage，
+  答案以 `crops_items_recognition.csv` 为准（文本值/预期值）。
 
 优先级：G2 ✅ → G3（与 mega 合并发射）→ G4（收口成一次 submit 出结果）。
 
@@ -220,7 +227,7 @@ G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 评分
       全绿（byte-exact + fused logits + crops dict 模式全语料 parity）
 - [x] G4 评分链单次发射：`WGPUScoringStage.score_line` 1 submit /
       1 map_sync，stage 逐位 parity + `last_submit_count == 1`
-      （`tests/test_goal20_crops_gpu.py`，共 6 个全绿）
+      （`tests/test_goal20_crops_gpu.py`，共 9 个全绿）
 - [ ] `tests/test_goal20_wgpu.py` 全绿（无 xfail）
 - [ ] `tests/test_wgpu.py` + `tests/test_wgpu_vectors.py` +
       `tests/test_auto_backend.py` 全绿
@@ -228,7 +235,12 @@ G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 评分
       `backend="cpu"` 下与当前 HEAD CPU 输出一致
 - [ ] 端到端 parity：digits / CJK / game_cn 上 `backend="wgpu"` ==
       `backend="cpu"`（text、char_ids、scores < 1e-4）
-- [ ] 一次 submit 出 OCR 结果（G2+G3+G4 同 encoder），读回仅最终记录
+- [x] 一次 submit 出 OCR 结果（G2+G3+G4 同 encoder，读回仅最终记录）：
+      binary 混合模型走 `score_line`，soft 混合模型走
+      `score_line_from_image`（preprocess+template+mega 三 dispatch、
+      1 个 submit、1 次 map_sync、1 次读回）；crops_items dict 全语料
+      CSV 答案测试 tripwire 全部其他 GPU 入口，断言整行 recognize 只
+      经 stage 单次提交且结果与 CPU 一致
 - [ ] 基准更新并写回 `docs/wgpu.md`：dispatch 数、phase 耗时、
       crossover、连续帧 readback 摊薄
 - [ ] README / `docs/architecture.md` 状态更新（Goal 20 complete）

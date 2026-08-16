@@ -413,6 +413,56 @@ class WGPUBackend(Backend):
             size=n * self._H * self._W, usage=self._U_MAP_READ | self._U_COPY_DST
         )
 
+    def _pp_bind_group(
+        self,
+        n: int,
+        H: int,
+        W: int,
+        params: NDArray[np.uint32],
+        img_words: NDArray[np.uint32],
+        out_buf: object,
+    ) -> object:
+        """Upload preprocess params + RGB image words and build the bind group.
+
+        ``out_buf`` receives the packed ``uint8 [N, 24, 24]`` soft batch; it
+        may be the standalone ``_pp_bufs["out"]`` or — in a fused encoder —
+        the mega input buffer, so the preprocess dispatch can hand its
+        output straight to the mega dispatch in the same submit.
+        """
+        self._pp_ensure(n)
+        self.device.queue.write_buffer(
+            self._pp_bufs["params"], 0, params, 0, params.nbytes
+        )
+        img_buf = self._device_create_buffer(
+            data=img_words.tobytes(), usage=self._U_STORAGE
+        )
+        uniform = self._device_create_buffer(
+            data=self._uniform(n, H, W, 0).tobytes(),
+            usage=self._wgpu.BufferUsage.UNIFORM,
+        )
+        entries = [
+            {"binding": 0, "resource": {"buffer": uniform}},
+            {
+                "binding": 1,
+                "resource": {"buffer": img_buf, "offset": 0, "size": img_buf.size},
+            },
+            {
+                "binding": 2,
+                "resource": {
+                    "buffer": self._pp_bufs["params"],
+                    "offset": 0,
+                    "size": self._pp_bufs["params"].size,
+                },
+            },
+            {
+                "binding": 3,
+                "resource": {"buffer": out_buf, "offset": 0, "size": out_buf.size},
+            },
+        ]
+        return self.device.create_bind_group(
+            layout=self._layouts["preprocess_soft"], entries=entries
+        )
+
     def preprocess_glyphs(
         self,
         image: NDArray[np.uint8],
@@ -440,42 +490,7 @@ class WGPUBackend(Backend):
         params = self._pp_params(segments, spec, geometries)
         words = self._image_words(image)
         self._pp_ensure(n)
-        self.device.queue.write_buffer(
-            self._pp_bufs["params"], 0, params, 0, params.nbytes
-        )
-        img_buf = self._device_create_buffer(
-            data=words.tobytes(), usage=self._U_STORAGE
-        )
-        uniform = self._device_create_buffer(
-            data=self._uniform(n, H, W, 0).tobytes(),
-            usage=self._wgpu.BufferUsage.UNIFORM,
-        )
-        entries = [
-            {"binding": 0, "resource": {"buffer": uniform}},
-            {
-                "binding": 1,
-                "resource": {"buffer": img_buf, "offset": 0, "size": img_buf.size},
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": self._pp_bufs["params"],
-                    "offset": 0,
-                    "size": self._pp_bufs["params"].size,
-                },
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": self._pp_bufs["out"],
-                    "offset": 0,
-                    "size": self._pp_bufs["out"].size,
-                },
-            },
-        ]
-        bg = self.device.create_bind_group(
-            layout=self._layouts["preprocess_soft"], entries=entries
-        )
+        bg = self._pp_bind_group(n, H, W, params, words, self._pp_bufs["out"])
         enc = self.device.create_command_encoder()
         p = enc.begin_compute_pass()
         p.set_pipeline(self._pipelines["preprocess_soft"])
@@ -518,43 +533,7 @@ class WGPUBackend(Backend):
         params = self._pp_params(segments, spec, geometries)
         words = self._image_words(image)
         self._ensure_buffers(n)
-        self._pp_ensure(n)
-        self.device.queue.write_buffer(
-            self._pp_bufs["params"], 0, params, 0, params.nbytes
-        )
-        img_buf = self._device_create_buffer(
-            data=words.tobytes(), usage=self._U_STORAGE
-        )
-        uniform = self._device_create_buffer(
-            data=self._uniform(n, H, W, 0).tobytes(),
-            usage=self._wgpu.BufferUsage.UNIFORM,
-        )
-        entries = [
-            {"binding": 0, "resource": {"buffer": uniform}},
-            {
-                "binding": 1,
-                "resource": {"buffer": img_buf, "offset": 0, "size": img_buf.size},
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": self._pp_bufs["params"],
-                    "offset": 0,
-                    "size": self._pp_bufs["params"].size,
-                },
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": self._bufs["input"],
-                    "offset": 0,
-                    "size": self._bufs["input"].size,
-                },
-            },
-        ]
-        bg = self.device.create_bind_group(
-            layout=self._layouts["preprocess_soft"], entries=entries
-        )
+        bg = self._pp_bind_group(n, H, W, params, words, self._bufs["input"])
         enc = self.device.create_command_encoder()
         p = enc.begin_compute_pass()
         p.set_pipeline(self._pipelines["preprocess_soft"])
@@ -1148,6 +1127,26 @@ _GPU_TEMPLATE_P_MAX = 256
 _GPU_TEMPLATE_RECORD = 15  # u32 words per glyph result record
 
 
+def _allowed_mask(
+    num_classes: int, allowed_ids: set[int] | None, words: int
+) -> NDArray[np.uint32]:
+    """Bitmask of allowed char ids (all-ones when ``allowed_ids`` is None).
+
+    Shared by the GPU template matcher and the fused scoring stage so the
+    two one-submit paths encode the identical mask.
+    """
+    if allowed_ids is None:
+        mask = np.full(words, 0xFFFFFFFF, dtype=np.uint32)
+        rem = num_classes % 32
+        if rem:
+            mask[-1] &= np.uint32((1 << rem) - 1)
+    else:
+        mask = np.zeros(words, dtype=np.uint32)
+        for cid in sorted(allowed_ids):
+            mask[cid // 32] |= np.uint32(1 << (cid % 32))
+    return mask
+
+
 class WGPUTemplateMatcher:
     """Template V2 matching on the GPU: one workgroup per glyph, one dispatch.
 
@@ -1469,15 +1468,7 @@ class WGPUTemplateMatcher:
 
         bits = np.packbits(glyphs.reshape(n, -1), axis=1, bitorder="little")
         words = bits.view(np.uint32).reshape(-1)
-        if allowed_ids is None:
-            mask = np.full(self._allowed_words, 0xFFFFFFFF, dtype=np.uint32)
-            rem = self.num_classes % 32
-            if rem:
-                mask[-1] &= np.uint32((1 << rem) - 1)
-        else:
-            mask = np.zeros(self._allowed_words, dtype=np.uint32)
-            for cid in sorted(allowed_ids):
-                mask[cid // 32] |= np.uint32(1 << (cid % 32))
+        mask = _allowed_mask(self.num_classes, allowed_ids, self._allowed_words)
 
         self._ensure_buffers(n)
         self.device.queue.write_buffer(self._glyph_buf, 0, words, 0, words.nbytes)
@@ -1608,6 +1599,7 @@ class WGPUScoringStage:
         self.device = gpu.device
         self._wgpu = gpu._wgpu
         self.last_submit_count: int | None = None
+        self.last_dispatch_count: int | None = None
         self._cap = 0
         self._staging = None
 
@@ -1658,15 +1650,7 @@ class WGPUScoringStage:
 
         bits = np.packbits(glyphs.reshape(n, -1), axis=1, bitorder="little")
         words = bits.view(np.uint32).reshape(-1)
-        if allowed_ids is None:
-            mask = np.full(self.template._allowed_words, 0xFFFFFFFF, dtype=np.uint32)
-            rem = self.template.num_classes % 32
-            if rem:
-                mask[-1] &= np.uint32((1 << rem) - 1)
-        else:
-            mask = np.zeros(self.template._allowed_words, dtype=np.uint32)
-            for cid in sorted(allowed_ids):
-                mask[cid // 32] |= np.uint32(1 << (cid % 32))
+        mask = _allowed_mask(self.template.num_classes, allowed_ids, self.template._allowed_words)
         self.device.queue.write_buffer(
             self.template._glyph_buf, 0, words, 0, words.nbytes
         )
@@ -1704,6 +1688,127 @@ class WGPUScoringStage:
         ).copy()
         self._staging.unmap()
         self.last_submit_count = 1
+        self.last_dispatch_count = 2  # template + mega
+        tb = self.template._parse_results(raw[:tpl_bytes], n, area)
+        logits = np.ascontiguousarray(
+            raw[tpl_bytes:].view("<f4").reshape(n, self.gpu.num_classes),
+            dtype=np.float32,
+        )
+        return tb, logits
+
+    def score_line_from_image(
+        self,
+        image: NDArray[np.uint8],
+        segments: list,
+        glyphs: NDArray[np.uint8],
+        allowed_ids: set[int] | None = None,
+        spec=None,
+        geometries: list[tuple[float, float] | None] | None = None,
+    ) -> tuple[TemplateBatch, NDArray[np.float32]]:
+        """One submit: GPU preprocess + template match + TinyCNN logits.
+
+        The G3 preprocess dispatch (RGB -> packed soft glyph batch), the G2
+        template dispatch and the G1 mega-logits dispatch are recorded into
+        ONE command encoder: the preprocess shader writes its output straight
+        into the mega input buffer, and a single staging readback returns the
+        template records + full ``[N, C]`` logits. This closes the "one
+        submit produces the OCR result" chain for soft-input hybrid models —
+        the CPU only uploads the RGB image, the per-glyph frame params and
+        the binary glyph words the template matcher consumes.
+
+        ``glyphs`` is the binary-normalized ``uint8 [N, 24, 24]`` batch the
+        CPU already computed for the template path (identical to
+        :meth:`score_line`); the soft batch for the CNN is produced on the
+        GPU from ``image`` + ``segments`` + ``geometries`` and is byte-exact
+        with the CPU ``_soft_glyph_batch`` path.
+        """
+        image = np.asarray(image)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                f"expected RGB image with shape (H, W, 3), got {image.shape}"
+            )
+        if image.dtype != np.uint8:
+            raise ValueError(f"expected uint8 image, got {image.dtype}")
+        glyphs = np.asarray(glyphs, dtype=np.uint8)
+        if glyphs.ndim != 3:
+            raise ValueError(f"glyphs must be [N, H, W], got {glyphs.shape}")
+        n = glyphs.shape[0]
+        area = self.template.input_size * self.template.input_size
+        if n == 0:
+            return (
+                self.template.match_batch(glyphs, allowed_ids),
+                np.empty((0, self.gpu.num_classes), dtype=np.float32),
+            )
+        if glyphs.shape[1:] != (self.template.input_size,) * 2:
+            raise ValueError(
+                f"expected {self.template.input_size}x{self.template.input_size} "
+                f"glyphs, got {glyphs.shape[1:]}"
+            )
+        if len(segments) != n:
+            raise ValueError(
+                f"expected {n} segments for {n} glyphs, got {len(segments)}"
+            )
+        proto_ids = self.template._allowed_prototypes(allowed_ids)
+        if proto_ids.size == 0:
+            return (
+                self.template.match_batch(glyphs, allowed_ids),
+                np.zeros((n, self.gpu.num_classes), dtype=np.float32),
+            )
+
+        H, W = image.shape[:2]
+        params = self.gpu._pp_params(segments, spec, geometries)
+        img_words = self.gpu._image_words(image)
+
+        self.template._ensure_buffers(n)
+        self.gpu._ensure_buffers(n)
+        self._ensure(n)
+
+        bits = np.packbits(glyphs.reshape(n, -1), axis=1, bitorder="little")
+        words = bits.view(np.uint32).reshape(-1)
+        mask = _allowed_mask(self.template.num_classes, allowed_ids, self.template._allowed_words)
+        self.device.queue.write_buffer(
+            self.template._glyph_buf, 0, words, 0, words.nbytes
+        )
+        self.device.queue.write_buffer(
+            self.template._allowed_buf, 0, mask, 0, mask.nbytes
+        )
+        pp_bg = self.gpu._pp_bind_group(
+            n, H, W, params, img_words, self.gpu._bufs["input"]
+        )
+
+        enc = self.device.create_command_encoder()
+        p0 = enc.begin_compute_pass()
+        p0.set_pipeline(self.gpu._pipelines["preprocess_soft"])
+        p0.set_bind_group(0, pp_bg, [], 0, 99)
+        p0.dispatch_workgroups((n * 144 + 63) // 64, 1, 1)
+        p0.end()
+        p1 = enc.begin_compute_pass()
+        p1.set_pipeline(self.template._pipeline)
+        p1.set_bind_group(0, self.template._bind_group, [], 0, 99)
+        p1.dispatch_workgroups(n, 1, 1)
+        p1.end()
+        p2 = enc.begin_compute_pass()
+        p2.set_pipeline(self.gpu._pipelines["mega"])
+        p2.set_bind_group(0, self.gpu._mega_bind(self.gpu._MEGA_LOGITS), [], 0, 99)
+        p2.dispatch_workgroups(n, 1, 1)
+        p2.end()
+        tpl_bytes = n * _GPU_TEMPLATE_RECORD * 4
+        logits_bytes = n * self.gpu.num_classes * 4
+        enc.copy_buffer_to_buffer(
+            self.template._result_buf, 0, self._staging, 0, tpl_bytes
+        )
+        enc.copy_buffer_to_buffer(
+            self.gpu._bufs["logits"], 0, self._staging, tpl_bytes, logits_bytes
+        )
+        self.device.queue.submit([enc.finish()])
+        self._staging.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(
+            self._staging.read_mapped(size=tpl_bytes + logits_bytes),
+            dtype=np.uint8,
+        ).copy()
+        self._staging.unmap()
+        self.last_submit_count = 1
+        self.last_dispatch_count = 3  # preprocess + template + mega
         tb = self.template._parse_results(raw[:tpl_bytes], n, area)
         logits = np.ascontiguousarray(
             raw[tpl_bytes:].view("<f4").reshape(n, self.gpu.num_classes),

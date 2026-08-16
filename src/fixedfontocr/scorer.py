@@ -610,12 +610,20 @@ class SegmentScorer:
 
         use_stage = (
             self.gpu_stage is not None
-            and self.cnn_input_mode == "binary"
             and (allowed_ids is None or bool(allowed_ids))
+            and (self.cnn_input_mode == "binary" or fused_soft)
         )
         if self.template is not None:
             if use_stage:
-                tb, stage_logits = self.gpu_stage.score_line(glyphs, allowed_ids)
+                if fused_soft:
+                    # G2+G3+G4 in one encoder: GPU preprocess writes the
+                    # soft batch straight into the mega input buffer while
+                    # the template dispatch consumes the binary glyphs.
+                    tb, stage_logits = self.gpu_stage.score_line_from_image(
+                        image, segments, glyphs, allowed_ids, spec, geoms
+                    )
+                else:
+                    tb, stage_logits = self.gpu_stage.score_line(glyphs, allowed_ids)
             else:
                 tb = self.template.match_batch(glyphs, allowed_ids)
             if self.weights is None:

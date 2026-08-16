@@ -193,11 +193,13 @@ class FixedFontOCR:
         """Single-submit template+CNN scoring stage (G4).
 
         Requires an explicit WGPU backend, the GPU template matcher and a
-        binary-input hybrid model (the soft path keeps the G3 fused
-        preprocess+mega submit). The visual DP stays on the CPU — its f64
-        tie tolerance cannot be reproduced in f32 WGSL and it is
-        microsecond-scale — so the stage closes the scoring chain into ONE
-        submit and ONE readback per line.
+        hybrid model. Binary-input hybrids score through
+        ``score_line`` (template + mega); soft-input hybrids score through
+        ``score_line_from_image``, which also folds the G3 preprocess
+        dispatch into the same encoder — either way the scoring chain is
+        ONE submit and ONE readback per line. The visual DP stays on the
+        CPU — its f64 tie tolerance cannot be reproduced in f32 WGSL and it
+        is microsecond-scale.
         """
 
         if (
@@ -205,7 +207,6 @@ class FixedFontOCR:
             and isinstance(self._backend, WGPUBackend)
             and isinstance(self._template_backend, WGPUTemplateMatcher)
             and self.model.classifier == "hybrid"
-            and self.model.input_mode == "binary"
         ):
             try:
                 return WGPUScoringStage(self._backend, self._template_backend)

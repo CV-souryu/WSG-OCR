@@ -277,6 +277,17 @@ the four tasks:
   CPU soft batch; `forward_logits_from_image` runs preprocess + mega in
   ONE submit. Validated on the crops_items dict-mode corpus
   (`tests/test_goal20_crops_gpu.py`).
+- **G4 single-submit scoring chain**: DONE — `WGPUScoringStage.score_line`
+  records the template dispatch + mega-logits dispatch into one command
+  encoder (1 submit, 1 `map_sync`, one staging readback) for binary
+  hybrids; `score_line_from_image` additionally folds the G3 preprocess
+  dispatch into the same encoder for soft hybrids, so a full OCR line
+  (G2+G3+G4) comes out of ONE submit with only the final template records
+  + logits read back. The visual DP stays on the CPU (f64 tie semantics).
+  `tests/test_goal20_crops_gpu.py` pins this on the crops_items dict
+  corpus: stage parity, per-line `last_submit_count == 1`, trip-wired
+  single-submit recognize, and the full CSV answer key (文本值/预期值)
+  with backend="wgpu" == backend="cpu".
 - **T2 DP Top-K 回灌**: `classify_topk(glyphs, allowed_mask)` +
   `logits_for(glyphs, char_ids)` so the lattice scorer reads back
   ~`N*(K*8+12)` bytes instead of the full `[N, C]` logits.

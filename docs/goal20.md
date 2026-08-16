@@ -167,10 +167,17 @@ mega（G1）已把 TinyCNN 整链做成单 dispatch。剩余三段：
   **端到端 recognize：GPU 3.2-4.7x（auto 3.4-4.7x），首次真正领先
   CPU**。测试：`tests/test_goal20_template_gpu.py` 10 个（含逐字段
   精确 parity、allowed 子集、auto 包装、game_cn 端到端）。
-- **G3 预处理进 GPU**（下一目标）：RGB 整图一次上传，ROI crop + 灰度 +
-  nearest-neighbor resize（bit-exact 已论证）+ baseline 放置全在
-  WGSL，输出直接作为 mega/template 的输入（binary/soft 双变体），
-  CPU 只留 CC/bbox。
+- **G3 预处理进 GPU** ✅ 完成（soft 路径）：`shaders/preprocess_soft.wgsl`
+  单 dispatch —— RGB 整图一次上传，ROI crop + 灰度（default profile
+  f32 公式）+ 最近邻 resize + baseline 放置全在 WGSL，直接写 mega 的
+  packed 输入格式；`WGPUBackend.preprocess_glyphs` 与 CPU
+  `_soft_glyph_batch` **逐字节一致**（real crops 上验证），
+  `forward_logits_from_image` 把 preprocess + mega 合入 **1 个 submit
+  （2 dispatch）**、单次最终读回。`backend="wgpu"` 的 soft-mode 模型
+  不再构建 CPU soft 图（dict 仲裁按需回退）。注意：game_cn 是
+  binary input_mode，crops 上的收益来自 G1/G2（见下方实测）。
+  测试：`tests/test_goal20_crops_gpu.py`（byte parity、fused logits
+  parity、pinned + 全语料 dict 模式 parity）。
 - **G4 纯视觉 DP 解码进 GPU**：每行一个 workgroup，lattice 候选分数
   （G2+G3 产出）直接在工作组内跑 DP，读回最终路径 + Top-K —— 一次
   submit 出 OCR 结果。Lexicon beam 仍留 CPU（fonts/goal 边界）；
@@ -181,12 +188,12 @@ mega（G1）已把 TinyCNN 整链做成单 dispatch。剩余三段：
 ## 5. 实施顺序与依赖
 
 ```text
-G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理 → G4 视觉 DP → T2 收尾
+G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 视觉 DP → T2 收尾
 ```
 
 - G1 mega 已消灭 8-sync 墙；G2 已把端到端大头（模板段）搬上 GPU
-  （端到端 3.2-4.7x）。
-- G2/G3 落地后同 encoder 发射，G4 收口成「一次 submit 出结果」。
+  （端到端 3.2-4.7x）；G3 已把 soft 预处理搬上 GPU（byte-exact）。
+- G4 收口成「一次 submit 出结果」。
 - T2（Top-K 读回裁剪）在 G4 之后做读回字节优化；T3 的 profile 公式
   风险被 G3 分解（先 default profile soft 路径）。
 - 每项任务落地 = 独立 commit + 把 `tests/test_goal20_wgpu.py` 中对应
@@ -198,6 +205,8 @@ G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理 → G4 视觉 DP → 
       （`last_dispatch_count == 1`），28 个 parity 测试全绿
 - [x] G2 模板单 dispatch：`tests/test_goal20_template_gpu.py` 10 个
       全绿（逐字段精确 parity），端到端 GPU/auto 领先 3.2-4.7x
+- [x] G3 预处理单 dispatch：`tests/test_goal20_crops_gpu.py` 4 个
+      全绿（byte-exact + fused logits + crops dict 模式全语料 parity）
 - [ ] `tests/test_goal20_wgpu.py` 全绿（无 xfail）
 - [ ] `tests/test_wgpu.py` + `tests/test_wgpu_vectors.py` +
       `tests/test_auto_backend.py` 全绿
@@ -258,6 +267,21 @@ text 一致）：
 | 获得金币1000×3（21 字） | 157.9 ms | 33.7 ms | 33.5 ms | 4.7x / 4.7x |
 
 auto 选路：模板 crossover = (4, "wgpu")，CNN crossover = (64, "wgpu")。
+
+### crops_items dict 模式实测（2026-08-16，+ real-glyph bank，三后端
+text/matched_term 全部一致）
+
+| crop | CPU | GPU (wgpu) | auto | speedup |
+| --- | --- | --- | --- | --- |
+| Z17 | 20.7 ms | 19.8 ms | 19.9 ms | 1.05x / 1.04x |
+| Z28 | 18.7 ms | 17.9 ms | 18.6 ms | 1.04x / 1.00x |
+| 初雪（小 crop） | 12.3 ms | 26.4 ms | 12.3 ms | 0.46x / 1.00x |
+| 乌戈里尼（大 crop，~94 词条） | 92.0 ms | 50.8 ms | 49.4 ms | 1.81x / **1.86x** |
+
+auto 后端在所有 crops 上无回归（小 crop 自动留在 CPU，大 crop 走 GPU），
+全语料 238 个标注 crop 的 dict 模式 parity 由
+`tests/test_goal20_crops_gpu.py::test_crops_gpu_dict_mode_parity_full_corpus`
+逐张断言。
 
 三个事实（对排期的影响）：
 

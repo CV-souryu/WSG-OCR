@@ -133,6 +133,7 @@ class FixedFontOCR:
                 self.model.templates_v2,
                 self.model.charset,
                 self.model.input_size,
+                normalize_spec=self.model.normalize_spec,
             )
         except Exception as exc:  # no adapter / unsupported shape
             self._benchmark_error = (
@@ -290,7 +291,18 @@ class FixedFontOCR:
                 allowed = lexicon_ids
             elif lexicon_ids is not None:
                 allowed &= lexicon_ids
-        frontend = extract_frontend(image, self.profile)
+        # G3: with an explicit WGPU backend the soft batch is produced on the
+        # GPU (preprocess + mega in one submit), so the CPU soft map is
+        # never built here — except dict-mode real-glyph arbitration, which
+        # recomputes it on demand below.
+        use_gpu_preprocess = (
+            self.backend == "wgpu"
+            and isinstance(self._backend, WGPUBackend)
+            and self.model.input_mode == "soft"
+        )
+        frontend = extract_frontend(
+            image, self.profile, with_soft=not use_gpu_preprocess
+        )
         mask = frontend.binary_mask
         paths: list[DecodePath] = []
         decoded: list[tuple[VisualCandidate, str, float]] = []
@@ -304,6 +316,7 @@ class FixedFontOCR:
                 self._scorer,
                 allowed,
                 soft=frontend.soft_foreground,
+                image=image if use_gpu_preprocess else None,
                 lexicon=(
                     lexicon
                     if lexicon_mode not in ("none", "dict")
@@ -362,9 +375,12 @@ class FixedFontOCR:
         if lexicon_mode == "dict" and real_glyph_bank is not None:
             bank_obj = _realglyphs.load_real_glyphs(Path(real_glyph_bank))
             if bank_obj is not None and len(paths) == 1 and paths[0].candidates:
+                soft_map = frontend.soft_foreground
+                if soft_map is None:  # G3 skipped the CPU soft map
+                    soft_map = self.profile.soft_foreground(image)
                 soft_glyphs = [
                     _realglyphs.resize24(
-                        frontend.soft_foreground[
+                        soft_map[
                             cand.segment.y : cand.segment.y + cand.segment.h,
                             cand.segment.x : cand.segment.x + cand.segment.w,
                         ]

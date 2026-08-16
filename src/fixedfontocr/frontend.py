@@ -136,6 +136,7 @@ class VisualFrontend:
 def extract_frontend(
     image: NDArray[np.uint8],
     profile: Profile,
+    with_soft: bool = True,
 ) -> VisualFrontend:
     """Extract binary + soft foreground from one RGB image in a single pass.
 
@@ -164,6 +165,6 @@ def extract_frontend(
     return VisualFrontend(
         image=image,
         binary_mask=profile.color_mask(image),
-        soft_foreground=profile.soft_foreground(image),
+        soft_foreground=profile.soft_foreground(image) if with_soft else None,
         profile=profile,
     )

@@ -134,6 +134,36 @@ class CPUBackend(Backend):
         return BackendResult(char_ids=char_ids, scores=scores)
 
 
+
+def _glyph_frame_params(segment, geometry, target: int, spec) -> tuple[int, ...]:
+    """Per-glyph placement frame replicating ``normalize_grayscale``.
+
+    The frame math runs on the host in float64 (python round-half-even)
+    because WGSL has no f64; the per-pixel nearest-neighbor truncation is
+    bit-exact in f32 (fractional parts are >= 1/24).
+    Returns (x, y, w, h, new_h, new_w, y0, x0); new_h==0 marks an empty ROI.
+    """
+    h, w = segment.h, segment.w
+    if h == 0 or w == 0:
+        return (segment.x, segment.y, w, h, 0, 0, 0, 0)
+    if geometry is None:
+        scale = min(target * 0.8 / h, target * 0.8 / w)
+        baseline_offset = None
+    else:
+        baseline_offset, scale = geometry
+        scale = min(float(scale), target / h, target / w)
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+    if baseline_offset is None:
+        y0 = (target - new_h) // 2
+    else:
+        row = spec.baseline_row if spec is not None else 18.0
+        y0 = int(round(row - baseline_offset * scale))
+        y0 = min(max(y0, 0), target - new_h)
+    x0 = (target - new_w) // 2
+    return (segment.x, segment.y, w, h, new_h, new_w, y0, x0)
+
+
 class WGPUBackend(Backend):
     """WGPU TinyCNN backend.
 
@@ -161,6 +191,7 @@ class WGPUBackend(Backend):
         "argmax": "argmax",
         "fused": "linear_argmax",
         "mega": "mega",
+        "preprocess_soft": "preprocess_soft",
     }
 
     def __init__(
@@ -342,6 +373,215 @@ class WGPUBackend(Backend):
         return self._parse_results(self._read(buf_out, n * 12))
 
     # ------------------------------------------------------------------
+    # GPU preprocessing (Goal 20 G3)
+    # ------------------------------------------------------------------
+
+    def _image_words(self, image: NDArray[np.uint8]) -> NDArray[np.uint32]:
+        """RGB image bytes padded to u32 words (little-endian)."""
+        nbytes = image.shape[0] * image.shape[1] * 3
+        buf = np.zeros(nbytes + (-nbytes) % 4, dtype=np.uint8)
+        buf[:nbytes] = image.reshape(-1)
+        return buf.view(np.uint32)
+
+    def _pp_params(
+        self,
+        segments: list,
+        spec,
+        geometries: list[tuple[float, float] | None] | None,
+    ) -> NDArray[np.uint32]:
+        n = len(segments)
+        geoms = geometries if geometries is not None else [None] * n
+        params = np.empty((n, 8), dtype=np.uint32)
+        for i, seg in enumerate(segments):
+            params[i] = _glyph_frame_params(seg, geoms[i], self._H, spec)
+        return params
+
+    def _pp_ensure(self, n: int) -> None:
+        if n <= getattr(self, "_pp_cap", 0):
+            return
+        self._pp_cap = n
+        u = self._U_STORAGE
+        self._pp_bufs = {
+            "params": self._device_create_buffer(
+                size=n * 8 * 4, usage=u | self._U_COPY_DST
+            ),
+            "out": self._device_create_buffer(
+                size=n * self._H * self._W, usage=u | self._U_COPY_SRC
+            ),
+        }
+        self._pp_readback = self._device_create_buffer(
+            size=n * self._H * self._W, usage=self._U_MAP_READ | self._U_COPY_DST
+        )
+
+    def preprocess_glyphs(
+        self,
+        image: NDArray[np.uint8],
+        segments: list,
+        spec=None,
+        geometries: list[tuple[float, float] | None] | None = None,
+    ) -> NDArray[np.uint8]:
+        """GPU soft glyph batch: RGB -> ROI gray + nearest-neighbor normalize.
+
+        Byte-exact with the CPU ``_soft_glyph_batch`` path (default
+        grayscale profile formula); one dispatch, one readback of the
+        ``uint8 [N, 24, 24]`` batch.
+        """
+        image = np.asarray(image)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                f"expected RGB image with shape (H, W, 3), got {image.shape}"
+            )
+        if image.dtype != np.uint8:
+            raise ValueError(f"expected uint8 image, got {image.dtype}")
+        n = len(segments)
+        if n == 0:
+            return np.empty((0, self._H, self._W), dtype=np.uint8)
+        H, W = image.shape[:2]
+        params = self._pp_params(segments, spec, geometries)
+        words = self._image_words(image)
+        self._pp_ensure(n)
+        self.device.queue.write_buffer(
+            self._pp_bufs["params"], 0, params, 0, params.nbytes
+        )
+        img_buf = self._device_create_buffer(
+            data=words.tobytes(), usage=self._U_STORAGE
+        )
+        uniform = self._device_create_buffer(
+            data=self._uniform(n, H, W, 0).tobytes(),
+            usage=self._wgpu.BufferUsage.UNIFORM,
+        )
+        entries = [
+            {"binding": 0, "resource": {"buffer": uniform}},
+            {
+                "binding": 1,
+                "resource": {"buffer": img_buf, "offset": 0, "size": img_buf.size},
+            },
+            {
+                "binding": 2,
+                "resource": {
+                    "buffer": self._pp_bufs["params"],
+                    "offset": 0,
+                    "size": self._pp_bufs["params"].size,
+                },
+            },
+            {
+                "binding": 3,
+                "resource": {
+                    "buffer": self._pp_bufs["out"],
+                    "offset": 0,
+                    "size": self._pp_bufs["out"].size,
+                },
+            },
+        ]
+        bg = self.device.create_bind_group(
+            layout=self._layouts["preprocess_soft"], entries=entries
+        )
+        enc = self.device.create_command_encoder()
+        p = enc.begin_compute_pass()
+        p.set_pipeline(self._pipelines["preprocess_soft"])
+        p.set_bind_group(0, bg, [], 0, 99)
+        p.dispatch_workgroups((n * 144 + 63) // 64, 1, 1)
+        p.end()
+        size = n * self._H * self._W
+        enc.copy_buffer_to_buffer(self._pp_bufs["out"], 0, self._pp_readback, 0, size)
+        self.device.queue.submit([enc.finish()])
+        self._pp_readback.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(self._pp_readback.read_mapped(size=size), dtype=np.uint8).copy()
+        self._pp_readback.unmap()
+        self.last_dispatch_count = 1
+        return raw.reshape(n, self._H, self._W)
+
+    def forward_logits_from_image(
+        self,
+        image: NDArray[np.uint8],
+        segments: list,
+        spec=None,
+        geometries: list[tuple[float, float] | None] | None = None,
+    ) -> NDArray[np.float32]:
+        """Fused preprocess + TinyCNN in ONE submit (two dispatches).
+
+        The preprocess shader writes the packed soft glyph batch straight
+        into the mega input buffer, the mega dispatch follows in the same
+        command encoder, and only the final ``[N, C]`` logits are read back.
+        """
+        image = np.asarray(image)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                f"expected RGB image with shape (H, W, 3), got {image.shape}"
+            )
+        if image.dtype != np.uint8:
+            raise ValueError(f"expected uint8 image, got {image.dtype}")
+        n = len(segments)
+        if n == 0:
+            return np.empty((0, self.num_classes), dtype=np.float32)
+        H, W = image.shape[:2]
+        params = self._pp_params(segments, spec, geometries)
+        words = self._image_words(image)
+        self._ensure_buffers(n)
+        self._pp_ensure(n)
+        self.device.queue.write_buffer(
+            self._pp_bufs["params"], 0, params, 0, params.nbytes
+        )
+        img_buf = self._device_create_buffer(
+            data=words.tobytes(), usage=self._U_STORAGE
+        )
+        uniform = self._device_create_buffer(
+            data=self._uniform(n, H, W, 0).tobytes(),
+            usage=self._wgpu.BufferUsage.UNIFORM,
+        )
+        entries = [
+            {"binding": 0, "resource": {"buffer": uniform}},
+            {
+                "binding": 1,
+                "resource": {"buffer": img_buf, "offset": 0, "size": img_buf.size},
+            },
+            {
+                "binding": 2,
+                "resource": {
+                    "buffer": self._pp_bufs["params"],
+                    "offset": 0,
+                    "size": self._pp_bufs["params"].size,
+                },
+            },
+            {
+                "binding": 3,
+                "resource": {
+                    "buffer": self._bufs["input"],
+                    "offset": 0,
+                    "size": self._bufs["input"].size,
+                },
+            },
+        ]
+        bg = self.device.create_bind_group(
+            layout=self._layouts["preprocess_soft"], entries=entries
+        )
+        enc = self.device.create_command_encoder()
+        p = enc.begin_compute_pass()
+        p.set_pipeline(self._pipelines["preprocess_soft"])
+        p.set_bind_group(0, bg, [], 0, 99)
+        p.dispatch_workgroups((n * 144 + 63) // 64, 1, 1)
+        p.end()
+        p2 = enc.begin_compute_pass()
+        p2.set_pipeline(self._pipelines["mega"])
+        p2.set_bind_group(0, self._mega_bind(self._MEGA_LOGITS), [], 0, 99)
+        p2.dispatch_workgroups(n, 1, 1)
+        p2.end()
+        size = n * self.num_classes * 4
+        enc.copy_buffer_to_buffer(
+            self._bufs["logits"], 0, self._logits_readback, 0, size
+        )
+        self.device.queue.submit([enc.finish()])
+        self._logits_readback.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(
+            self._logits_readback.read_mapped(size=size), dtype=np.uint8
+        ).copy()
+        self._logits_readback.unmap()
+        self.last_dispatch_count = 2
+        return np.ascontiguousarray(
+            raw.view("<f4").reshape(n, self.num_classes), dtype=np.float32
+        )
+
+    # ------------------------------------------------------------------
     # WGPU plumbing
     # ------------------------------------------------------------------
 
@@ -456,6 +696,7 @@ class WGPUBackend(Backend):
             "argmax": [uniform_buf(), storage_ro(), storage_rw()],
             "fused": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
             "mega": [uniform_buf(), storage_ro(), storage_ro(), storage_rw()],
+            "preprocess_soft": [uniform_buf(), storage_ro(), storage_ro(), storage_rw()],
         }
         for name, entries in specs.items():
             bgl_entries = [
@@ -925,6 +1166,7 @@ class WGPUTemplateMatcher:
         charset: list[str],
         input_size: int = 24,
         default_top_k: int = 5,
+        normalize_spec=None,
     ):
         expected = (input_size * input_size + 7) // 8
         if data.bytes_per_template != expected:
@@ -961,8 +1203,12 @@ class WGPUTemplateMatcher:
         self.last_dispatch_count: int | None = None
         self._allowed_words = (num_classes + 31) // 32
 
-        # Coarse features come from the CPU builder (byte-identical arrays).
-        ref = TemplateV2Classifier(data, charset, input_size)
+        # Coarse features come from the CPU builder (byte-identical arrays);
+        # the CPU reference also serves the single-glyph lexicon entry.
+        ref = TemplateV2Classifier(
+            data, charset, input_size, normalize_spec=normalize_spec
+        )
+        self._cpu_ref = ref
         feats = ref._features
 
         self._tbits = gpu._device_create_buffer(
@@ -1149,6 +1395,20 @@ class WGPUTemplateMatcher:
             prototype_downsample_modes=rec[:, 14].astype(np.int32),
         )
 
+    def match(
+        self,
+        mask: NDArray[np.bool_],
+        profile,
+        allowed_ids: set[int] | None = None,
+    ) -> tuple[str, float]:
+        """Single-glyph entry used by the lexicon layer (CPU reference).
+
+        Same contract as :meth:`TemplateV2Classifier.match`; the one-glyph
+        normalize + match stays on the CPU reference so the result is
+        identical to the canonical matcher.
+        """
+        return self._cpu_ref.match(mask, profile, allowed_ids)
+
     def match_batch(
         self,
         glyphs: NDArray[np.uint8],
@@ -1308,6 +1568,15 @@ class AutoTemplateMatcher:
             {b: m["gpu"] for b, m in self.measurements.items()}, n
         )
         return self.gpu if gpu_t < cpu_t else self.cpu
+
+    def match(
+        self,
+        mask: NDArray[np.bool_],
+        profile,
+        allowed_ids: set[int] | None = None,
+    ) -> tuple[str, float]:
+        """Single-glyph lexicon entry: delegate to the canonical CPU matcher."""
+        return self.cpu.match(mask, profile, allowed_ids)
 
     def match_batch(
         self,

@@ -749,5 +749,13 @@ spacing, and normalized size. Pass a custom profile to
   `backend="wgpu"` uses it always, `backend="auto"` picks per batch
   (crossover 4). End-to-end `recognize()` on `model/game_cn` is now
   **3.2-4.7x faster on GPU/auto** than CPU with identical text output.
-  Remaining 全链路 steps: G3 GPU preprocessing and G4 visual-DP decode
+- Goal 20 G3 landed: `shaders/preprocess_soft.wgsl` uploads the RGB image
+  once and does ROI crop + grayscale + nearest-neighbor resize + baseline
+  placement in one dispatch, byte-exact against the CPU soft batch;
+  `WGPUBackend.forward_logits_from_image` runs preprocess + mega in ONE
+  submit. Validated on the crops_items dict-mode corpus
+  (`tests/test_goal20_crops_gpu.py`: byte parity, fused-logits parity,
+  full-corpus wgpu/cpu parity; auto backend shows no regression on any
+  crop and 1.86x on the big 乌戈里尼 crop).
+  Remaining 全链路 step: G4 visual-DP decode on GPU
   (`docs/goal20.md`).

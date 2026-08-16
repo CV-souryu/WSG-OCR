@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .backends import Backend, CPUBackend
+from .backends import Backend, CPUBackend, WGPUBackend
 from .classifier import (
     DOWNSAMPLE_CLEAN,
     TemplateClassifier,
@@ -541,6 +541,7 @@ class SegmentScorer:
         allowed_ids: set[int] | None = None,
         soft: NDArray[np.uint8] | None = None,
         geometries: list[tuple[float, float] | None] | None = None,
+        image: NDArray[np.uint8] | None = None,
     ) -> list[SegmentScore]:
         """Score every candidate segment in one batched pass.
 
@@ -551,6 +552,10 @@ class SegmentScorer:
         glyphs. Binary-trained models (``input_mode="binary"``) ignore the
         soft map, so old checkpoints keep their exact training-domain
         inputs.
+
+        With ``image`` and a WGPU backend (Goal 20 G3) the soft batch is
+        produced on the GPU inside the same submission as the TinyCNN, so
+        the CPU soft map is never built.
         """
 
         if not segments:
@@ -585,10 +590,19 @@ class SegmentScorer:
                     for s, g in zip(segments, geoms)
                 ]
             )
+        fused_soft = (
+            image is not None
+            and self.cnn_input_mode == "soft"
+            and isinstance(self.cnn_backend, WGPUBackend)
+        )
         soft_batch = (
-            _soft_glyph_batch(segments, soft, self.input_size, geoms, spec)
-            if soft is not None and self.cnn_input_mode == "soft"
-            else None
+            None
+            if fused_soft
+            else (
+                _soft_glyph_batch(segments, soft, self.input_size, geoms, spec)
+                if soft is not None and self.cnn_input_mode == "soft"
+                else None
+            )
         )
         n = len(segments)
 
@@ -654,7 +668,7 @@ class SegmentScorer:
                     & (tb.margins <= 0.0)
                     & (tb.prototype_downsample_modes != DOWNSAMPLE_CLEAN)
                 )
-            cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch)
+            cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch, image, segments, geoms)
             out: list[SegmentScore] = []
             for i in range(n):
                 template_entries = _template_entries(tb, i)
@@ -750,7 +764,7 @@ class SegmentScorer:
             return out
 
         if self.weights is not None:
-            cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch)
+            cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch, image, segments, geoms)
             out = []
             for i in range(n):
                 fused = _fuse_scores(
@@ -915,9 +929,16 @@ class SegmentScorer:
         glyphs: np.ndarray,
         allowed_ids: set[int] | None,
         soft_batch: np.ndarray | None = None,
+        image: NDArray[np.uint8] | None = None,
+        segments: list[Segment] | None = None,
+        geometries: list[tuple[float, float] | None] | None = None,
     ) -> ClassificationBatch:
         if allowed_ids is not None and not allowed_ids:
-            n = soft_batch.shape[0] if soft_batch is not None else glyphs.shape[0]
+            n = (
+                len(segments)
+                if segments is not None
+                else (soft_batch.shape[0] if soft_batch is not None else glyphs.shape[0])
+            )
             return ClassificationBatch(
                 ids=np.full(n, -1, dtype=np.int32),
                 top1=np.full(n, -np.inf, dtype=np.float32),
@@ -930,8 +951,19 @@ class SegmentScorer:
             )
         if self.cnn_backend is None:
             raise ValueError("CNN backend is required for a TinyCNN/hybrid model")
-        cnn_input = soft_batch if soft_batch is not None else glyphs
-        logits = self.cnn_backend.forward_logits(cnn_input)
+        if (
+            image is not None
+            and segments is not None
+            and self.cnn_input_mode == "soft"
+            and isinstance(self.cnn_backend, WGPUBackend)
+        ):
+            # G3 fused path: preprocess + mega in one submit.
+            logits = self.cnn_backend.forward_logits_from_image(
+                image, segments, self.normalize_spec, geometries
+            )
+        else:
+            cnn_input = soft_batch if soft_batch is not None else glyphs
+            logits = self.cnn_backend.forward_logits(cnn_input)
         if allowed_ids is not None:
             masked = np.full_like(logits, -np.inf)
             idx = np.fromiter(sorted(allowed_ids), dtype=np.int64)

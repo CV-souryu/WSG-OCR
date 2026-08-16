@@ -610,6 +610,7 @@ def segment_line(
     allowed_ids: set[int] | None = None,
     max_merge_components: int = 4,
     soft: np.ndarray | None = None,
+    image: np.ndarray | None = None,
     lexicon: Lexicon | str | None = None,
     decoder_config: DecoderConfig | None = None,
 ) -> DecodePath:
@@ -681,7 +682,7 @@ def segment_line(
         ]
     else:
         geometries = [None] * len(candidates)
-    scores = scorer.score(segments, allowed_ids, soft=soft, geometries=geometries)
+    scores = scorer.score(segments, allowed_ids, soft=soft, geometries=geometries, image=image)
     geometry_db = getattr(scorer, "geometry", None)
     for cand, raw_score, geom in zip(candidates, scores, geometries):
         # Goal 20 geometry split: compute the identity-independent half once

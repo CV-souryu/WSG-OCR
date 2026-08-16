@@ -87,7 +87,7 @@ def _cpu_soft_batch(
     image: np.ndarray, segments: list[Component], spec
 ) -> np.ndarray:
     """CPU reference for ``preprocess_glyphs`` (default profile soft path)."""
-    from fixedfontocr.preprocess import _soft_glyph_batch
+    from fixedfontocr.scorer import _soft_glyph_batch
 
     profile = default_profile()
     soft = profile.soft_foreground(image)
@@ -229,7 +229,6 @@ def test_goal20_logits_for_gather_parity(wgpu, weights, random_glyphs) -> None:
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=T3, strict=False)
 def test_goal20_gpu_preprocess_parity(wgpu) -> None:
     """GPU preprocess must be byte-identical to the CPU soft batch."""
     rng = np.random.default_rng(7)

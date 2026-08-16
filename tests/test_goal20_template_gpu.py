@@ -25,8 +25,6 @@ from fixedfontocr.classifier import (
     TemplateV2Data,
 )
 
-from conftest import render_text
-
 
 def _random_weights(num_classes: int = 10, seed: int = 0) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
@@ -185,46 +183,96 @@ def test_gpu_template_auto_wrapper_parity(cpu_matcher, gpu_matcher) -> None:
         )
 
 
-def test_gpu_template_end_to_end_game_cn(font_path) -> None:
-    """The production hybrid path runs the GPU template matcher."""
+
+
+# ---------------------------------------------------------------------
+# Real-game crops_items corpus (dict mode) — the production scenario
+# ---------------------------------------------------------------------
+
+CROPS = (
+    Path(__file__).resolve().parents[1]
+    / "fonts" / "SourceHanSansSC" / "crops" / "crops_items"
+)
+BANK = CROPS.parent / "crops_items_recognition.csv.realglyphs.npz"
+PINNED_CROPS = (
+    "0_y112_y140_item1.png",  # Z17
+    "1_y646_y674_item2.png",  # Z28
+    "1_y646_y674_item6.png",  # Z1
+    "0_y151_y179_item5.png",  # 47工程
+    "0_y290_y318_item0.png",  # 初雪
+    "1_y400_y428_item1.png",  # 乌戈里尼
+)
+
+
+def _require_crops() -> None:
+    if not all((CROPS / name).is_file() for name in PINNED_CROPS) or not BANK.is_file():
+        pytest.skip("crops_items corpus/bank not present (local dataset)")
+
+
+def _load_crop(name: str) -> np.ndarray:
+    from PIL import Image
+
+    return np.asarray(Image.open(CROPS / name).convert("RGB"), dtype=np.uint8)
+
+
+def _game_cn_ocr(backend: str):
     model_dir = Path("model/game_cn")
     if not (model_dir / "config.json").exists():
         pytest.skip("model/game_cn not present")
     pytest.importorskip("wgpu")
     try:
-        gpu_ocr = FixedFontOCR(model_path=model_dir, backend="wgpu")
+        return FixedFontOCR(model_path=model_dir, backend=backend)
     except Exception as exc:
         pytest.skip(f"WGPU adapter unavailable: {exc}")
+
+
+def test_gpu_template_end_to_end_crops_dict_mode() -> None:
+    """wgpu vs cpu on the real crops in dict mode (+ real-glyph bank)."""
+    _require_crops()
     from fixedfontocr.backends import WGPUTemplateMatcher as WTM
 
+    gpu_ocr = _game_cn_ocr("wgpu")
     assert isinstance(gpu_ocr._scorer.template, WTM)
-    cpu_ocr = FixedFontOCR(model_path=model_dir, backend="cpu")
-    for text in ("获得金币1000", "巴尔的摩"):
-        image = render_text(text, font_path)
-        got = gpu_ocr.recognize(image)
-        ref = cpu_ocr.recognize(image)
-        assert got.text == ref.text == text, (got.text, ref.text)
+    cpu_ocr = _game_cn_ocr("cpu")
+    for name in PINNED_CROPS:
+        image = _load_crop(name)
+        got = gpu_ocr.recognize(
+            image, lexicon="ship_names", lexicon_mode="dict", real_glyph_bank=BANK
+        )
+        ref = cpu_ocr.recognize(
+            image, lexicon="ship_names", lexicon_mode="dict", real_glyph_bank=BANK
+        )
+        assert got.text == ref.text, (name, got.text, ref.text)
+        assert got.matched_term == ref.matched_term, (
+            name,
+            got.matched_term,
+            ref.matched_term,
+        )
 
 
-def test_gpu_template_auto_backend_game_cn(font_path) -> None:
-    """backend="auto" wraps CPU+GPU template matchers and stays in parity."""
-    model_dir = Path("model/game_cn")
-    if not (model_dir / "config.json").exists():
-        pytest.skip("model/game_cn not present")
-    pytest.importorskip("wgpu")
-    try:
-        auto_ocr = FixedFontOCR(model_path=model_dir, backend="auto")
-    except Exception as exc:
-        pytest.skip(f"WGPU adapter unavailable: {exc}")
+def test_gpu_template_auto_backend_crops_dict_mode() -> None:
+    """backend="auto" stays in parity with CPU on the real crops (dict)."""
+    _require_crops()
     from fixedfontocr.backends import AutoTemplateMatcher as ATM
     from fixedfontocr.backends import WGPUTemplateMatcher as WTM
 
+    auto_ocr = _game_cn_ocr("auto")
     assert isinstance(auto_ocr._scorer.template, ATM)
     assert isinstance(auto_ocr._scorer.template.gpu, WTM)
     assert auto_ocr._scorer.template.crossover is not None
-    cpu_ocr = FixedFontOCR(model_path=model_dir, backend="cpu")
-    for text in ("获得金币1000", "巴尔的摩"):
-        image = render_text(text, font_path)
-        got = auto_ocr.recognize(image)
-        ref = cpu_ocr.recognize(image)
-        assert got.text == ref.text == text, (got.text, ref.text)
+    cpu_ocr = _game_cn_ocr("cpu")
+    for name in PINNED_CROPS:
+        image = _load_crop(name)
+        got = auto_ocr.recognize(
+            image, lexicon="ship_names", lexicon_mode="dict", real_glyph_bank=BANK
+        )
+        ref = cpu_ocr.recognize(
+            image, lexicon="ship_names", lexicon_mode="dict", real_glyph_bank=BANK
+        )
+        assert got.text == ref.text, (name, got.text, ref.text)
+        assert got.matched_term == ref.matched_term, (
+            name,
+            got.matched_term,
+            ref.matched_term,
+        )
+

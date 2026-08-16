@@ -63,6 +63,8 @@ linear.wgsl           dense layer (for layer verification)
 argmax.wgsl           top-1/top-2 reduction over logits (for verification)
 linear_argmax.wgsl    fused dense + top-1/top-2 (for verification)
 mega.wgsl             the WHOLE chain in one dispatch (production path)
+template_match.wgsl   Template V2 cascade in one dispatch per glyph batch
+preprocess_soft.wgsl  RGB -> soft glyph batch (ROI/gray/resize) in one dispatch
 ```
 
 Since the mega rewrite (Goal 20 phase 2) the production path no longer
@@ -269,6 +271,12 @@ the four tasks:
   fallback, deterministic Top-K, winner prototype) in one dispatch per
   glyph batch, byte-exact against the CPU reference. End-to-end
   `recognize()` on `model/game_cn` is now 3.2-4.7x faster on GPU/auto.
+- **G3 GPU preprocessing**: DONE (soft path) — `preprocess_soft.wgsl`
+  uploads the RGB image once and does ROI crop, grayscale, nearest-neighbor
+  resize and baseline placement in one dispatch, byte-exact against the
+  CPU soft batch; `forward_logits_from_image` runs preprocess + mega in
+  ONE submit. Validated on the crops_items dict-mode corpus
+  (`tests/test_goal20_crops_gpu.py`).
 - **T2 DP Top-K 回灌**: `classify_topk(glyphs, allowed_mask)` +
   `logits_for(glyphs, char_ids)` so the lattice scorer reads back
   ~`N*(K*8+12)` bytes instead of the full `[N, C]` logits.

@@ -151,10 +151,13 @@ def test_scorer_feeds_cnn_soft_glyphs(font_path, monkeypatch):
     original = SegmentScorer._cnn_batch
     captured: dict[str, np.ndarray | None] = {}
 
-    def spy(self, glyphs, allowed_ids, soft_batch=None):
+    def spy(self, glyphs, allowed_ids, soft_batch=None, image=None,
+            segments=None, geometries=None):
         captured["binary"] = glyphs
         captured["soft"] = soft_batch
-        return original(self, glyphs, allowed_ids, soft_batch)
+        return original(
+            self, glyphs, allowed_ids, soft_batch, image, segments, geometries
+        )
 
     monkeypatch.setattr(SegmentScorer, "_cnn_batch", spy)
     scorer.score(comps, soft=frontend.soft_foreground)
@@ -186,10 +189,13 @@ def test_binary_trained_model_keeps_binary_cnn_input(font_path, monkeypatch):
     original = SegmentScorer._cnn_batch
     captured: dict[str, np.ndarray | None] = {}
 
-    def spy(self, glyphs, allowed_ids, soft_batch=None):
+    def spy(self, glyphs, allowed_ids, soft_batch=None, image=None,
+            segments=None, geometries=None):
         captured["binary"] = glyphs
         captured["soft"] = soft_batch
-        return original(self, glyphs, allowed_ids, soft_batch)
+        return original(
+            self, glyphs, allowed_ids, soft_batch, image, segments, geometries
+        )
 
     monkeypatch.setattr(SegmentScorer, "_cnn_batch", spy)
     scorer.score(comps, soft=frontend.soft_foreground)

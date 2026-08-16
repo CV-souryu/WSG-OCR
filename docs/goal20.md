@@ -306,8 +306,27 @@ text/matched_term 全部一致）
 
 auto 后端在所有 crops 上无回归（小 crop 自动留在 CPU，大 crop 走 GPU），
 全语料 238 个标注 crop 的 dict 模式 parity 由
-`tests/test_goal20_crops_gpu.py::test_crops_gpu_dict_mode_parity_full_corpus`
-逐张断言。
+`tests/test_goal20_crops_gpu.py::test_crops_gpu_dict_mode_csv_answers_single_submit`
+逐张断言（答案以 `crops_items_recognition.csv` 为准，1 submit/行）。
+
+### 单次发射 A/B 实测（2026-08-16，G4 补口后；真实 crops、真实 segments，
+交错测量 median of 9×15；2-submit = 模板 dispatch 与 CNN dispatch 分两次
+submit，1-submit = stage 同 encoder 合并发射）
+
+| crop | N | binary 2sub | `score_line` | 收益 | soft 2sub | `score_line_from_image` | 收益 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Z17 | 3 | 7.85 ms | 6.46 ms | 1.21x | 7.93 ms | 6.54 ms | 1.21x |
+| 初雪 | 2 | 11.68 ms | 10.37 ms | 1.13x | 11.71 ms | 10.32 ms | 1.14x |
+| 乌戈里尼 | 7 | 11.83 ms | 10.46 ms | 1.13x | 12.27 ms | 10.71 ms | 1.15x |
+| Z1 | 2 | 7.91 ms | 6.72 ms | 1.18x | 7.92 ms | 6.78 ms | 1.17x |
+
+结论：合并发射稳定省掉第二个 `map_sync` 地板（~1.3-1.5 ms/行），binary 与
+soft 路径收益一致（1.13-1.21x）；每行剩余 ~6.5-10.5 ms 大头是 G2 模板
+全量扫描（N≤7 时 workgroup 数少、扫描 92.8k prototypes 的固定 ALU 成本），
+与 sync 数无关。端到端（dict + bank，median of 5×5，见上表同机复测）：
+乌戈里尼 82.3→44.9 ms（1.83x，binary）/ 80.7→42.8 ms（1.89x，soft），
+小 crop 仍受 sync 地板拖累（初雪 0.5-0.67x），由 `backend="auto"` 留在
+CPU。
 
 三个事实（对排期的影响）：
 
@@ -315,5 +334,6 @@ auto 后端在所有 crops 上无回归（小 crop 自动留在 CPU，大 crop �
    （模板段）搬上 GPU —— 端到端从打平变为 **GPU 领先 3.2-4.7x**。
 2. 剩余 GPU 地板仍是单次 `map_sync`（~1.3-2.7 ms）：batch < 4 的
    模板匹配与 batch < 64 的 CNN 由 auto 选路留在 CPU，无回归。
-3. G3（预处理）+ G4（视觉 DP 解码）落地后收口成「一次 submit 出
-   OCR 结果」；T2/T4 的读回裁剪与 staged 双缓冲作为后续优化。
+3. G3（预处理）+ G4（评分链）已收口成「一次 submit 出 OCR 结果」；
+   单行再省一次 sync 的边际收益有限（大头是模板扫描），T2 读回裁剪、
+   T4 staged 双缓冲与模板 shader 的粗筛减枝作为后续优化方向。

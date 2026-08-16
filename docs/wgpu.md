@@ -288,6 +288,12 @@ the four tasks:
   corpus: stage parity, per-line `last_submit_count == 1`, trip-wired
   single-submit recognize, and the full CSV answer key (文本值/预期值)
   with backend="wgpu" == backend="cpu".
+  Measured on real crops (interleaved median 9x15): merging the second
+  submit saves the extra `map_sync` floor consistently — binary
+  `score_line` and soft `score_line_from_image` are both 1.13-1.21x vs the
+  two-submit equivalent; per-line cost is dominated by the G2 template
+  scan (~6.5-10.5 ms at N<=7, independent of submit count), and end-to-end
+  the big crops win 1.8-1.9x while tiny crops stay on CPU via auto.
 - **T2 DP Top-K 回灌**: `classify_topk(glyphs, allowed_mask)` +
   `logits_for(glyphs, char_ids)` so the lattice scorer reads back
   ~`N*(K*8+12)` bytes instead of the full `[N, C]` logits.

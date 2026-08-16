@@ -14,6 +14,7 @@ from .backends import (
     Backend,
     CPUBackend,
     WGPUBackend,
+    WGPUScoringStage,
     WGPUTemplateMatcher,
     benchmark_backends,
 )
@@ -94,10 +95,12 @@ class FixedFontOCR:
                 "WGPU backend requires a tinycnn model; template models run on CPU"
             )
         self._template_backend = self._make_template_backend()
+        self._gpu_stage = self._make_gpu_stage()
         self._scorer = SegmentScorer(
             self.model,
             cnn_backend=self._backend,
             template_backend=self._template_backend,
+            gpu_stage=self._gpu_stage,
         )
 
     # ------------------------------------------------------------------
@@ -185,6 +188,33 @@ class FixedFontOCR:
             return cpu
         self._benchmark = measurements
         return AutoBackend(cpu=cpu, gpu=gpu, measurements=measurements)
+
+    def _make_gpu_stage(self) -> WGPUScoringStage | None:
+        """Single-submit template+CNN scoring stage (G4).
+
+        Requires an explicit WGPU backend, the GPU template matcher and a
+        binary-input hybrid model (the soft path keeps the G3 fused
+        preprocess+mega submit). The visual DP stays on the CPU — its f64
+        tie tolerance cannot be reproduced in f32 WGSL and it is
+        microsecond-scale — so the stage closes the scoring chain into ONE
+        submit and ONE readback per line.
+        """
+
+        if (
+            self.backend == "wgpu"
+            and isinstance(self._backend, WGPUBackend)
+            and isinstance(self._template_backend, WGPUTemplateMatcher)
+            and self.model.classifier == "hybrid"
+            and self.model.input_mode == "binary"
+        ):
+            try:
+                return WGPUScoringStage(self._backend, self._template_backend)
+            except Exception as exc:
+                self._benchmark_error = (
+                    (self._benchmark_error + "; " if self._benchmark_error else "")
+                    + f"gpu scoring stage unavailable: {exc}"
+                )
+        return None
 
     @property
     def backend_benchmark(self) -> dict[int, dict[str, float]] | None:

@@ -757,5 +757,10 @@ spacing, and normalized size. Pass a custom profile to
   (`tests/test_goal20_crops_gpu.py`: byte parity, fused-logits parity,
   full-corpus wgpu/cpu parity; auto backend shows no regression on any
   crop and 1.86x on the big 乌戈里尼 crop).
-  Remaining 全链路 step: G4 visual-DP decode on GPU
-  (`docs/goal20.md`).
+- Goal 20 G4 landed: `WGPUScoringStage.score_line` closes the whole
+  scoring chain (template match + TinyCNN logits) into ONE submit with
+  ONE readback per line (2 syncs -> 1; e.g. 初雪 crop 26.4 -> 21.1 ms).
+  The visual DP intentionally stays on CPU: `decode_dp` uses f64
+  arithmetic with a 1e-12 tie tolerance that f32 WGSL cannot reproduce,
+  and it is microsecond-scale — fonts/goal keeps the decoder on the CPU
+  boundary. Remaining: T2 Top-K readback trimming (`docs/goal20.md`).

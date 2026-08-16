@@ -1586,3 +1586,127 @@ class AutoTemplateMatcher:
     ) -> TemplateBatch:
         n = int(np.asarray(glyphs).shape[0])
         return self.pick(n).match_batch(glyphs, allowed_ids, top_k)
+
+
+class WGPUScoringStage:
+    """Template + TinyCNN scoring in ONE submit, ONE readback (Goal 20 G4).
+
+    The visual DP itself stays on the CPU: ``decode_dp`` uses f64 arithmetic
+    with a 1e-12 tie tolerance that f32 WGSL cannot reproduce, and the DP is
+    microsecond-scale anyway. The GPU's job is the scoring chain, so this
+    stage records the template dispatch and the mega-logits dispatch into a
+    single command encoder and reads both results back with ONE ``map_sync``.
+    """
+
+    def __init__(
+        self,
+        gpu: "WGPUBackend",
+        template_matcher: "WGPUTemplateMatcher",
+    ):
+        self.gpu = gpu
+        self.template = template_matcher
+        self.device = gpu.device
+        self._wgpu = gpu._wgpu
+        self.last_submit_count: int | None = None
+        self._cap = 0
+        self._staging = None
+
+    def _ensure(self, n: int) -> None:
+        if n <= self._cap:
+            return
+        self._cap = n
+        size = n * (_GPU_TEMPLATE_RECORD * 4 + self.gpu.num_classes * 4)
+        self._staging = self.gpu._device_create_buffer(
+            size=size, usage=self.gpu._U_MAP_READ | self.gpu._U_COPY_DST
+        )
+
+    def score_line(
+        self,
+        glyphs: NDArray[np.uint8],
+        allowed_ids: set[int] | None = None,
+    ) -> tuple[TemplateBatch, NDArray[np.float32]]:
+        """One submit: template match + full TinyCNN logits; one readback.
+
+        ``glyphs`` is the packed-binary ``uint8 [N, 24, 24]`` batch (the
+        same one the CPU template matcher and binary-mode CNN consume).
+        """
+        glyphs = np.asarray(glyphs, dtype=np.uint8)
+        if glyphs.ndim != 3:
+            raise ValueError(f"glyphs must be [N, H, W], got {glyphs.shape}")
+        n = glyphs.shape[0]
+        area = self.template.input_size * self.template.input_size
+        if n == 0:
+            return (
+                self.template.match_batch(glyphs, allowed_ids),
+                np.empty((0, self.gpu.num_classes), dtype=np.float32),
+            )
+        if glyphs.shape[1:] != (self.template.input_size,) * 2:
+            raise ValueError(
+                f"expected {self.template.input_size}x{self.template.input_size} "
+                f"glyphs, got {glyphs.shape[1:]}"
+            )
+        proto_ids = self.template._allowed_prototypes(allowed_ids)
+        if proto_ids.size == 0:
+            return (
+                self.template.match_batch(glyphs, allowed_ids),
+                np.zeros((n, self.gpu.num_classes), dtype=np.float32),
+            )
+
+        self.template._ensure_buffers(n)
+        self.gpu._ensure_buffers(n)
+        self._ensure(n)
+
+        bits = np.packbits(glyphs.reshape(n, -1), axis=1, bitorder="little")
+        words = bits.view(np.uint32).reshape(-1)
+        if allowed_ids is None:
+            mask = np.full(self.template._allowed_words, 0xFFFFFFFF, dtype=np.uint32)
+            rem = self.template.num_classes % 32
+            if rem:
+                mask[-1] &= np.uint32((1 << rem) - 1)
+        else:
+            mask = np.zeros(self.template._allowed_words, dtype=np.uint32)
+            for cid in sorted(allowed_ids):
+                mask[cid // 32] |= np.uint32(1 << (cid % 32))
+        self.device.queue.write_buffer(
+            self.template._glyph_buf, 0, words, 0, words.nbytes
+        )
+        self.device.queue.write_buffer(
+            self.template._allowed_buf, 0, mask, 0, mask.nbytes
+        )
+        self.device.queue.write_buffer(
+            self.gpu._bufs["input"], 0, glyphs, 0, glyphs.nbytes
+        )
+
+        enc = self.device.create_command_encoder()
+        p1 = enc.begin_compute_pass()
+        p1.set_pipeline(self.template._pipeline)
+        p1.set_bind_group(0, self.template._bind_group, [], 0, 99)
+        p1.dispatch_workgroups(n, 1, 1)
+        p1.end()
+        p2 = enc.begin_compute_pass()
+        p2.set_pipeline(self.gpu._pipelines["mega"])
+        p2.set_bind_group(0, self.gpu._mega_bind(self.gpu._MEGA_LOGITS), [], 0, 99)
+        p2.dispatch_workgroups(n, 1, 1)
+        p2.end()
+        tpl_bytes = n * _GPU_TEMPLATE_RECORD * 4
+        logits_bytes = n * self.gpu.num_classes * 4
+        enc.copy_buffer_to_buffer(
+            self.template._result_buf, 0, self._staging, 0, tpl_bytes
+        )
+        enc.copy_buffer_to_buffer(
+            self.gpu._bufs["logits"], 0, self._staging, tpl_bytes, logits_bytes
+        )
+        self.device.queue.submit([enc.finish()])
+        self._staging.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(
+            self._staging.read_mapped(size=tpl_bytes + logits_bytes),
+            dtype=np.uint8,
+        ).copy()
+        self._staging.unmap()
+        self.last_submit_count = 1
+        tb = self.template._parse_results(raw[:tpl_bytes], n, area)
+        logits = np.ascontiguousarray(
+            raw[tpl_bytes:].view("<f4").reshape(n, self.gpu.num_classes),
+            dtype=np.float32,
+        )
+        return tb, logits

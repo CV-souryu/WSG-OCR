@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .backends import Backend, CPUBackend, WGPUBackend
+from .backends import Backend, CPUBackend, WGPUBackend, WGPUScoringStage
 from .classifier import (
     DOWNSAMPLE_CLEAN,
     TemplateClassifier,
@@ -492,7 +492,9 @@ class SegmentScorer:
         model: OCRModel,
         cnn_backend: Backend | None = None,
         template_backend=None,
+        gpu_stage: WGPUScoringStage | None = None,
     ):
+        self.gpu_stage = gpu_stage
         self.model = model
         self.input_size = model.input_size
         self.normalize_spec = model.normalize_spec
@@ -606,8 +608,16 @@ class SegmentScorer:
         )
         n = len(segments)
 
+        use_stage = (
+            self.gpu_stage is not None
+            and self.cnn_input_mode == "binary"
+            and (allowed_ids is None or bool(allowed_ids))
+        )
         if self.template is not None:
-            tb = self.template.match_batch(glyphs, allowed_ids)
+            if use_stage:
+                tb, stage_logits = self.gpu_stage.score_line(glyphs, allowed_ids)
+            else:
+                tb = self.template.match_batch(glyphs, allowed_ids)
             if self.weights is None:
                 out: list[SegmentScore] = []
                 for i in range(n):
@@ -668,7 +678,10 @@ class SegmentScorer:
                     & (tb.margins <= 0.0)
                     & (tb.prototype_downsample_modes != DOWNSAMPLE_CLEAN)
                 )
-            cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch, image, segments, geoms)
+            if use_stage:
+                cnn = self._cnn_from_logits(stage_logits, allowed_ids)
+            else:
+                cnn = self._cnn_batch(glyphs, allowed_ids, soft_batch, image, segments, geoms)
             out: list[SegmentScore] = []
             for i in range(n):
                 template_entries = _template_entries(tb, i)
@@ -964,6 +977,14 @@ class SegmentScorer:
         else:
             cnn_input = soft_batch if soft_batch is not None else glyphs
             logits = self.cnn_backend.forward_logits(cnn_input)
+        return self._cnn_from_logits(logits, allowed_ids)
+
+    def _cnn_from_logits(
+        self,
+        logits: np.ndarray,
+        allowed_ids: set[int] | None,
+    ) -> ClassificationBatch:
+        """Top-2/Top-K reduction over already-computed ``[N, C]`` logits."""
         if allowed_ids is not None:
             masked = np.full_like(logits, -np.inf)
             idx = np.fromiter(sorted(allowed_ids), dtype=np.int64)

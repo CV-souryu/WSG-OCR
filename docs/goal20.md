@@ -178,22 +178,33 @@ mega（G1）已把 TinyCNN 整链做成单 dispatch。剩余三段：
   binary input_mode，crops 上的收益来自 G1/G2（见下方实测）。
   测试：`tests/test_goal20_crops_gpu.py`（byte parity、fused logits
   parity、pinned + 全语料 dict 模式 parity）。
-- **G4 纯视觉 DP 解码进 GPU**：每行一个 workgroup，lattice 候选分数
-  （G2+G3 产出）直接在工作组内跑 DP，读回最终路径 + Top-K —— 一次
-  submit 出 OCR 结果。Lexicon beam 仍留 CPU（fonts/goal 边界）；
-  CC/lattice 生成暂留 CPU（CC 的 GPU 化是独立研究级任务，单列）。
+- **G4 视觉 DP 解码进 GPU** — 重新评估后**有意不做**，改为
+  **评分链单次发射** ✅：`decode_dp` 用 f64 算术 + 1e-12 tie 容差
+  （`score > prev + 1e-12` 比较），f32 WGSL 无法复刻该比较语义
+  （近并列路径会选错），且 DP 本身是微秒级。fonts/goal 的边界本来
+  就把 Decoder 留给 CPU。真正的收口是评分链：
+  `WGPUScoringStage.score_line` 把模板 dispatch + mega-logits dispatch
+  记入**同一个 command encoder**，模板记录与全 logits 拷进同一块
+  staging，**1 个 submit、1 次 map_sync、1 次读回**，每行评分从
+  2 sync 降为 1（crops 实测：初雪 26.4→21.1 ms，乌戈里尼
+  50.8→49.5 ms）。DP/lexicon/NCC 仲裁留 CPU（见边界说明）。
+  测试：`tests/test_goal20_crops_gpu.py` 新增 stage 逐位 parity +
+  `last_submit_count == 1`；全语料 dict parity 在生产路径上直接
+  覆盖 stage。
 
 优先级：G2 ✅ → G3（与 mega 合并发射）→ G4（收口成一次 submit 出结果）。
 
 ## 5. 实施顺序与依赖
 
 ```text
-G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 视觉 DP → T2 收尾
+G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 评分链单次发射（✅）→ T2 收尾
 ```
 
 - G1 mega 已消灭 8-sync 墙；G2 已把端到端大头（模板段）搬上 GPU
-  （端到端 3.2-4.7x）；G3 已把 soft 预处理搬上 GPU（byte-exact）。
-- G4 收口成「一次 submit 出结果」。
+  （端到端 3.2-4.7x）；G3 已把 soft 预处理搬上 GPU（byte-exact）；
+  G4 已把模板+CNN 评分链收进 1 个 submit（1 次 map_sync）。
+- 剩余：T2 读回字节裁剪（[N,C] → Top-K+gather）作为最后的带宽优化；
+  视觉 DP/lexicon/CC 按 fonts/goal 边界留 CPU。
 - T2（Top-K 读回裁剪）在 G4 之后做读回字节优化；T3 的 profile 公式
   风险被 G3 分解（先 default profile soft 路径）。
 - 每项任务落地 = 独立 commit + 把 `tests/test_goal20_wgpu.py` 中对应
@@ -207,6 +218,9 @@ G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 视觉
       全绿（逐字段精确 parity），端到端 GPU/auto 领先 3.2-4.7x
 - [x] G3 预处理单 dispatch：`tests/test_goal20_crops_gpu.py` 4 个
       全绿（byte-exact + fused logits + crops dict 模式全语料 parity）
+- [x] G4 评分链单次发射：`WGPUScoringStage.score_line` 1 submit /
+      1 map_sync，stage 逐位 parity + `last_submit_count == 1`
+      （`tests/test_goal20_crops_gpu.py`，共 6 个全绿）
 - [ ] `tests/test_goal20_wgpu.py` 全绿（无 xfail）
 - [ ] `tests/test_wgpu.py` + `tests/test_wgpu_vectors.py` +
       `tests/test_auto_backend.py` 全绿

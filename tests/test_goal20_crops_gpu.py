@@ -139,6 +139,43 @@ def test_crops_gpu_fused_logits_parity(game_ocrs, game_model) -> None:
     assert gpu_backend.last_dispatch_count == 2  # preprocess + mega, 1 submit
 
 
+def test_crops_gpu_stage_parity(game_ocrs) -> None:
+    """One-submit scoring stage == the two separate GPU calls, exactly."""
+    _require_crops()
+    cpu_ocr, gpu_ocr = game_ocrs
+    from fixedfontocr.backends import WGPUScoringStage
+    from fixedfontocr.preprocess import normalize
+
+    assert isinstance(gpu_ocr._scorer.gpu_stage, WGPUScoringStage)
+    stage = gpu_ocr._scorer.gpu_stage
+    matcher = gpu_ocr._scorer.template
+    backend = gpu_ocr._scorer.cnn_backend
+    for name in PINNED_CROPS:
+        image = _load_crop(name)
+        segments = _candidate_segments(cpu_ocr, image)
+        glyphs = np.stack([normalize(s.mask, 24) for s in segments])
+        tb_stage, logits_stage = stage.score_line(glyphs, None)
+        tb_sep = matcher.match_batch(glyphs, None)
+        logits_sep = backend.forward_logits(glyphs)
+        assert np.array_equal(tb_stage.top_k_ids, tb_sep.top_k_ids)
+        assert np.array_equal(tb_stage.top_k_scores, tb_sep.top_k_scores)
+        assert np.array_equal(tb_stage.best_prototypes, tb_sep.best_prototypes)
+        assert np.array_equal(logits_stage, logits_sep), name
+    assert stage.last_submit_count == 1
+
+
+def test_crops_gpu_stage_single_submit_per_line(game_ocrs) -> None:
+    """The production wgpu path closes the scoring chain into one submit."""
+    _require_crops()
+    _cpu_ocr, gpu_ocr = game_ocrs
+    stage = gpu_ocr._scorer.gpu_stage
+    assert stage is not None
+    for name in PINNED_CROPS:
+        image = _load_crop(name)
+        gpu_ocr.recognize(image)
+        assert stage.last_submit_count == 1
+
+
 def test_crops_gpu_dict_mode_parity_pinned(game_ocrs) -> None:
     """wgpu vs cpu in dict mode (+ bank): same text and matched_term."""
     _require_crops_and_bank()

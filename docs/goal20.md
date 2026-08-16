@@ -73,34 +73,44 @@ host 零中间拷回：
 - per-layer 入口原样保留作为 parity 原语；`last_dispatch_count` 观测
   字段已加，契约测试 pin `== 1`。
 
-### T2 — DP 候选 Top-K 回灌（`classify_topk` + `logits_for`）
+### T2 — DP 候选 Top-K 回灌（`classify_topk` + `logits_for`）✅ 完成
 
 现状：DP 需要全 `[N,C]` logits —— Top-5、allowed_ids 掩码，以及
 `_fuse_scores` 对 template-only id 取 logit（`scorer.py:264-308`）。
 
-目标：每 glyph 只读回小记录：
+落地（实现细节与草案的差异）：
 
-1. `Backend.classify_topk(glyphs, allowed_mask=None)`：新 WGSL
-   `linear_topk.wgsl`（per-glyph workgroup：全 C logits → 按 bitmask
-   掩码 → Top-K 顺序归约），读回 `K × (u32 + f32)`/glyph。CPU 参考 =
-   numpy topk over `forward_logits`（掩码语义一致）。
-2. `Backend.logits_for(glyphs, char_ids)`：`[N,M]` 定点 gather
-   （`logits_for.wgsl`：只算指定 (glyph, class) 的 dot），供 hybrid
-   fusion 取 template-only id 的 logit。
-3. `SegmentScorer._cnn_batch` 在后端提供能力时切换为上述两调用，
-   fusion 逻辑逐行不变（`classify_topk` 缺省实现退回全 logits，模板
-   模型无 CNN 不受影响）。
+1. `Backend.classify_topk(glyphs, allowed_mask=None, top_k=5)`：没有另写
+   `linear_topk.wgsl`，而是给 `mega.wgsl` 加了 **MODE_TOPK（2）** —— 同一
+   个 per-glyph workgroup 里 dense 之后做掩码 Top-7 归约（每线程 7 槽
+   局部表 → 448 项 thread-0 归并，并列取更小 id），读回 7×(u32+f32)/glyph，
+   对外返回前 5 名。ABC 提供缺省实现（全 logits + numpy Top-K），
+   CPU/AutoBackend 直接继承。
+2. `Backend.logits_for(glyphs, char_ids)`：`mega.wgsl` **MODE_GATHER（3）**
+   —— 只算指定 (glyph, class) 的 dot（M 经 uniform 传入，上限 64），
+   读回 `[N,M]` f32。
+3. 生产路径在 `WGPUScoringStage` 内收口为 **MODE_TOPK_GATHER（4）**：
+   模板 dispatch + mega(top7+gather) 仍在同一个 encoder，gather 的 id 由
+   shader 直接读模板记录（binding 5），宿主把 top-7 + 5 个 gathered 对
+   重建为稠密 `[N,C]` 掩码矩阵（支持位置真实值、其余 `-inf`）——
+   `SegmentScorer._cnn_from_logits` 与 fusion 逻辑**逐行不变**（融合只读
+   CNN Top-K 与模板 Top-K 两类位置，重建信息完整）。`score_line`/
+   `score_line_from_image` 带 `sparse=True/False`：默认稀疏（生产），
+   `sparse=False` 保留全量读回供逐位 parity 测试。
 
-Top-K 边界保护：WGSL 额外读回第 k+1/k+2 名 logit；CPU 发现
-`|logit_k − logit_{k+2}| < 1e-4` 时该批回退全 logits 读回（正确性
-优先，罕见路径）。
+Top-K 边界保护：WGSL 读回第 k+1/k+2 名 logit；宿主发现
+`|logit_k − logit_{k+2}| < 1e-4`（且两名均有效）时该批回退全 logits
+读回（正确性优先，罕见路径；crops 全语料实测未触发）。
 
-验收：`classify_topk`/`logits_for` 与 CPU 参考 parity（ids 一致、
-logits <1e-4）；hybrid 端到端 wgpu == cpu（digits/CJK/game_cn）；
-读回字节量从 `N×C×4` 降到 ~`N×(K×8+12)`。
+验收结果：`classify_topk`/`logits_for` 与 CPU 参考 parity（ids 一致、
+logits <1e-4，实测 max err ~7.6e-5）；`tests/test_goal20_wgpu.py` 两个
+T2 xfail 翻正；crops 全语料 dict 端到端 wgpu == cpu 不变；**读回字节量
+从 N×(60+4C) 降到 N×156（game_cn：7,636 B → 156 B/glyph，48.9x）**。
+`test_crops_gpu_stage_topk_sparse_contract` 钉住稀疏契约：支持位置与全量
+读回逐位相等、其余 `-inf`。
 
-风险：Top-K 并列次序 CPU（argpartition）vs GPU（顺序 scan）可能不同 →
-端到端 parity 测试把关 + 边界保护回退。
+风险（并列次序 CPU argpartition vs GPU 顺序 scan）由边界保护 + 端到端
+parity 把关；稀疏重建只在融合会读的位置放真实值，其余 `-inf`。
 
 ### T3 — GPU preprocessing（先 soft normalize）
 
@@ -227,8 +237,13 @@ G1 mega（✅）→ G2 模板 GPU（✅）→ G3 预处理（✅）→ G4 评分
       全绿（byte-exact + fused logits + crops dict 模式全语料 parity）
 - [x] G4 评分链单次发射：`WGPUScoringStage.score_line` 1 submit /
       1 map_sync，stage 逐位 parity + `last_submit_count == 1`
-      （`tests/test_goal20_crops_gpu.py`，共 9 个全绿）
-- [ ] `tests/test_goal20_wgpu.py` 全绿（无 xfail）
+      （`tests/test_goal20_crops_gpu.py`，共 10 个全绿）
+- [x] T2 Top-K 回灌：`classify_topk` + `logits_for` 与 CPU 参考 parity
+      （ids 一致、logits <1e-4，实测 ~7.6e-5）；stage 生产路径稀疏读回
+      （top-7 + 模板 gather，边界保护回退），读回 N×(60+4C) →
+      N×156 B（game_cn 48.9x）；`test_goal20_wgpu.py` 两个 T2 xfail 翻正
+- [ ] `tests/test_goal20_wgpu.py` 全绿（无 xfail）—— 仅剩 T4 staged
+      readback
 - [ ] `tests/test_wgpu.py` + `tests/test_wgpu_vectors.py` +
       `tests/test_auto_backend.py` 全绿
 - [ ] 全量回归（631 tests + 235-crop corpus + game_samples）在
@@ -356,6 +371,7 @@ N=1/7 从 9.1/11.7 ms → 4.0/2.7 ms（2.3-4.4x），端到端全部 crops 反�
    模板 workgroup 提速后再进一步（crops 上 1.3-2.3x）。
 2. 剩余 GPU 地板仍是单次 `map_sync`（~1.3-1.5 ms）：batch < 2 的
    模板匹配与 batch < 64 的 CNN 由 auto 选路留在 CPU，无回归。
-3. G3（预处理）+ G4（评分链）已收口成「一次 submit 出 OCR 结果」；
-   单行再省一次 sync 的边际收益有限（~0.4-1.3 ms），T2 读回裁剪、
-   T4 staged 双缓冲作为后续优化方向。
+3. G3（预处理）+ G4（评分链）已收口成「一次 submit 出 OCR 结果」，
+   T2 已把评分链读回从 N×(60+4C) 裁到 N×156 B（game_cn 48.9x，带宽
+   优化，单行时延不变——地板在 sync）；T4 staged 双缓冲是最后的
+   优化项（多帧场景摊薄 ~1.4 ms 地板）。

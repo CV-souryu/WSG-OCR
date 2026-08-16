@@ -301,9 +301,16 @@ the four tasks:
   two-submit equivalent; with the G2 tuning above the per-line scoring
   chain is now ~3.9-5.0 ms and end-to-end every pinned crop reaches or
   beats CPU (乌戈里尼 2.3x, small crops 0.98-1.3x).
-- **T2 DP Top-K 回灌**: `classify_topk(glyphs, allowed_mask)` +
-  `logits_for(glyphs, char_ids)` so the lattice scorer reads back
-  ~`N*(K*8+12)` bytes instead of the full `[N, C]` logits.
+- **T2 DP Top-K 回灌**: DONE — `mega.wgsl` gained MODE_TOPK (masked
+  top-7 per glyph), MODE_GATHER (dots for M requested ids) and
+  MODE_TOPK_GATHER (stage path: top-7 + template-id gather in the same
+  dispatch, one readback). `Backend.classify_topk` / `logits_for` provide
+  numpy fallbacks on CPU; the production `WGPUScoringStage` reads back
+  `N * 156 B` instead of `N * (60 + 4C)` (game_cn: 48.9x less) and
+  reconstructs the dense masked matrix on the host — the fusion algorithm
+  is unchanged. Tie-boundary guard: rank-5/rank-7 within 1e-4 falls back
+  to a full readback (rare). `tests/test_goal20_wgpu.py` T2 xfails flipped;
+  `tests/test_goal20_crops_gpu.py` pins the sparse contract on real crops.
 - **T3 GPU preprocessing**: upload the RGB image once and do ROI crop,
   grayscale, nearest-neighbor resize and normalize in WGSL; keep only
   bounding-box computation on CPU (soft path first, per-profile gated).

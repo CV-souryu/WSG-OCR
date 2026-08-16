@@ -6,9 +6,9 @@ Pins the acceptance criteria defined in ``docs/goal20.md``:
   never regress while WGPU work happens against the current repo CPU
   implementation as the parity reference (NOT the Goal 19 version-1.0
   snapshot; see ``docs/goal20.md`` section 1);
-- the ``xfail`` tests pin the four phase-2 tasks (T1 shader fusion, T2
-  DP Top-K 回灌, T3 GPU preprocessing, T4 staged readback). Each one flips
-  to a plain test when its task lands — see ``docs/goal20.md`` section 3.
+- the remaining ``xfail`` pins T4 staged readback — see
+  ``docs/goal20.md`` section 3. Each one flips to a plain test when its
+  task lands.
 
 Per-layer numeric parity, exported-vector parity and auto-backend selection
 live in ``tests/test_wgpu.py``, ``tests/test_wgpu_vectors.py`` and
@@ -30,9 +30,6 @@ from fixedfontocr.types import Component, default_profile
 
 from conftest import render_text
 
-T1 = "Goal 20 T1 (shader fusion) pending: docs/goal20.md"
-T2 = "Goal 20 T2 (DP Top-K 回灌) pending: docs/goal20.md"
-T3 = "Goal 20 T3 (GPU preprocessing) pending: docs/goal20.md"
 T4 = "Goal 20 T4 (staged readback) pending: docs/goal20.md"
 
 
@@ -194,7 +191,6 @@ def test_goal20_fused_pipeline_dispatch_count(wgpu, random_glyphs) -> None:
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason=T2, strict=False)
 def test_goal20_classify_topk_parity(wgpu, weights, random_glyphs) -> None:
     """classify_topk(glyphs, allowed_mask) matches the CPU masked Top-K."""
     cpu = CPUBackend(weights)
@@ -208,9 +204,13 @@ def test_goal20_classify_topk_parity(wgpu, weights, random_glyphs) -> None:
     assert got_logits.shape == ref_logits.shape
     assert np.array_equal(got_ids, ref_ids)
     assert np.abs(got_logits - ref_logits).max() < 1e-4
+    # no mask == all classes allowed
+    got_ids, got_logits = wgpu.classify_topk(random_glyphs, None)
+    ref_ids, ref_logits = _cpu_masked_topk(logits, np.ones(num_classes, dtype=bool))
+    assert np.array_equal(got_ids, ref_ids)
+    assert np.abs(got_logits - ref_logits).max() < 1e-4
 
 
-@pytest.mark.xfail(reason=T2, strict=False)
 def test_goal20_logits_for_gather_parity(wgpu, weights, random_glyphs) -> None:
     """logits_for(glyphs, char_ids) matches the CPU logit gather (hybrid fusion)."""
     cpu = CPUBackend(weights)

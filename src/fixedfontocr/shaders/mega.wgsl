@@ -8,8 +8,12 @@
 //     -> dw2    (3x3 depthwise, SAME, ReLU)   6x6x16
 //     -> pw2    (1x1, stride 2, ReLU)         3x3x32
 //     -> gap    (global average pool)         32
-//     -> MODE_CLASSIFY: dense + top-1/top-2 reduction -> 12-byte record
-//     -> MODE_LOGITS:   dense -> full [C] logits
+//     -> MODE_CLASSIFY:    dense + top-1/top-2 reduction -> 12-byte record
+//     -> MODE_LOGITS:      dense -> full [C] logits
+//     -> MODE_TOPK:        dense -> masked top-7 (ids+logits) -> 14-u32 record
+//     -> MODE_GATHER:      dense -> logits for M requested ids -> [N*M] f32
+//     -> MODE_TOPK_GATHER: masked top-7 + gather the template top-K ids
+//                          (binding 5) -> 24-u32 record (T2 stage path)
 //
 // All intermediate tensors live in workgroup shared memory: the host uploads
 // the packed glyph batch once, submits ONE dispatch (n workgroups), and reads
@@ -18,15 +22,25 @@
 // Per-layer f32 accumulation order replicates the verified per-layer shaders
 // (conv3x3/dwconv3x3/pointwise/gap/linear_argmax), so the numeric contract
 // against the numpy reference is unchanged.
+//
+// T2 (DP Top-K 回灌): MODE_TOPK/MODE_TOPK_GATHER read back 7 ranks instead
+// of the full [C] logits — the host uses ranks 6-7 (k+1/k+2 for k=5) as the
+// tie-boundary guard and falls back to a full readback when they are within
+// 1e-4. MODE_GATHER computes only the requested (glyph, class) dots, so the
+// hybrid fusion can fetch template-only logits without a full readback.
 
 struct Params {
-    a: vec4<u32>,  // n, num_classes, mode (0=classify, 1=logits), unused
+    a: vec4<u32>,  // n, num_classes, mode (0-4), M (gather count)
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> input: array<u32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> results: array<u32>;
+// Mode 2/4: allowed-class bitmask (words). Mode 3: requested ids [N*M].
+@group(0) @binding(4) var<storage, read> aux: array<u32>;
+// Mode 4: template match records (15 u32 per glyph) for the gather ids.
+@group(0) @binding(5) var<storage, read> template_results: array<u32>;
 
 // Fused weight-buffer layout (floats):
 //   conv1.w(72) conv1.b(8) dw1.w(72) dw1.b(8) pw1.w(128) pw1.b(16)
@@ -51,6 +65,8 @@ var<workgroup> sm_p2: array<f32, 288>;   // 3*3*32
 var<workgroup> sm_gap: array<f32, 32>;
 var<workgroup> sm_score: array<f32, 64>;
 var<workgroup> sm_id: array<u32, 64>;
+var<workgroup> sm_topv: array<f32, 448>;  // 64 threads x 7 top-logits
+var<workgroup> sm_topi: array<u32, 448>;  // 64 threads x 7 top-ids
 
 fn glyph_byte(base_words: u32, pos: u32) -> f32 {
     let word = input[base_words + pos / 4u];
@@ -218,7 +234,7 @@ fn main(
             results[g * 3u + 1u] = bitcast<u32>(r1);
             results[g * 3u + 2u] = bitcast<u32>(r2);
         }
-    } else {
+    } else if (mode == 1u) {
         // ---- dense: full [C] logits, one value per assigned class ----
         for (var c = tid; c < num_classes; c += 64u) {
             var acc = weights[off_fcb + c];
@@ -226,6 +242,131 @@ fn main(
                 acc += sm_gap[ic] * weights[OFF_FCW + c * 32u + ic];
             }
             results[g * num_classes + c] = bitcast<u32>(acc);
+        }
+    } else if (mode == 2u || mode == 4u) {
+        // ---- dense + masked top-7 per thread (ties keep the lower id) ----
+        var tv: array<f32, 7>;
+        var ti: array<u32, 7>;
+        var cnt = 0u;
+        for (var i = 0u; i < 7u; i++) {
+            tv[i] = -3.402823466e+38;
+            ti[i] = 0xffffffffu;
+        }
+        for (var c = tid; c < num_classes; c += 64u) {
+            if (((aux[c / 32u] >> (c % 32u)) & 1u) == 0u) {
+                continue;
+            }
+            var acc = weights[off_fcb + c];
+            for (var ic = 0u; ic < 32u; ic++) {
+                acc += sm_gap[ic] * weights[OFF_FCW + c * 32u + ic];
+            }
+            if (cnt < 7u) {
+                var j = cnt;
+                while (j > 0u && tv[j - 1u] < acc) {
+                    tv[j] = tv[j - 1u];
+                    ti[j] = ti[j - 1u];
+                    j -= 1u;
+                }
+                tv[j] = acc;
+                ti[j] = c;
+                cnt += 1u;
+            } else if (acc > tv[6u]) {
+                var j = 6u;
+                while (j > 0u && tv[j - 1u] < acc) {
+                    tv[j] = tv[j - 1u];
+                    ti[j] = ti[j - 1u];
+                    j -= 1u;
+                }
+                tv[j] = acc;
+                ti[j] = c;
+            }
+        }
+        for (var i = 0u; i < 7u; i++) {
+            sm_topv[tid * 7u + i] = tv[i];
+            sm_topi[tid * 7u + i] = ti[i];
+        }
+    }
+    workgroupBarrier();
+
+    if (mode == 2u || mode == 4u) {
+        // ---- merge 64 x 7 local tops -> global top-7 record (14 u32) ----
+        if (tid == 0u) {
+            var rv: array<f32, 7>;
+            var ri: array<u32, 7>;
+            var rcnt = 0u;
+            for (var i = 0u; i < 7u; i++) {
+                rv[i] = -3.402823466e+38;
+                ri[i] = 0xffffffffu;
+            }
+            for (var i = 0u; i < 448u; i++) {
+                let v = sm_topv[i];
+                let id = sm_topi[i];
+                if (id == 0xffffffffu) {
+                    continue;
+                }
+                if (rcnt < 7u) {
+                    var j = rcnt;
+                    while (j > 0u && rv[j - 1u] < v) {
+                        rv[j] = rv[j - 1u];
+                        ri[j] = ri[j - 1u];
+                        j -= 1u;
+                    }
+                    rv[j] = v;
+                    ri[j] = id;
+                    rcnt += 1u;
+                } else if (v > rv[6u]) {
+                    var j = 6u;
+                    while (j > 0u && rv[j - 1u] < v) {
+                        rv[j] = rv[j - 1u];
+                        ri[j] = ri[j - 1u];
+                        j -= 1u;
+                    }
+                    rv[j] = v;
+                    ri[j] = id;
+                }
+            }
+            // Mode 2 records are 14 u32/glyph; mode 4 packs top-7 + the
+            // gathered pairs into a 24-u32/glyph record, so the top-7 base
+            // must use the same stride the host parses.
+            let rec_stride = select(14u, 24u, mode == 4u);
+            let base = g * rec_stride;
+            for (var i = 0u; i < 7u; i++) {
+                results[base + i] = ri[i];
+                results[base + 7u + i] = bitcast<u32>(rv[i]);
+            }
+        }
+        // ---- mode 4: gather the template top-K logits (5 slots) ----
+        if (mode == 4u) {
+            if (tid < 5u) {
+                let tpl_id = template_results[g * 15u + tid];
+                let out_base = g * 24u + 14u;
+                if (tpl_id == 0xffffffffu) {
+                    results[out_base + tid] = 0xffffffffu;
+                    results[out_base + 5u + tid] = bitcast<u32>(-3.402823466e+38);
+                } else {
+                    var acc = weights[off_fcb + tpl_id];
+                    for (var ic = 0u; ic < 32u; ic++) {
+                        acc += sm_gap[ic] * weights[OFF_FCW + tpl_id * 32u + ic];
+                    }
+                    results[out_base + tid] = tpl_id;
+                    results[out_base + 5u + tid] = bitcast<u32>(acc);
+                }
+            }
+        }
+    } else if (mode == 3u) {
+        // ---- gather: logits for M requested ids, one value per request ----
+        let M = params.a.w;
+        for (var m = tid; m < M; m += 64u) {
+            let c = aux[g * M + m];
+            if (c == 0xffffffffu) {
+                results[g * M + m] = bitcast<u32>(-3.402823466e+38);
+            } else {
+                var acc = weights[off_fcb + c];
+                for (var ic = 0u; ic < 32u; ic++) {
+                    acc += sm_gap[ic] * weights[OFF_FCW + c * 32u + ic];
+                }
+                results[g * M + m] = bitcast<u32>(acc);
+            }
         }
     }
 }

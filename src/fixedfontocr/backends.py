@@ -79,6 +79,43 @@ class Backend(ABC):
         the identical hybrid fusion algorithm on CPUBackend and WGPUBackend.
         """
 
+    def classify_topk(
+        self,
+        glyphs: NDArray[np.uint8],
+        allowed_mask: NDArray[np.bool_] | None = None,
+        top_k: int = 5,
+    ) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+        """Ranked masked Top-K ``(ids, logits)`` as ``[N, k]`` arrays.
+
+        Default implementation: full ``forward_logits`` + numpy masked
+        Top-K, so any backend gets the sparse-read contract. GPU backends
+        override this with a shader that never materializes ``[N, C]`` on
+        the host.
+        """
+        logits = self.forward_logits(glyphs)
+        if allowed_mask is not None:
+            logits = np.where(allowed_mask[None, :], logits, -np.inf)
+        order = np.argsort(-logits, axis=1)[:, :top_k]
+        ids = order.astype(np.int32)
+        vals = np.take_along_axis(logits, order, axis=1).astype(np.float32)
+        return ids, vals
+
+    def logits_for(
+        self,
+        glyphs: NDArray[np.uint8],
+        char_ids: NDArray[np.int32],
+    ) -> NDArray[np.float32]:
+        """Gather logits for ``char_ids`` (``[N, M]``) as ``[N, M]`` f32.
+
+        Default implementation: full ``forward_logits`` + numpy gather.
+        GPU backends override this with a shader that computes only the
+        requested ``(glyph, class)`` dots.
+        """
+        logits = self.forward_logits(glyphs)
+        return np.take_along_axis(
+            logits, np.asarray(char_ids, dtype=np.int64), axis=1
+        ).astype(np.float32)
+
 
 def _check_glyphs(glyphs: NDArray[np.uint8]) -> tuple[np.ndarray, int, int, int]:
     arr = np.asarray(glyphs)
@@ -262,6 +299,10 @@ class WGPUBackend(Backend):
     # Mega-dispatch modes (mega.wgsl).
     _MEGA_CLASSIFY = 0
     _MEGA_LOGITS = 1
+    _MEGA_TOPK = 2
+    _MEGA_GATHER = 3
+    _MEGA_TOPK_GATHER = 4
+    _MEGA_GATHER_MAX = 64  # requested ids per glyph (logits_for cap)
 
     def forward_logits(self, glyphs: NDArray[np.uint8]) -> NDArray[np.float32]:
         """Raw ``[N, C]`` logits through the single-dispatch mega pipeline.
@@ -280,6 +321,112 @@ class WGPUBackend(Backend):
         return np.ascontiguousarray(
             raw.view("<f4").reshape(n, self.num_classes), dtype=np.float32
         )
+
+    def classify_topk(
+        self,
+        glyphs: NDArray[np.uint8],
+        allowed_mask: NDArray[np.bool_] | None = None,
+        top_k: int = 5,
+    ) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+        """Ranked masked Top-K via one mega TOPK dispatch (T2).
+
+        Reads back 7 ranks per glyph (``top_k + 2`` boundary ranks); the
+        caller receives the first ``top_k``. The masked top-K reduction runs
+        inside the shader, so the full ``[N, C]`` logits never leave the
+        GPU.
+        """
+        if top_k != 5:
+            raise ValueError(f"GPU classify_topk supports top_k=5, got {top_k}")
+        arr, n, h, w = _check_glyphs(glyphs)
+        if h != self._H or w != self._W:
+            raise ValueError(f"expected {self._H}x{self._W} glyphs, got {h}x{w}")
+        if n == 0:
+            return (
+                np.empty((0, top_k), dtype=np.int32),
+                np.empty((0, top_k), dtype=np.float32),
+            )
+        if allowed_mask is not None:
+            mask = np.zeros((self.num_classes + 31) // 32, dtype=np.uint32)
+            ids = np.nonzero(np.asarray(allowed_mask, dtype=bool))[0]
+            for cid in ids:
+                mask[cid // 32] |= np.uint32(1 << (cid % 32))
+        else:
+            mask = _allowed_mask(self.num_classes, None, (self.num_classes + 31) // 32)
+        self._ensure_buffers(n)
+        self.device.queue.write_buffer(
+            self._bufs["input"], 0, arr, 0, arr.nbytes
+        )
+        self.device.queue.write_buffer(self._aux, 0, mask, 0, mask.nbytes)
+        enc = self.device.create_command_encoder()
+        p = enc.begin_compute_pass()
+        p.set_pipeline(self._pipelines["mega"])
+        p.set_bind_group(0, self._mega_bind(self._MEGA_TOPK), [], 0, 99)
+        p.dispatch_workgroups(n, 1, 1)
+        p.end()
+        size = n * 14 * 4
+        enc.copy_buffer_to_buffer(self._topk, 0, self._topk_readback, 0, size)
+        self.device.queue.submit([enc.finish()])
+        self._topk_readback.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(
+            self._topk_readback.read_mapped(size=size), dtype=np.uint8
+        ).copy()
+        self._topk_readback.unmap()
+        self.last_dispatch_count = 1
+        rec = raw.view("<u4").reshape(n, 14)
+        ids7 = rec[:, :7].astype(np.int32)
+        logits7 = rec[:, 7:14].view("<f4")
+        return ids7[:, :top_k], np.ascontiguousarray(
+            logits7[:, :top_k], dtype=np.float32
+        )
+
+    def logits_for(
+        self,
+        glyphs: NDArray[np.uint8],
+        char_ids: NDArray[np.int32],
+    ) -> NDArray[np.float32]:
+        """Gather ``(glyph, class)`` logits via one mega GATHER dispatch.
+
+        Only the requested dots are computed on the GPU; ``[N, M]`` ids in,
+        ``[N, M]`` logits out.
+        """
+        requested = np.asarray(char_ids, dtype=np.int32)
+        if requested.ndim != 2:
+            raise ValueError(f"char_ids must be [N, M], got {requested.shape}")
+        n, m = requested.shape
+        if m > self._MEGA_GATHER_MAX:
+            raise ValueError(
+                f"GPU logits_for supports up to {self._MEGA_GATHER_MAX} "
+                f"ids per glyph, got {m}"
+            )
+        arr, n2, h, w = _check_glyphs(glyphs)
+        if n2 != n:
+            raise ValueError(f"glyphs N={n2} != char_ids N={n}")
+        if h != self._H or w != self._W:
+            raise ValueError(f"expected {self._H}x{self._W} glyphs, got {h}x{w}")
+        if n == 0 or m == 0:
+            return np.empty((n, m), dtype=np.float32)
+        self._ensure_buffers(n)
+        ids_u32 = requested.astype(np.uint32).reshape(-1)
+        self.device.queue.write_buffer(
+            self._bufs["input"], 0, arr, 0, arr.nbytes
+        )
+        self.device.queue.write_buffer(self._aux, 0, ids_u32, 0, ids_u32.nbytes)
+        enc = self.device.create_command_encoder()
+        p = enc.begin_compute_pass()
+        p.set_pipeline(self._pipelines["mega"])
+        p.set_bind_group(0, self._mega_bind(self._MEGA_GATHER, m=m), [], 0, 99)
+        p.dispatch_workgroups(n, 1, 1)
+        p.end()
+        size = n * m * 4
+        enc.copy_buffer_to_buffer(self._gather, 0, self._gather_readback, 0, size)
+        self.device.queue.submit([enc.finish()])
+        self._gather_readback.map_sync(self._wgpu.MapMode.READ)
+        raw = np.frombuffer(
+            self._gather_readback.read_mapped(size=size), dtype=np.uint8
+        ).copy()
+        self._gather_readback.unmap()
+        self.last_dispatch_count = 1
+        return np.ascontiguousarray(raw.view("<f4").reshape(n, m), dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Per-layer entry points (used by the CPU/GPU consistency tests)
@@ -674,7 +821,7 @@ class WGPUBackend(Backend):
             "linear": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
             "argmax": [uniform_buf(), storage_ro(), storage_rw()],
             "fused": [uniform_buf(), storage_ro(), storage_ro(), storage_ro(), storage_rw()],
-            "mega": [uniform_buf(), storage_ro(), storage_ro(), storage_rw()],
+            "mega": [uniform_buf(), storage_ro(), storage_ro(), storage_rw(), storage_ro(), storage_ro()],
             "preprocess_soft": [uniform_buf(), storage_ro(), storage_ro(), storage_rw()],
         }
         for name, entries in specs.items():
@@ -770,11 +917,13 @@ class WGPUBackend(Backend):
     # ------------------------------------------------------------------
 
     def _ensure_buffers(self, n: int) -> None:
-        """Persistent mega-dispatch buffers (input + final records + staging).
+        """Persistent mega-dispatch buffers (input + records + staging).
 
         The mega shader keeps every intermediate tensor in workgroup shared
         memory, so there are no per-layer buffers to allocate at all: input,
-        result/logits records and the two staging buffers are the whole set.
+        the classify/logits/topk/gather record buffers, the T2 aux buffer
+        (allowed mask or requested ids) and the staging buffers are the
+        whole set.
         """
         if n <= self._cap:
             return
@@ -798,31 +947,61 @@ class WGPUBackend(Backend):
         self._logits_readback = self._device_create_buffer(
             size=n * self.num_classes * 4, usage=self._U_MAP_READ | self._U_COPY_DST
         )
+        allowed_words = (self.num_classes + 31) // 32
+        self._aux = self._device_create_buffer(
+            size=max(allowed_words * 4, n * self._MEGA_GATHER_MAX * 4),
+            usage=self._U_STORAGE | self._U_COPY_DST,
+        )
+        # TOPK_GATHER writes 24 u32/glyph (top-7 + 5 gathered pairs); the
+        # standalone TOPK mode only fills the first 14 u32 of each slot.
+        self._topk = self._device_create_buffer(
+            size=n * 24 * 4, usage=self._U_STORAGE | self._U_COPY_SRC
+        )
+        self._gather = self._device_create_buffer(
+            size=n * self._MEGA_GATHER_MAX * 4,
+            usage=self._U_STORAGE | self._U_COPY_SRC,
+        )
+        # Dummy template-record buffer for the mega binding-5 slot on the
+        # standalone modes (only TOPK_GATHER reads it, and the stage passes
+        # the real template result buffer instead).
+        self._tpl = self._device_create_buffer(
+            size=n * 15 * 4, usage=self._U_STORAGE
+        )
+        self._topk_readback = self._device_create_buffer(
+            size=n * 14 * 4, usage=self._U_MAP_READ | self._U_COPY_DST
+        )
+        self._gather_readback = self._device_create_buffer(
+            size=n * self._MEGA_GATHER_MAX * 4,
+            usage=self._U_MAP_READ | self._U_COPY_DST,
+        )
 
-    def _mega_uniform(self, mode: int) -> object:
-        key = ("mega", self._cap, mode)
+    def _mega_uniform(self, mode: int, m: int = 0) -> object:
+        key = ("mega", self._cap, mode, m)
         buf = self._uniform_bufs.get(key)
         if buf is None:
             buf = self._device_create_buffer(
-                data=self._uniform(
-                    self._cap, self.num_classes, mode, 0
-                ).tobytes(),
+                data=self._uniform(self._cap, self.num_classes, mode, m).tobytes(),
                 usage=self._wgpu.BufferUsage.UNIFORM,
             )
             self._uniform_bufs[key] = buf
         return buf
 
-    def _mega_bind(self, mode: int) -> object:
-        key = ("mega", self._cap, mode)
+    def _mega_bind(
+        self, mode: int, m: int = 0, template_results: object | None = None
+    ) -> object:
+        key = ("mega", self._cap, mode, m, id(template_results))
         bg = self._bg_cache.get(key)
         if bg is None:
-            out = (
-                self._bufs["result"]
-                if mode == self._MEGA_CLASSIFY
-                else self._bufs["logits"]
-            )
+            if mode == self._MEGA_CLASSIFY:
+                out = self._bufs["result"]
+            elif mode in (self._MEGA_TOPK, self._MEGA_TOPK_GATHER):
+                out = self._topk
+            elif mode == self._MEGA_GATHER:
+                out = self._gather
+            else:
+                out = self._bufs["logits"]
             entries = [
-                {"binding": 0, "resource": {"buffer": self._mega_uniform(mode)}},
+                {"binding": 0, "resource": {"buffer": self._mega_uniform(mode, m)}},
                 {
                     "binding": 1,
                     "resource": {
@@ -842,6 +1021,30 @@ class WGPUBackend(Backend):
                 {
                     "binding": 3,
                     "resource": {"buffer": out, "offset": 0, "size": out.size},
+                },
+                {
+                    "binding": 4,
+                    "resource": {
+                        "buffer": self._aux,
+                        "offset": 0,
+                        "size": self._aux.size,
+                    },
+                },
+                {
+                    "binding": 5,
+                    "resource": {
+                        "buffer": (
+                            template_results
+                            if template_results is not None
+                            else self._tpl
+                        ),
+                        "offset": 0,
+                        "size": (
+                            template_results.size
+                            if template_results is not None
+                            else self._tpl.size
+                        ),
+                    },
                 },
             ]
             bg = self.device.create_bind_group(
@@ -1607,20 +1810,74 @@ class WGPUScoringStage:
         if n <= self._cap:
             return
         self._cap = n
-        size = n * (_GPU_TEMPLATE_RECORD * 4 + self.gpu.num_classes * 4)
+        # Sparse layout: template record (15 u32) + topk/gather record
+        # (24 u32) per glyph; full layout: template record + [C] logits.
+        # Allocate the larger of the two so one staging buffer serves both.
+        size = n * (
+            _GPU_TEMPLATE_RECORD * 4
+            + max(24 * 4, self.gpu.num_classes * 4)
+        )
         self._staging = self.gpu._device_create_buffer(
             size=size, usage=self.gpu._U_MAP_READ | self.gpu._U_COPY_DST
         )
+
+    def _reconstruct_logits(
+        self,
+        n: int,
+        ids7: np.ndarray,
+        logits7: np.ndarray,
+        gids: np.ndarray,
+        glogits: np.ndarray,
+    ) -> np.ndarray:
+        """Dense masked ``[N, C]`` matrix from the sparse top-7 + gather.
+
+        The hybrid fusion only ever reads CNN Top-K ids and template Top-K
+        ids, so the supported positions (top-7 + gathered template ids) hold
+        the real logits and everything else is ``-inf`` — exactly the
+        information the full masked readback would provide to the fusion.
+        """
+        masked = np.full((n, self.gpu.num_classes), -np.inf, dtype=np.float32)
+        row = np.arange(n)[:, None]
+        valid7 = ids7 >= 0
+        masked[row, np.where(valid7, ids7, 0)] = np.where(valid7, logits7, 0.0)
+        gvalid = gids >= 0
+        masked[row, np.where(gvalid, gids, 0)] = np.where(gvalid, glogits, 0.0)
+        return masked
+
+    def _topk_boundary_ambiguous(self, n: int, ids7: np.ndarray, logits7: np.ndarray) -> bool:
+        """T2 boundary guard: rank-5 and rank-7 within 1e-4 -> fall back.
+
+        With ``k = 5`` the shader reads back ranks 6-7 as well; when the
+        k-th and (k+2)-th logits are indistinguishable in f32 the top-7 may
+        have missed a tied class, so the host re-reads the full logits for
+        this batch (rare path, correctness first).
+        """
+        if self.gpu.num_classes < 7 or n == 0:
+            return False
+        ok5 = ids7[:, 4] >= 0
+        ok7 = ids7[:, 6] >= 0
+        amb = ok5 & ok7 & (np.abs(logits7[:, 4] - logits7[:, 6]) < 1e-4)
+        return bool(np.any(amb))
 
     def score_line(
         self,
         glyphs: NDArray[np.uint8],
         allowed_ids: set[int] | None = None,
+        sparse: bool = True,
     ) -> tuple[TemplateBatch, NDArray[np.float32]]:
-        """One submit: template match + full TinyCNN logits; one readback.
+        """One submit: template match + TinyCNN evidence; one readback.
 
         ``glyphs`` is the packed-binary ``uint8 [N, 24, 24]`` batch (the
         same one the CPU template matcher and binary-mode CNN consume).
+
+        With ``sparse=True`` (T2, default) the CNN part runs the masked
+        top-7 + template-id gather inside the same mega dispatch and the
+        readback is 39 u32/glyph instead of ``15 + C`` — the returned
+        ``[N, C]`` matrix is the sparse reconstruction (real logits on the
+        supported positions, ``-inf`` elsewhere), with an automatic full
+        readback fallback when the top-7 boundary is ambiguous. Pass
+        ``sparse=False`` for the full-logits readback used by the parity
+        tests.
         """
         glyphs = np.asarray(glyphs, dtype=np.uint8)
         if glyphs.ndim != 3:
@@ -1660,6 +1917,7 @@ class WGPUScoringStage:
         self.device.queue.write_buffer(
             self.gpu._bufs["input"], 0, glyphs, 0, glyphs.nbytes
         )
+        self.device.queue.write_buffer(self.gpu._aux, 0, mask, 0, mask.nbytes)
 
         enc = self.device.create_command_encoder()
         p1 = enc.begin_compute_pass()
@@ -1669,31 +1927,64 @@ class WGPUScoringStage:
         p1.end()
         p2 = enc.begin_compute_pass()
         p2.set_pipeline(self.gpu._pipelines["mega"])
-        p2.set_bind_group(0, self.gpu._mega_bind(self.gpu._MEGA_LOGITS), [], 0, 99)
+        if sparse:
+            p2.set_bind_group(
+                0,
+                self.gpu._mega_bind(
+                    self.gpu._MEGA_TOPK_GATHER,
+                    template_results=self.template._result_buf,
+                ),
+                [],
+                0,
+                99,
+            )
+        else:
+            p2.set_bind_group(0, self.gpu._mega_bind(self.gpu._MEGA_LOGITS), [], 0, 99)
         p2.dispatch_workgroups(n, 1, 1)
         p2.end()
         tpl_bytes = n * _GPU_TEMPLATE_RECORD * 4
-        logits_bytes = n * self.gpu.num_classes * 4
-        enc.copy_buffer_to_buffer(
-            self.template._result_buf, 0, self._staging, 0, tpl_bytes
-        )
-        enc.copy_buffer_to_buffer(
-            self.gpu._bufs["logits"], 0, self._staging, tpl_bytes, logits_bytes
-        )
+        if sparse:
+            rec_bytes = n * 24 * 4
+            enc.copy_buffer_to_buffer(
+                self.template._result_buf, 0, self._staging, 0, tpl_bytes
+            )
+            enc.copy_buffer_to_buffer(
+                self.gpu._topk, 0, self._staging, tpl_bytes, rec_bytes
+            )
+        else:
+            logits_bytes = n * self.gpu.num_classes * 4
+            enc.copy_buffer_to_buffer(
+                self.template._result_buf, 0, self._staging, 0, tpl_bytes
+            )
+            enc.copy_buffer_to_buffer(
+                self.gpu._bufs["logits"], 0, self._staging, tpl_bytes, logits_bytes
+            )
         self.device.queue.submit([enc.finish()])
         self._staging.map_sync(self._wgpu.MapMode.READ)
         raw = np.frombuffer(
-            self._staging.read_mapped(size=tpl_bytes + logits_bytes),
+            self._staging.read_mapped(size=tpl_bytes + (rec_bytes if sparse else logits_bytes)),
             dtype=np.uint8,
         ).copy()
         self._staging.unmap()
         self.last_submit_count = 1
         self.last_dispatch_count = 2  # template + mega
         tb = self.template._parse_results(raw[:tpl_bytes], n, area)
-        logits = np.ascontiguousarray(
-            raw[tpl_bytes:].view("<f4").reshape(n, self.gpu.num_classes),
-            dtype=np.float32,
-        )
+        if sparse:
+            rec = raw[tpl_bytes:].view("<u4").reshape(n, 24)
+            ids7 = rec[:, :7].astype(np.int32)
+            logits7 = np.ascontiguousarray(rec[:, 7:14]).view("<f4")
+            gids = rec[:, 14:19].astype(np.int32)
+            glogits = np.ascontiguousarray(rec[:, 19:24]).view("<f4")
+            if self._topk_boundary_ambiguous(n, ids7, logits7):
+                # Rare tie at the Top-K boundary: full readback (2nd submit).
+                full = self.gpu.forward_logits(glyphs)
+                return tb, full
+            logits = self._reconstruct_logits(n, ids7, logits7, gids, glogits)
+        else:
+            logits = np.ascontiguousarray(
+                raw[tpl_bytes:].view("<f4").reshape(n, self.gpu.num_classes),
+                dtype=np.float32,
+            )
         return tb, logits
 
     def score_line_from_image(
@@ -1704,23 +1995,28 @@ class WGPUScoringStage:
         allowed_ids: set[int] | None = None,
         spec=None,
         geometries: list[tuple[float, float] | None] | None = None,
+        sparse: bool = True,
     ) -> tuple[TemplateBatch, NDArray[np.float32]]:
-        """One submit: GPU preprocess + template match + TinyCNN logits.
+        """One submit: GPU preprocess + template match + TinyCNN evidence.
 
         The G3 preprocess dispatch (RGB -> packed soft glyph batch), the G2
-        template dispatch and the G1 mega-logits dispatch are recorded into
-        ONE command encoder: the preprocess shader writes its output straight
-        into the mega input buffer, and a single staging readback returns the
-        template records + full ``[N, C]`` logits. This closes the "one
-        submit produces the OCR result" chain for soft-input hybrid models —
-        the CPU only uploads the RGB image, the per-glyph frame params and
-        the binary glyph words the template matcher consumes.
+        template dispatch and the G1 mega dispatch are recorded into ONE
+        command encoder: the preprocess shader writes its output straight
+        into the mega input buffer, and a single staging readback returns
+        the template records + CNN evidence. This closes the "one submit
+        produces the OCR result" chain for soft-input hybrid models — the
+        CPU only uploads the RGB image, the per-glyph frame params and the
+        binary glyph words the template matcher consumes.
 
         ``glyphs`` is the binary-normalized ``uint8 [N, 24, 24]`` batch the
         CPU already computed for the template path (identical to
         :meth:`score_line`); the soft batch for the CNN is produced on the
         GPU from ``image`` + ``segments`` + ``geometries`` and is byte-exact
         with the CPU ``_soft_glyph_batch`` path.
+
+        ``sparse=True`` (T2, default) reads back the masked top-7 +
+        template-id gather instead of the full ``[N, C]`` logits (see
+        :meth:`score_line`); ``sparse=False`` keeps the full readback.
         """
         image = np.asarray(image)
         if image.ndim != 3 or image.shape[2] != 3:
@@ -1772,6 +2068,7 @@ class WGPUScoringStage:
         self.device.queue.write_buffer(
             self.template._allowed_buf, 0, mask, 0, mask.nbytes
         )
+        self.device.queue.write_buffer(self.gpu._aux, 0, mask, 0, mask.nbytes)
         pp_bg = self.gpu._pp_bind_group(
             n, H, W, params, img_words, self.gpu._bufs["input"]
         )
@@ -1789,29 +2086,64 @@ class WGPUScoringStage:
         p1.end()
         p2 = enc.begin_compute_pass()
         p2.set_pipeline(self.gpu._pipelines["mega"])
-        p2.set_bind_group(0, self.gpu._mega_bind(self.gpu._MEGA_LOGITS), [], 0, 99)
+        if sparse:
+            p2.set_bind_group(
+                0,
+                self.gpu._mega_bind(
+                    self.gpu._MEGA_TOPK_GATHER,
+                    template_results=self.template._result_buf,
+                ),
+                [],
+                0,
+                99,
+            )
+        else:
+            p2.set_bind_group(0, self.gpu._mega_bind(self.gpu._MEGA_LOGITS), [], 0, 99)
         p2.dispatch_workgroups(n, 1, 1)
         p2.end()
         tpl_bytes = n * _GPU_TEMPLATE_RECORD * 4
-        logits_bytes = n * self.gpu.num_classes * 4
-        enc.copy_buffer_to_buffer(
-            self.template._result_buf, 0, self._staging, 0, tpl_bytes
-        )
-        enc.copy_buffer_to_buffer(
-            self.gpu._bufs["logits"], 0, self._staging, tpl_bytes, logits_bytes
-        )
+        if sparse:
+            rec_bytes = n * 24 * 4
+            enc.copy_buffer_to_buffer(
+                self.template._result_buf, 0, self._staging, 0, tpl_bytes
+            )
+            enc.copy_buffer_to_buffer(
+                self.gpu._topk, 0, self._staging, tpl_bytes, rec_bytes
+            )
+        else:
+            logits_bytes = n * self.gpu.num_classes * 4
+            enc.copy_buffer_to_buffer(
+                self.template._result_buf, 0, self._staging, 0, tpl_bytes
+            )
+            enc.copy_buffer_to_buffer(
+                self.gpu._bufs["logits"], 0, self._staging, tpl_bytes, logits_bytes
+            )
         self.device.queue.submit([enc.finish()])
         self._staging.map_sync(self._wgpu.MapMode.READ)
         raw = np.frombuffer(
-            self._staging.read_mapped(size=tpl_bytes + logits_bytes),
+            self._staging.read_mapped(size=tpl_bytes + (rec_bytes if sparse else logits_bytes)),
             dtype=np.uint8,
         ).copy()
         self._staging.unmap()
         self.last_submit_count = 1
         self.last_dispatch_count = 3  # preprocess + template + mega
         tb = self.template._parse_results(raw[:tpl_bytes], n, area)
-        logits = np.ascontiguousarray(
-            raw[tpl_bytes:].view("<f4").reshape(n, self.gpu.num_classes),
-            dtype=np.float32,
-        )
+        if sparse:
+            rec = raw[tpl_bytes:].view("<u4").reshape(n, 24)
+            ids7 = rec[:, :7].astype(np.int32)
+            logits7 = np.ascontiguousarray(rec[:, 7:14]).view("<f4")
+            gids = rec[:, 14:19].astype(np.int32)
+            glogits = np.ascontiguousarray(rec[:, 19:24]).view("<f4")
+            if self._topk_boundary_ambiguous(n, ids7, logits7):
+                # Rare tie at the Top-K boundary: full readback (2nd submit).
+                full = self.gpu.forward_logits_from_image(
+                    image, segments, spec, geometries
+                )
+                return tb, full
+            logits = self._reconstruct_logits(n, ids7, logits7, gids, glogits)
+        else:
+            logits = np.ascontiguousarray(
+                raw[tpl_bytes:].view("<f4").reshape(n, self.gpu.num_classes),
+                dtype=np.float32,
+            )
         return tb, logits

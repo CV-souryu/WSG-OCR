@@ -172,7 +172,12 @@ def test_crops_gpu_fused_logits_parity(game_ocrs, game_model) -> None:
 
 
 def test_crops_gpu_stage_parity(game_ocrs) -> None:
-    """One-submit scoring stage == the two separate GPU calls, exactly."""
+    """One-submit scoring stage == the two separate GPU calls, exactly.
+
+    Runs the stage with ``sparse=False`` (full-logits readback) so the
+    exact full-matrix parity is pinned; the T2 sparse readback has its own
+    contract test below.
+    """
     _require_crops()
     cpu_ocr, gpu_ocr = game_ocrs
     from fixedfontocr.backends import WGPUScoringStage
@@ -186,7 +191,7 @@ def test_crops_gpu_stage_parity(game_ocrs) -> None:
         image = _load_crop(name)
         segments = _candidate_segments(cpu_ocr, image)
         glyphs = np.stack([normalize(s.mask, 24) for s in segments])
-        tb_stage, logits_stage = stage.score_line(glyphs, None)
+        tb_stage, logits_stage = stage.score_line(glyphs, None, sparse=False)
         tb_sep = matcher.match_batch(glyphs, None)
         logits_sep = backend.forward_logits(glyphs)
         assert np.array_equal(tb_stage.top_k_ids, tb_sep.top_k_ids)
@@ -194,6 +199,48 @@ def test_crops_gpu_stage_parity(game_ocrs) -> None:
         assert np.array_equal(tb_stage.best_prototypes, tb_sep.best_prototypes)
         assert np.array_equal(logits_stage, logits_sep), name
     assert stage.last_submit_count == 1
+
+
+def test_crops_gpu_stage_topk_sparse_contract(game_ocrs) -> None:
+    """T2 sparse readback: exact on the supported ids, -inf elsewhere.
+
+    The sparse stage returns a ``[N, C]`` matrix whose real values sit
+    exactly on the union of the CNN top-7 ids and the template top-K ids
+    (the only positions the hybrid fusion reads), byte-identical to the
+    full readback there, and ``-inf`` everywhere else.
+    """
+    _require_crops()
+    cpu_ocr, gpu_ocr = game_ocrs
+    from fixedfontocr.backends import WGPUScoringStage
+    from fixedfontocr.postprocess import topk as np_topk
+    from fixedfontocr.preprocess import normalize
+
+    assert isinstance(gpu_ocr._scorer.gpu_stage, WGPUScoringStage)
+    stage = gpu_ocr._scorer.gpu_stage
+    matcher = gpu_ocr._scorer.template
+    backend = gpu_ocr._scorer.cnn_backend
+    for name in PINNED_CROPS:
+        image = _load_crop(name)
+        segments = _candidate_segments(cpu_ocr, image)
+        glyphs = np.stack([normalize(s.mask, 24) for s in segments])
+        tb_stage, logits_stage = stage.score_line(glyphs, None)  # sparse=True
+        assert stage.last_submit_count == 1, name
+        full = backend.forward_logits(glyphs)
+        tb_sep = matcher.match_batch(glyphs, None)
+        n = len(segments)
+        row = np.arange(n)[:, None]
+        # supported positions: CNN top-7 ids + template top-K ids
+        cnn_ids, _ = np_topk(full, 7)
+        tpl_ids = np.maximum(tb_sep.top_k_ids, 0)
+        supported = np.zeros_like(full, dtype=bool)
+        supported[row, np.maximum(cnn_ids, 0)] = True
+        supported[row, tpl_ids] = True
+        # every supported position is exact
+        assert np.array_equal(logits_stage[supported], full[supported]), name
+        # everything else is -inf
+        assert np.all(np.isneginf(logits_stage[~supported])), name
+        # the supported set is complete for fusion: CNN top-5 + template ids
+        assert np.all(logits_stage[row, tpl_ids] == full[row, tpl_ids]), name
 
 
 def test_crops_gpu_stage_single_submit_per_line(game_ocrs) -> None:
@@ -234,7 +281,7 @@ def test_crops_gpu_stage_from_image_parity(game_ocrs, game_model) -> None:
         glyphs, geoms = _scorer_inputs(cpu_ocr, segments)
         spec = cpu_ocr.model.normalize_spec
         tb, logits = stage.score_line_from_image(
-            image, segments, glyphs, None, spec, geoms
+            image, segments, glyphs, None, spec, geoms, sparse=False
         )
         ref_tb = cpu_template.match_batch(glyphs, None)
         soft = cpu_ocr.profile.soft_foreground(image)

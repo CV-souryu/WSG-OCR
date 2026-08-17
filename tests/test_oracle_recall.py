@@ -7,15 +7,16 @@ the correct text -- the failure is in segmentation (candidate generation /
 pruning).  If it does but the decoder picked another path, the failure is
 in classification / decoding.
 
-This file tests the metric itself with deterministic synthetic lines:
+Goal 21 candidate-generation upgrades under test:
 
-* normal rendered strings -> oracle path exists;
-* fully-glued glyph pairs (no vertical valley at the boundary) -> oracle
-  path missing with a straddled-boundary diagnostic naming the missing
-  cut position (the ``LV`` / ``4+3`` / ``U-`` failure mode);
-* thin-valley glued pairs -> oracle path exists (the current valley
-  heuristic handles these);
-* a merge pruned by the gap rule -> ``missing_candidate``.
+* forced seam cuts at advance multiples / equal parts rescue valley-free
+  fully-touching blobs (甲申 zero-gap);
+* the edge-valley rule separates a short trailing/leading glyph that is
+  itself a valley run (``U-`` style);
+* small punctuation bypasses the Goal 8 bbox envelope, so ``-`` / ``.`` /
+  ``·`` candidates reach the scorer (T-23 / U- at 32 px);
+* the expected-width estimate caps wide multi-glyph components so single-
+  component lines still get split.
 """
 
 from __future__ import annotations
@@ -27,13 +28,23 @@ from fixedfontocr.oracle import (
     COVERAGE_THRESHOLD,
     GroundTruthBox,
     GroundTruthLine,
+    OracleReport,
+    OracleSample,
     evaluate_oracle,
     format_report,
     glue_ground_truth,
     oracle_lattice_recall,
     render_ground_truth,
 )
-from fixedfontocr.segmentation import connected_components
+from fixedfontocr.segmentation import (
+    _estimate_expected_width,
+    _forced_seam_cuts,
+    _geometry_bbox_ok,
+    _split_along_paths,
+    _valley_cuts,
+    connected_components,
+    expand_atoms,
+)
 from fixedfontocr.types import default_profile
 
 NORMAL_STRINGS = [
@@ -49,7 +60,26 @@ NORMAL_STRINGS = [
     "1000",
     "岛风",
     "甲申",
+    "获得金币1000",
 ]
+
+MODEL_GEOMETRY = None
+
+
+def _model_geometry():
+    """Model font geometry database, or None when the model is absent."""
+    global MODEL_GEOMETRY
+    from pathlib import Path
+
+    from fixedfontocr.geometry import FontGeometryDatabase
+
+    if MODEL_GEOMETRY is None:
+        path = Path("model/game_cn/geometry.json")
+        if path.exists():
+            MODEL_GEOMETRY = FontGeometryDatabase.load(path)
+        else:
+            MODEL_GEOMETRY = False
+    return MODEL_GEOMETRY or None
 
 
 def _pair(font_path, a: str, b: str, bridge: str) -> GroundTruthLine:
@@ -64,19 +94,16 @@ def _pair(font_path, a: str, b: str, bridge: str) -> GroundTruthLine:
 
 
 def test_render_boxes_match_standalone_glyph_masks(font_path):
-    """Per-char GT boxes are pixel-exact against standalone tight renders.
+    """Per-char GT boxes are pixel-exact against standalone tight renders."""
 
-    Each GT box's region of the line mask must be exactly the standalone
-    tight mask of that character (same font size, threshold and integer
-    origin), and the union of all boxes must cover every ink pixel.
-    """
+    from fixedfontocr.oracle import render_glyph_mask
 
     for text in NORMAL_STRINGS:
         gt = render_ground_truth(text, font_path, font_size=32)
         covered = np.zeros_like(gt.mask)
         for i, box in enumerate(gt.boxes):
             sub = gt.mask[box.y0 : box.y1, box.x0 : box.x1]
-            ref = render_glyph_mask_ref(gt.text[i], font_path)
+            ref = render_glyph_mask(gt.text[i], font_path, font_size=32)
             assert sub.shape == ref.shape, (
                 f"{text!r} char {i} {gt.text[i]!r}: box {sub.shape} != "
                 f"standalone {ref.shape}"
@@ -86,12 +113,6 @@ def test_render_boxes_match_standalone_glyph_masks(font_path):
             )
             covered[box.y0 : box.y1, box.x0 : box.x1] = True
         assert not np.any(gt.mask & ~covered), f"{text!r}: ink outside boxes"
-
-
-def render_glyph_mask_ref(char: str, font_path) -> np.ndarray:
-    from fixedfontocr.oracle import render_glyph_mask
-
-    return render_glyph_mask(char, font_path, font_size=32)
 
 
 def test_render_boxes_reject_bad_layout(font_path):
@@ -122,9 +143,7 @@ def test_oracle_recall_on_normal_renders(font_path):
             f"{text!r}: oracle path missing (reason={res.reason!r})"
         )
         assert res.reason == ""
-        # The oracle path has one candidate per GT character.
         assert len(res.path) == len(text)
-        # Atom order matches text order (sanity on the walk).
         spans = [c.atom_span for c in res.path]
         assert spans[0][0] == 0
         assert all(
@@ -133,64 +152,99 @@ def test_oracle_recall_on_normal_renders(font_path):
         assert spans[-1][1] == res.n_atoms
 
 
+def test_oracle_recall_with_model_geometry_on_normal_renders(font_path):
+    """With the production geometry, every normal render keeps its path.
+
+    This is the no-regression pin for the Goal 21 pruning changes
+    (punctuation bypass + wide-component cap + forced seams).
+    """
+
+    geometry = _model_geometry()
+    profile = default_profile()
+    for text in NORMAL_STRINGS:
+        gt = render_ground_truth(text, font_path, font_size=32)
+        res = oracle_lattice_recall(
+            gt.line, profile, gt.boxes, geometry=geometry
+        )
+        assert res.recall, (
+            f"{text!r} (geometry): oracle path missing "
+            f"(reason={res.reason!r})"
+        )
+
+
 def test_oracle_recall_ignores_scores(font_path):
     """The metric must not require a scorer: no score is ever consulted."""
 
     gt = render_ground_truth("潜甲", font_path, font_size=32)
     res = oracle_lattice_recall(gt.line, default_profile(), gt.boxes)
     assert res.recall
-    # Every candidate on the oracle path is unscored.
     assert all(c.score is None and c.scores is None for c in res.path)
 
 
 # ---------------------------------------------------------------------------
-# Fully-glued pairs: the LV / 4+3 / U- failure mode
+# Glued pairs: the forced seam cut (valley-free touching)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "left,right,bridge",
-    [
-        ("甲", "申", "full"),
-        ("4", "3", "full"),
-        ("L", "V", "full"),
-        ("U", "-", "full"),
-    ],
-    ids=["jia-shen", "4-3", "L-V", "U-dash"],
-)
-def test_fully_glued_pairs_have_no_oracle_path(font_path, left, right, bridge):
-    """A full-height connector has no valley: no split, oracle path missing.
+def test_zero_gap_jia_shen_is_one_component_with_no_valley(font_path):
+    """甲+申 zero-gap: one component whose boundary has no valley column.
 
-    This is the diagnostic the metric exists for: the current valley-based
-    splitter cannot cut the boundary, so the GT segmentation never enters
-    the lattice and no classifier can recover it.  The result must name the
-    missing cut position (the straddled boundary).
+    This is the fully-touching case the valley heuristic cannot cut -- the
+    regression fixture for the forced advance/seam cuts.
     """
 
-    gt = _pair(font_path, left, right, bridge)
-    # The construction really is one connected component.
+    gt = _pair(font_path, "甲", "申", "full")
     comps = connected_components(gt.line)
-    assert len(comps) == 1, "full bridge must produce one component"
+    assert len(comps) == 1
+    comp = comps[0]
+    profile = default_profile()
+    expected = _estimate_expected_width(comps, profile)
+    assert _valley_cuts(comp.mask, expected, profile, 3) == []
+    # The forced seam mechanism does find a cut near the glyph boundary.
+    seams = _forced_seam_cuts(comp.mask, expected, profile, 3)
+    assert len(seams) == 1
+    mean_x = float(np.mean(seams[0][0]))
+    # GT boundary sits at 甲's box end (25): seam must land within ~2 px.
+    assert abs(mean_x - 25) <= 3, f"seam at x={mean_x:.1f}, boundary at 25"
 
-    res = oracle_lattice_recall(gt.line, default_profile(), gt.boxes)
-    assert not res.recall
-    assert res.reason == "unassigned_atom"
-    assert len(res.straddled_boundaries) == 1
-    l_idx, r_idx, x = res.straddled_boundaries[0]
-    assert (l_idx, r_idx) == (0, 1)
-    assert res.missing_chars == ()
+
+def test_forced_seam_rescues_valley_free_blob(font_path):
+    """甲+申 zero-gap has an oracle path *because* of the split machinery.
+
+    With splitting disabled the single atom straddles both GT boxes and
+    the oracle path is missing; with the forced seam it exists.  This is
+    the exact 'no valley -> correct path never enters the lattice' failure
+    the metric was built to detect, now fixed at the lattice level.
+    """
+
+    gt = _pair(font_path, "甲", "申", "full")
+    profile = default_profile()
+    res_off = oracle_lattice_recall(
+        gt.line, profile, gt.boxes, split_wide=False
+    )
+    assert not res_off.recall
+    assert res_off.reason == "unassigned_atom"
+    assert res_off.straddled_boundaries == ((0, 1, 25),)
+
+    res_on = oracle_lattice_recall(gt.line, profile, gt.boxes)
+    assert res_on.recall
+    assert len(res_on.path) == 2
+    # The original component stays reachable as the whole merge.
+    spans = {c.atom_span for c in res_on.path}
+    assert (0, res_on.n_atoms) not in spans  # path uses the split pieces
 
 
-def test_thin_valley_connector_keeps_oracle_path(font_path):
-    """A 1 px connector is a real valley: the split exists, oracle passes."""
+def test_glued_pairs_with_connector_have_oracle_path(font_path):
+    """Thin-connector glued pairs keep their oracle path (valley rule)."""
 
     for left, right in [("甲", "申"), ("4", "3")]:
         gt = _pair(font_path, left, right, "row")
         comps = connected_components(gt.line)
-        assert len(comps) == 1, "row bridge must produce one component"
+        assert len(comps) == 1, f"{left}+{right} row bridge must connect"
         res = oracle_lattice_recall(gt.line, default_profile(), gt.boxes)
         assert res.recall, (
-            f"{left}+{right} row-bridge: oracle missing (reason={res.reason!r})"
+            f"{left}+{right} row-bridge: oracle missing "
+            f"(reason={res.reason!r})"
         )
         assert len(res.path) == 2
 
@@ -203,6 +257,23 @@ def test_separated_pair_oracle_path(font_path):
     res = oracle_lattice_recall(gt.line, default_profile(), gt.boxes)
     assert res.recall
     assert len(res.path) == 2
+
+
+def test_lv_and_u_dash_do_not_glue_in_clean_rendering(font_path):
+    """L/V and U/- never form one component in this font's clean raster.
+
+    L's right-edge ink is its bottom bar and V's left-edge ink is its top
+    arm (rows never overlap at any size); U's right stroke ends above the
+    '-' bar.  Their real-game gluing is an anti-aliasing artifact that
+    clean rendering cannot reproduce, so the glued regression set pins
+    甲申/43 and these two stay normal-render oracle samples.
+    """
+
+    for a, b in [("L", "V"), ("U", "-")]:
+        gt = _pair(font_path, a, b, "full")
+        assert len(connected_components(gt.line)) == 2, f"{a}+{b} glued?!"
+        res = oracle_lattice_recall(gt.line, default_profile(), gt.boxes)
+        assert res.recall
 
 
 # ---------------------------------------------------------------------------
@@ -229,15 +300,14 @@ def test_pruned_merge_reports_missing_candidate(font_path):
     assert not res.recall
     assert res.reason == "missing_candidate"
     assert res.missing_chars == (0,)
-    # Best any candidate can do is cover one of the two bars (~half).
     assert res.best_coverage[0] < COVERAGE_THRESHOLD
     assert res.best_coverage[0] >= 0.4
     assert res.atom_assignments == (0, 0)
 
 
 def test_atom_interleaving_reports_no_path(font_path):
-    """Pathological x-interleaved boxes: every atom is assignable and each
-    char has a valid candidate, but they cannot tile in text order."""
+    """Pathological x-interleaved boxes: atoms are individually assignable
+    but the candidates cannot tile in text order."""
 
     mask = np.zeros((13, 10), dtype=bool)
     mask[0:3, 5:8] = True  # dot (char A)
@@ -256,16 +326,135 @@ def test_atom_interleaving_reports_no_path(font_path):
 
 
 # ---------------------------------------------------------------------------
+# Small punctuation: the Goal 8 bbox-envelope bypass
+# ---------------------------------------------------------------------------
+
+
+def test_punctuation_bypasses_bbox_envelope(font_path):
+    """Short punctuation (8x3 '-') is not rejected by the height-derived
+    bbox envelope -- it must reach the scorer."""
+
+    from fixedfontocr.oracle import render_glyph_mask
+
+    geometry = _model_geometry()
+    dash = render_glyph_mask("-", font_path, font_size=32)
+    profile = default_profile()
+    assert dash.shape[0] < max(2, profile.char_height_min)
+    # The envelope alone rejects it...
+    from fixedfontocr.types import Component
+
+    comp = Component(mask=dash, x=0, y=0, w=dash.shape[1], h=dash.shape[0])
+    assert not _geometry_bbox_ok(comp, geometry)
+    # ...but the candidate filter lets it through (height below minimum).
+    res = oracle_lattice_recall(
+        render_ground_truth("T-23", font_path, font_size=32).line,
+        profile,
+        render_ground_truth("T-23", font_path, font_size=32).boxes,
+        geometry=geometry,
+    )
+    assert res.recall, f"T-23 (geometry): {res.reason!r}"
+
+    res = oracle_lattice_recall(
+        render_ground_truth("U-", font_path, font_size=32).line,
+        profile,
+        render_ground_truth("U-", font_path, font_size=32).boxes,
+        geometry=geometry,
+    )
+    assert res.recall, f"U- (geometry): {res.reason!r}"
+
+
+# ---------------------------------------------------------------------------
+# Expected-width estimate cap
+# ---------------------------------------------------------------------------
+
+
+def test_expected_width_excludes_wide_components(font_path):
+    """A single wide component must not set expected width to itself.
+
+    With the model geometry the height/width-derived em of a glued blob
+    would estimate 'expected = the blob' and the split trigger would never
+    fire; conversely, a *capped* contribution would drag the median down
+    and make real glyph parts (命's 人+一) look splittable.  Wide
+    components (aspect > 1.1) are excluded from the estimate, falling back
+    to the height heuristic when the whole line is one wide blob.
+    """
+
+    geometry = _model_geometry()
+    gt = _pair(font_path, "甲", "申", "full")  # one 52px-wide component
+    comps = connected_components(gt.line)
+    assert len(comps) == 1
+    expected = _estimate_expected_width(comps, default_profile(), geometry)
+    max_h = max(c.h for c in comps)
+    assert expected <= max_h * 0.8 + 1e-6, (
+        f"expected width {expected:.1f} not capped at 0.8*height"
+    )
+    assert comps[0].w > expected * 1.5  # the split trigger fires
+
+    # A normal line with one wide glyph part (命's 人+一, 30x13) must not
+    # have it split: no valley exists there, and the seam gate (w >= 2 *
+    # expected) keeps the part whole, so its glyph's merge stays within
+    # max_merge_components.
+    gt2 = render_ground_truth("生命值1000", font_path, font_size=32)
+    comps2 = connected_components(gt2.line)
+    expected2 = _estimate_expected_width(comps2, default_profile(), geometry)
+    atoms2, _ = expand_atoms(
+        comps2, default_profile(), 4, True, geometry
+    )
+    assert len(atoms2) == len(comps2), (
+        f"wide glyph part split at expected {expected2:.1f}: "
+        f"{len(comps2)} comps -> {len(atoms2)} atoms"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Split-along-paths unit
+# ---------------------------------------------------------------------------
+
+
+def test_split_along_paths_partitions_mask():
+    rng = np.random.default_rng(7)
+    mask = rng.random((9, 20)) < 0.4
+    straight = np.full(9, 7, dtype=np.int32)
+    pieces = _split_along_paths(mask, [straight])
+    assert len(pieces) == 2
+    assert np.array_equal(pieces[0] | pieces[1], mask)
+    assert not np.any(pieces[0] & pieces[1])
+    # Straight cut at x=7: left piece keeps cols [0, 7).
+    assert not np.any(pieces[0][:, 7:])
+
+    snake = np.array([6, 7, 7, 8, 8, 7, 6, 6, 7], dtype=np.int32)
+    pieces = _split_along_paths(mask, [snake])
+    assert len(pieces) == 2
+    assert np.array_equal(pieces[0] | pieces[1], mask)
+    assert not np.any(pieces[0] & pieces[1])
+
+
+# ---------------------------------------------------------------------------
 # Attribution: segmentation vs decoding errors
 # ---------------------------------------------------------------------------
+
+
+def _pruned_merge_line(font_path) -> GroundTruthLine:
+    bar1 = render_ground_truth("1", font_path, font_size=32)
+    bar2 = render_ground_truth("1", font_path, font_size=32)
+    w1 = bar1.mask.shape[1]
+    h = max(bar1.mask.shape[0], bar2.mask.shape[0])
+    gap = 15
+    mask = np.zeros((h, w1 + gap + bar2.mask.shape[1]), dtype=bool)
+    mask[: bar1.mask.shape[0], :w1] = bar1.mask
+    mask[: bar2.mask.shape[0], w1 + gap :] = bar2.mask
+    return GroundTruthLine(
+        text="X",
+        mask=mask,
+        boxes=(GroundTruthBox("X", 0, 0, mask.shape[1], h),),
+    )
 
 
 def test_evaluate_attributes_segmentation_vs_decoding(font_path):
     profile = default_profile()
     ok_line = render_ground_truth("潜甲", font_path, font_size=32)
-    seg_line = _pair(font_path, "甲", "申", "full")  # oracle missing
+    seg_line = _pruned_merge_line(font_path)  # oracle missing
 
-    # Correct decoder: only the segmentation failure remains.
     report = evaluate_oracle(
         [ok_line, seg_line],
         profile,
@@ -275,7 +464,6 @@ def test_evaluate_attributes_segmentation_vs_decoding(font_path):
     assert report.oracle_recall == 0.5
     assert report.status_counts == {"ok": 1, "segmentation": 1}
 
-    # Wrong decoder on the oracle-ok line: attributed to decoding.
     report = evaluate_oracle(
         [ok_line, seg_line],
         profile,
@@ -283,27 +471,50 @@ def test_evaluate_attributes_segmentation_vs_decoding(font_path):
     )
     assert report.status_counts == {"decoding": 1, "segmentation": 1}
 
-    # Without a decoder the oracle-ok lines are simply "ok".
     report = evaluate_oracle([ok_line], profile)
     assert report.status_counts == {"ok": 1}
 
 
-def test_format_report_smoke(font_path):
-    profile = default_profile()
+def test_evaluate_records_candidate_counts(font_path):
     report = evaluate_oracle(
         [render_ground_truth("潜甲", font_path, font_size=32)],
-        profile,
+        default_profile(),
+    )
+    sample = report.samples[0]
+    assert sample.n_atoms > 0
+    assert sample.n_candidates > 0
+    assert sample.n_candidates >= sample.n_atoms
+
+
+def test_format_report_smoke(font_path):
+    report = evaluate_oracle(
+        [render_ground_truth("潜甲", font_path, font_size=32)],
+        default_profile(),
     )
     text = format_report(report)
     assert "oracle lattice recall: 100.0%" in text
     assert "ok" in text
 
 
-def test_report_names_missing_cut_position(font_path):
+def test_format_report_names_missing_cut_position():
     """The report must say *where* the missing cut is (guides the fix)."""
 
-    gt = _pair(font_path, "甲", "申", "full")
-    report = evaluate_oracle([gt], default_profile())
+    report = OracleReport(
+        total=1,
+        oracle_recall=0.0,
+        status_counts={"segmentation": 1},
+        samples=(
+            OracleSample(
+                text="甲申",
+                oracle=False,
+                status="segmentation",
+                reason="unassigned_atom",
+                straddled_boundaries=((0, 1, 25),),
+                n_atoms=1,
+                n_candidates=1,
+            ),
+        ),
+    )
     text = format_report(report)
-    assert "甲" in text and "申" in text
-    assert "missing cut @x" in text
+    assert "missing cut @x25" in text
+    assert "甲|申" in text

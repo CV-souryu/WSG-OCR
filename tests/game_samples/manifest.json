@@ -1773,9 +1773,7 @@
       "expected": "U-156",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp15 row 1 col 6; source screens/viewport-15.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns 'い156'"
+      "note": "real ship-list card vp15 row 1 col 6; source screens/viewport-15.png"
     },
     {
       "file": "real-game/ship-name/vp16_r0_c0.png",
@@ -1875,9 +1873,7 @@
       "expected": "U-156",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp16 row 1 col 6; source screens/viewport-16.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns 'い156'"
+      "note": "real ship-list card vp16 row 1 col 6; source screens/viewport-16.png"
     },
     {
       "file": "real-game/ship-name/vp17_r0_c0.png",
@@ -1928,27 +1924,21 @@
       "expected": "U-156",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp17 row 0 col 6; source screens/viewport-17.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns 'い156'"
+      "note": "real ship-list card vp17 row 0 col 6; source screens/viewport-17.png"
     },
     {
       "file": "real-game/ship-name/vp17_r1_c0.png",
       "expected": "U-156",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp17 row 1 col 0; source screens/viewport-17.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns 'い156'"
+      "note": "real ship-list card vp17 row 1 col 0; source screens/viewport-17.png"
     },
     {
       "file": "real-game/ship-name/vp17_r1_c1.png",
       "expected": "U-96",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp17 row 1 col 1; source screens/viewport-17.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns 'い96'"
+      "note": "real ship-list card vp17 row 1 col 1; source screens/viewport-17.png"
     },
     {
       "file": "real-game/ship-name/vp18_r0_c0.png",
@@ -1999,27 +1989,21 @@
       "expected": "U-156",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp18 row 0 col 6; source screens/viewport-18.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns 'い156'"
+      "note": "real ship-list card vp18 row 0 col 6; source screens/viewport-18.png"
     },
     {
       "file": "real-game/ship-name/vp18_r1_c0.png",
       "expected": "U-156",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp18 row 1 col 0; source screens/viewport-18.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns 'い156'"
+      "note": "real ship-list card vp18 row 1 col 0; source screens/viewport-18.png"
     },
     {
       "file": "real-game/ship-name/vp18_r1_c1.png",
       "expected": "U-96",
       "category": "real-game/ship-name",
       "lexicon": "ships",
-      "note": "real ship-list card vp18 row 1 col 1; source screens/viewport-18.png",
-      "known_failure": true,
-      "known_failure_note": "current model returns 'い96'"
+      "note": "real ship-list card vp18 row 1 col 1; source screens/viewport-18.png"
     }
   ]
 }

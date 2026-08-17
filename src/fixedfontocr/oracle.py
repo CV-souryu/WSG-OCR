@@ -263,17 +263,19 @@ def glue_ground_truth(
     ``x == y == 0`` (i.e. produced by :func:`render_ground_truth`); the
     glyphs are bottom-aligned (ink bottoms on one row, like a baseline).
 
-    ``bridge`` (the glyphs always sit with a 1 px blank column between
-    them, which the bridge fills):
+    ``bridge``:
 
-    * ``"full"`` -- the blank column is filled entirely: the pair is one
-      connected component with *no* vertical valley at the boundary (the
-      column's projection is the full height). The valley heuristic cannot
-      split it.
-    * ``"row"`` -- a 1 px connector at a row where both glyphs have ink in
-      their outer columns: one connected component with a thin valley at
-      the boundary (the classic low-res connector).
-    * ``"none"`` -- the blank column stays blank: two separate components.
+    * ``"full"`` -- zero gap: the glyphs' own ink columns become adjacent
+      (real touching, no extra ink).  Whether the pair forms one connected
+      component with a valley at the boundary depends on the glyph shapes
+      (甲+申: connected with *no* valley -- the forced seam cut case;
+      4+3 / L+V / U-: connected, the boundary column is often a valley).
+    * ``"row"`` -- a 1 px blank column, filled by a thin connector at a
+      row where both glyphs have ink in their outer columns: one connected
+      component with a real valley at the boundary (the classic low-res
+      connector).
+    * ``"none"`` -- a 1 px blank column stays blank: two separate
+      components.
 
     The returned GT boxes are the exact placement boxes, so the oracle
     check is self-consistent: bridge ink legitimately belongs to no box.
@@ -288,19 +290,20 @@ def glue_ground_truth(
 
     # The inputs may carry render padding around their ink; tighten each to
     # its ink bbox and re-base the GT box, so the composite places the ink
-    # (not the canvas) and the GT boxes stay pixel-exact. The glyphs always
-    # get a 1 px blank column between them; the bridge fills it (so a
-    # zero-gap layout would already be touching and no bridge could add a
-    # valley).
+    # (not the canvas) and the GT boxes stay pixel-exact.  "full" places
+    # the glyphs with zero gap (their own ink columns become adjacent --
+    # real touching); "row" / "none" keep a 1 px blank column, which the
+    # row bridge fills.
     left_mask, left_box = _tighten(left)
     right_mask, right_box = _tighten(right)
     hl, wl = left_mask.shape
     hr, wr = right_mask.shape
     h = max(hl, hr)
-    w = wl + 1 + wr
+    gap = 0 if bridge == "full" else 1
+    w = wl + gap + wr
     out = np.zeros((h, w), dtype=bool)
     out[h - hl :, :wl] = left_mask
-    out[h - hr :, wl + 1 :] = right_mask
+    out[h - hr :, wl + gap :] = right_mask
     if bridge == "row":
         # A thin connector in the blank column between the two glyphs'
         # outer columns: 1 px wide, from the left glyph's right-edge ink
@@ -326,16 +329,12 @@ def glue_ground_truth(
                 "apart vertically; cannot make a thin row-bridge"
             )
         out[r_lo : r_hi + 1, wl] = True
-    elif bridge == "full":
-        # Fill the blank column entirely: one connected component with no
-        # valley at the boundary (full-height projection).
-        out[:, wl] = True
 
     def shift(b: GroundTruthBox, dx: int, dy: int) -> GroundTruthBox:
         return GroundTruthBox(b.char, b.x0 + dx, b.y0 + dy, b.x1 + dx, b.y1 + dy)
 
     lb = shift(left_box, 0, h - hl)
-    rb = shift(right_box, wl + 1, h - hr)
+    rb = shift(right_box, wl + gap, h - hr)
     return GroundTruthLine(
         text=left.text + right.text,
         mask=out,
@@ -594,6 +593,8 @@ class OracleSample:
     straddled_boundaries: tuple[tuple[int, int, int], ...] = ()
     missing_chars: tuple[int, ...] = ()
     best_coverage: tuple[float, ...] = ()
+    n_atoms: int = 0
+    n_candidates: int = 0
 
 
 @dataclass(frozen=True)
@@ -652,6 +653,8 @@ def evaluate_oracle(
                     oracle=True,
                     status=status,
                     decoded=decoded,
+                    n_atoms=res.n_atoms,
+                    n_candidates=res.n_candidates,
                 )
             )
         else:
@@ -664,6 +667,8 @@ def evaluate_oracle(
                     straddled_boundaries=res.straddled_boundaries,
                     missing_chars=res.missing_chars,
                     best_coverage=res.best_coverage,
+                    n_atoms=res.n_atoms,
+                    n_candidates=res.n_candidates,
                 )
             )
 

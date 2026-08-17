@@ -155,7 +155,18 @@ def _estimate_expected_width(
     if geometry is not None:
         widths: list[float] = []
         for c in tall:
-            if c.w / max(c.h, 1) < 0.8:
+            aspect = c.w / max(c.h, 1)
+            if aspect > 1.1:
+                # A very wide component is either several glued glyphs
+                # (甲+申 zero-gap) or a real glyph's wide part (命's 人+一,
+                # 尔's top): its width is not a glyph width.  Excluding it
+                # keeps the estimate on the line's normal glyphs -- capping
+                # it instead would drag the median down and make the
+                # component itself look splittable.  When every tall
+                # component is wide (a single glued blob line), fall back
+                # to the height heuristic below.
+                continue
+            if aspect < 0.8:
                 em = max(
                     c.h / max(geometry.narrow_height_ratio, 1e-6),
                     1.0,
@@ -173,6 +184,12 @@ def _estimate_expected_width(
                 float(profile.char_width_min),
                 min(float(profile.char_width_max), expected),
             )
+        # All tall components are wide: the height heuristic is the only
+        # glyph-width evidence (single glued-blob line).
+        return max(
+            float(profile.char_width_min),
+            min(float(profile.char_width_max), max_h * 0.8),
+        )
     median_h = float(np.median([c.h for c in tall]) if tall else max_h)
     return max(
         float(profile.char_width_min),
@@ -195,6 +212,12 @@ def _valley_cuts(
     have top/bottom strokes keeping the valley columns well above the
     threshold). Edge valleys are ignored and each resulting piece must be
     wide enough to be a glyph.
+
+    Edge valleys are deliberately *not* cut: a trailing sparse region is
+    often a real glyph's own tail (命's 人+一 component ends in a thin
+    stroke), and splitting it would push the glyph's whole merge past
+    ``max_merge_components``.  Short trailing glyphs (``U-``) stay covered
+    by their own connected component in clean rendering.
     """
 
     h, w = mask.shape
@@ -225,6 +248,125 @@ def _valley_cuts(
     return cuts
 
 
+def _seam_cut(
+    mask: np.ndarray,
+    x_ideal: float,
+    tol: int = 2,
+    offset_weight: float = 0.2,
+) -> tuple[np.ndarray, float] | None:
+    """Minimum-cost vertical seam near ``x_ideal``.
+
+    The cut path is not forced to be a straight column: it may snake one
+    column per row to dodge strokes.  The cost of a path is the number of
+    ink pixels it crosses plus ``offset_weight`` per row per pixel of
+    deviation from ``x_ideal`` (so a near-ideal low-ink column wins over a
+    far-away empty one).  Returns the ``(h,)`` path (column per row) and
+    its cost, or ``None`` when the window is degenerate.
+    """
+
+    h, w = mask.shape
+    lo = max(1, int(np.floor(x_ideal)) - tol)
+    hi = min(w - 2, int(np.ceil(x_ideal)) + tol)
+    if hi <= lo or h < 2:
+        return None
+    width = hi - lo + 1
+    INF = float("inf")
+    dp = np.full((h, width), INF, dtype=np.float64)
+    back = np.zeros((h, width), dtype=np.int32)
+    for j in range(width):
+        x = lo + j
+        dp[0, j] = float(mask[0, x]) + offset_weight * abs(x - x_ideal)
+    for y in range(1, h):
+        row = mask[y]
+        for j in range(width):
+            best = INF
+            best_j = 0
+            for dj in (-1, 0, 1):
+                jj = j + dj
+                if 0 <= jj < width:
+                    v = dp[y - 1, jj]
+                    if v < best:
+                        best, best_j = v, jj
+            dp[y, j] = best + float(row[lo + j]) + offset_weight * abs(
+                lo + j - x_ideal
+            )
+            back[y, j] = best_j
+    j = int(np.argmin(dp[h - 1]))
+    cost = float(dp[h - 1, j])
+    path = np.empty(h, dtype=np.int32)
+    for y in range(h - 1, -1, -1):
+        path[y] = lo + j
+        j = back[y, j]
+    return path, cost
+
+
+def _forced_seam_cuts(
+    mask: np.ndarray,
+    expected_width: float,
+    profile: Profile,
+    max_splits: int,
+) -> list[tuple[np.ndarray, float]]:
+    """Seam cut positions at font-advance multiples and equal parts.
+
+    Wide components whose ink has *no* valley at the glyph boundary (fully
+    touching ``LV``/``甲申`` style blobs) never get split by
+    :func:`_valley_cuts`.  This adds forced cut hypotheses near every
+    plausible glyph boundary:
+
+    * ``k * expected_width`` (font advance multiples, the user's
+      ``期望字符宽度的整数倍 ±1~2 px``), and
+    * ``k * w / n`` for ``n = round(w / expected_width)`` equal parts (so
+      a line whose glyphs are all narrower than the estimate still gets a
+      cut near the true boundary).
+
+    Each ideal position is refined by a min-cost seam in a ``±2 px``
+    window.  No decision is made here: every seam becomes an extra atom,
+    the original whole component stays reachable as their merge, and the
+    lattice decoder picks the best path.
+    """
+
+    h, w = mask.shape
+    min_piece = max(profile.char_width_min, int(expected_width * 0.4))
+    if h < 2 or w < 2 * min_piece + 2:
+        return []
+
+    n_est = int(round(w / max(expected_width, 1.0)))
+    ideals: list[float] = []
+    # Font advance multiples: k * expected_width.  Always considered --
+    # they are the user's ``期望字符宽度的整数倍 ±1~2 px``.
+    for k in range(1, n_est + 1):
+        x = k * expected_width
+        if min_piece <= x <= w - min_piece:
+            ideals.append(x)
+    # Equal parts w * k / n for n = round(w / expected) glyphs.  Gated on
+    # n >= 2 *naturally*: a component whose width is only ~1.4x the
+    # estimate is a single wide glyph (尔's 28px top vs a 20px estimate),
+    # and cutting it at w/2 would split a real glyph, pushing its whole
+    # merge past max_merge_components.  Advance multiples still cover the
+    # true boundary when the estimate is high (U- style).
+    if n_est >= 2:
+        for k in range(1, n_est):
+            x = w * k / n_est
+            if min_piece <= x <= w - min_piece:
+                ideals.append(x)
+
+    seams: list[tuple[np.ndarray, float]] = []
+    seen: list[float] = []
+    for ideal in sorted(set(ideals)):
+        # Skip ideals already covered by a kept seam (within 2 * tol).
+        if any(abs(ideal - s_mean) <= 4 for s_mean in seen):
+            continue
+        cut = _seam_cut(mask, ideal)
+        if cut is None:
+            continue
+        path, cost = cut
+        seen.append(float(np.mean(path)))
+        seams.append((path, cost))
+
+    seams.sort(key=lambda s: s[1])
+    return seams[:max_splits]
+
+
 def _split_atoms(
     comp: Component,
     component_index: int,
@@ -232,33 +374,91 @@ def _split_atoms(
     profile: Profile,
     max_splits: int,
 ) -> list[_Atom]:
-    """Return one whole atom, or one atom per vertically-split piece."""
+    """Return one whole atom, or one atom per split piece.
+
+    Two independent cut mechanisms feed the atom sequence:
+
+    * vertical valleys (:func:`_valley_cuts`) -- connectors between glyphs
+      and short edge glyphs (``U-``);
+    * forced seams at advance multiples / equal parts
+      (:func:`_forced_seam_cuts`) -- fully-touching blobs with no valley
+      at the boundary (``甲申``, ``LV``).
+
+    Every cut is only a *hypothesis*: the original component stays
+    reachable as the merge of all its atoms, and the lattice decoder picks
+    the best path.  ``max_splits`` bounds the atom count so the whole
+    component always fits in a ``max_merge_components`` merge.
+    """
 
     whole = [_Atom(component_index=component_index, segment=comp)]
     if (
         max_splits < 1
         or comp.h < max(2, profile.char_height_min)
-        # 1.25 * height still protects single CJK glyphs (aspect ~1.0)
-        # but lets touching Latin+digit pairs such as Z2 / Z1 be split.
+        # 1.5 * expected / 1.25 * height keeps single CJK glyphs and real
+        # glyphs' wide parts (命's 人+一, 尔's top) whole; wide multi-glyph
+        # blobs (甲+申 zero-gap) exceed it.
         or comp.w <= max(expected_width * 1.5, comp.h * 1.25)
     ):
         return whole
-    cuts = _valley_cuts(comp.mask, expected_width, profile, max_splits)
+
+    cuts: list[tuple[np.ndarray, float]] = []
+    for x in _valley_cuts(comp.mask, expected_width, profile, max_splits):
+        path = np.full(comp.mask.shape[0], x, dtype=np.int32)
+        cuts.append((path, 0.0))
+    if not cuts and comp.w >= expected_width * 2:
+        # Valley-free blob at least two glyphs wide (甲+申 zero-gap): the
+        # forced seams are its only chance.  The width gate keeps real
+        # glyph parts (w < 2 * expected) from being seam-sliced -- their
+        # interior sparse columns would otherwise read as cheap cuts and
+        # push the glyph's whole merge past max_merge_components.
+        cuts = _forced_seam_cuts(
+            comp.mask, expected_width, profile, max_splits
+        )
     if not cuts:
         return whole
 
-    bounds = [0, *cuts, comp.w]
+    # Keep the lowest-cost cuts (valleys count as free), ordered left to
+    # right, respecting the bound.
+    cuts.sort(key=lambda pc: (pc[1], float(np.mean(pc[0]))))
+    cuts = cuts[:max_splits]
+    cuts.sort(key=lambda pc: float(np.mean(pc[0])))
+
     pieces: list[Component] = []
-    for a, b in zip(bounds, bounds[1:]):
-        piece_mask = comp.mask[:, a:b]
-        if not np.any(piece_mask):
-            continue
+    for piece_mask in _split_along_paths(comp.mask, [p for p, _ in cuts]):
         seg = _bbox_segment(piece_mask, comp.y)
-        seg.x += comp.x + a
+        seg.x += comp.x
         pieces.append(seg)
     if len(pieces) < 2:
         return whole
     return [_Atom(component_index=component_index, segment=p) for p in pieces]
+
+
+def _split_along_paths(
+    mask: np.ndarray,
+    paths: list[np.ndarray],
+) -> list[np.ndarray]:
+    """Slice ``mask`` into ``len(paths) + 1`` pieces along cut paths.
+
+    Each path gives the cut column per row (a vertical valley cut is a
+    constant path; a seam may snake).  Piece ``k`` owns columns
+    ``(paths[k-1][y], paths[k][y])`` per row -- left-exclusive,
+    right-exclusive -- so the seam's crossed pixels belong to the right
+    piece (a straight column cut therefore keeps the left glyph intact).
+    """
+
+    h, w = mask.shape
+    n = len(paths)
+    pieces: list[np.ndarray] = []
+    for k in range(n + 1):
+        pm = np.zeros_like(mask)
+        for y in range(h):
+            a = int(paths[k - 1][y]) if k > 0 else 0
+            b = int(paths[k][y]) if k < n else w
+            if a < b:
+                pm[y, a:b] = mask[y, a:b]
+        if np.any(pm):
+            pieces.append(pm)
+    return pieces
 
 
 def expand_atoms(
@@ -322,7 +522,16 @@ def _passes_filters(
         seg = parts[0].segment
         if seg.w > profile.char_width_max or seg.h > profile.char_height_max:
             return False
-        if not _geometry_bbox_ok(seg, geometry):
+        # The Goal 8 bbox envelope is estimated from the glyph *height* and
+        # is unreliable for short punctuation: a 32px ``-`` is 8x3 (ratio
+        # 2.5, far above the normal 1.35x envelope).  Small candidates get
+        # a wider envelope (3.0x) so ``-``/``=``/``~`` reach the scorer,
+        # while near-empty 1-2 px bars (ratio ~3.3+, glyph fragments like
+        # 武's tail) stay rejected.  The identity-dependent char_geometry
+        # decides after classification whether the shape fits its Top-K
+        # pick.
+        envelope = 3.0 if seg.h < max(2, profile.char_height_min) else 1.35
+        if not _geometry_bbox_ok(seg, geometry, max_multiplier=envelope):
             return False
         if seg.h >= max(2, profile.char_height_min):
             ink = int(seg.mask.sum())
@@ -382,12 +591,21 @@ def _passes_filters(
 def _geometry_bbox_ok(
     seg: Component,
     geometry: FontGeometryDatabase | None,
+    max_multiplier: float = 1.35,
 ) -> bool:
     """Goal 8 bbox prior: reject shapes no charset glyph can occupy.
 
-    The check is deliberately generous (1.35x the widest narrow/full-width
-    glyph, 0.35x the narrowest) so low-resolution fragments are still scored
-    by the visual DP. Without a database every shape passes.
+    The check is deliberately generous (``max_multiplier`` x the widest
+    narrow/full-width glyph, 0.35x the narrowest) so low-resolution
+    fragments are still scored by the visual DP.  Without a database every
+    shape passes.
+
+    Small punctuation (below the minimum char height) uses a wider
+    ``max_multiplier`` (3.0 in :func:`_passes_filters`): the height-derived
+    em of a flat ``-`` (8x3, ratio 2.5) exceeds the normal 1.35x envelope
+    although ``-`` is a real charset glyph.  The wider bound still rejects
+    near-empty 1-2 px bars (ratio ~3.3+) that are glyph fragments, not
+    punctuation.
     """
 
     if geometry is None or seg.h < 2 or seg.w < 1:
@@ -399,14 +617,14 @@ def _geometry_bbox_ok(
             h / max(geometry.narrow_height_ratio, 1e-6),
             1.0,
         )
-        max_ratio = geometry.narrow_width_max * 1.35
+        max_ratio = geometry.narrow_width_max * max_multiplier
         min_ratio = geometry.narrow_width_min * 0.35
     else:
         em = max(
             h / max(geometry.full_height_ratio, 1e-6),
             1.0,
         )
-        max_ratio = geometry.full_width_max * 1.35
+        max_ratio = geometry.full_width_max * max_multiplier
         min_ratio = geometry.full_width_min * 0.35
     ratio = w / em
     return min_ratio <= ratio <= max_ratio

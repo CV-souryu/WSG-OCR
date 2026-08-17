@@ -55,14 +55,16 @@ shifted by the cumulative advance — pixel-exact at integer advances,
 outside all boxes, is a hard error.
 
 `glue_ground_truth(left, right, bridge=...)` joins two single-char lines
-with a 1 px blank column between them and optionally fills it, to
-reproduce the real-game fully-touching failure mode:
+to reproduce the real-game touching failure modes:
 
-* `"full"` — blank column filled entirely: one connected component with
-  *no* valley at the boundary (valley heuristic cannot cut it);
-* `"row"` — a thin connector (column projection ≤ 18% of the height): one
-  connected component with a real valley (the classic low-res connector);
-* `"none"` — blank column stays blank: two components.
+* `"full"` — zero gap: the glyphs' own ink columns become adjacent (real
+  touching, no extra ink).  Whether the pair forms one connected component
+  with a valley at the boundary depends on the glyph shapes (甲+申:
+  connected with *no* valley — the forced seam cut case);
+* `"row"` — a 1 px blank column filled by a thin connector (column
+  projection ≤ 18% of the height): one connected component with a real
+  valley (the classic low-res connector);
+* `"none"` — the 1 px blank column stays blank: two components.
 
 ## Usage
 
@@ -81,28 +83,50 @@ report = evaluate_oracle(lines, default_profile(), decode_fn=ocr_recognize)
 print(format_report(report))
 ```
 
-## Findings on the current corpus (32 px, model geometry)
+## Findings
 
-* Normal renders (`潜甲`, `鲃鱼。`, `LV.40`, `4+3`, `Z17`, `1000`, ...) have
-  oracle paths and decode correctly.
-* Fully-glued pairs (`甲申`, `43`, `LV`, `U-` with a full-height connector)
-  have **no oracle path**: `unassigned_atom` with the missing cut position
-  (e.g. `missing cut @x17 (4|3)`). This is the user-visible `LV`/`4+3`/`U-`
-  failure mode — the correct fix is not a stronger CNN but lattice
-  candidates for those boundaries (forced cuts at advance multiples /
-  min-cost seam cuts).
-* `T-23` / `U-` at 32 px: the standalone `-` component (8×3) is pruned by
-  the Goal 8 bbox prior (`_geometry_bbox_ok`, em estimated from height
-  only) → `missing_candidate`, and the model indeed reads `r23` / `山`.
-  At 14 px the oracle path exists and the model still reads `Т-23`
-  (Cyrillic lookalike) — a *classification* problem, correctly attributed
-  as `decoding` rather than `segmentation`.
-* A valley cut may land inside the left glyph (e.g. `43` full: cut at x=15,
-  two px inside `4`, boundary at x=17): atoms stay assignable, but no
-  candidate reaches the coverage threshold → `missing_candidate` with
-  per-char best coverage in the report.
+Goal 21 candidate-generation upgrades (frozen CNN/decoder), measured by the
+oracle on the 32 px rendered corpus with model geometry:
+
+* **Oracle lattice recall: 63.2% (12/19) -> 100% (16/16)**; the glued-pair
+  subset (single connected component) is 100% (3/3) at 6 candidates total
+  (no enumeration blowup; ~6.8 candidates/line across the corpus).
+* **Forced advance/seam cuts** (`_forced_seam_cuts` in segmentation.py):
+  a valley-free fully-touching blob (甲+申 zero-gap, one component, no
+  valley column) is now split by a min-cost seam near the font-advance
+  multiple / equal-part position; the original whole component stays
+  reachable as the merge of its atoms.  Seams run only when the component
+  has *no* valley cut and is at least 2x the expected width wide -- both
+  gates keep real glyphs' wide components (命's 人+一, 尔's top) from being
+  sliced, which would push the glyph's whole merge past
+  `max_merge_components`.
+* **Small punctuation gets a wider bbox envelope**: an 8x3 `-` (ratio
+  2.5) exceeds the normal 1.35x envelope; small candidates (below the
+  minimum char height) use a 3.0x envelope instead, so `-`/`=`/`~` reach
+  the scorer (T-23 / U- at 32 px had `missing_candidate` before; both now
+  have oracle paths), while near-empty 1-2 px bars (ratio ~3.3+, glyph
+  fragments) stay rejected.  This also fixed 8 real-game known failures
+  (`い156` -> `U-156`, `い96` -> `U-96`) and reads the hyphen in
+  `石勒苏益格-荷尔施泰因` crops.
+* **Expected-width estimate excludes wide components** (aspect > 1.1) --
+  they are either glued blobs or a real glyph's wide part (命's 人+一, 尔's
+  top), so their width is not a glyph width.  Excluding them keeps the
+  median on the line's normal glyphs; when the whole line is one wide
+  blob the height heuristic (0.8 x height) is the fallback.  (A *capped*
+  contribution instead drags the median down and makes the wide part
+  itself look splittable.)
+* L+V and U- never form one connected component in this font's clean
+  raster at any size (their outer ink rows do not overlap) -- their
+  real-game gluing is an anti-aliasing artifact; they stay normal-render
+  oracle samples.
+* T-23 at 32 px is now attributed to **decoding**: the oracle path exists
+  but the model reads Cyrillic `Т`.  The separability check
+  (`tests/test_tt_separability.py`) pins that Latin T and Cyrillic Т are
+  *pixel-identical* in the registered font at 14/16/32 px (normalized
+  Hamming 0/576), so no CNN can separate them: the fix is charset /
+  allowed_chars / lexicon disambiguation, not hard-negative training.
 
 These numbers depend on `font_size` and on whether the model geometry is
-passed (it changes `expected_width` and thus the valley cut positions and
-the bbox prior) — that sensitivity is the point: the metric measures the
+passed (it changes `expected_width` and thus the cut positions and the
+bbox prior) -- that sensitivity is the point: the metric measures the
 lattice the production pipeline actually builds.

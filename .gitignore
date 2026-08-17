@@ -6,6 +6,4 @@ __pycache__/
 model/
 data/
 out/
-fonts/*
-!fonts/registry.json
 .DS_Store

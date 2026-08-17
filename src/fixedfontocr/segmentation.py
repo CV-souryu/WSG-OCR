@@ -841,6 +841,8 @@ def segment_line(
     image: np.ndarray | None = None,
     lexicon: Lexicon | str | None = None,
     decoder_config: DecoderConfig | None = None,
+    prob_decoder=None,
+    prob_domain=None,
 ) -> DecodePath:
     """Segment one line with the candidate lattice + joint decoder.
 
@@ -855,6 +857,13 @@ def segment_line(
     :func:`decode_dp` (no beam-only segmentation artefacts). Without either
     argument the legacy visual DP (:func:`decode`) is kept for callers that
     only score segmentation.
+
+    Probabilistic decoder (v2): when ``prob_decoder`` is supplied the
+    scored lattice is decoded by the probabilistic v2 decoder with the
+    given ``prob_domain`` prior instead. Candidate generation and scoring
+    are identical; only the path selection changes. ``prob_decoder`` is a
+    :class:`fixedfontocr.prob_decoder.ProbabilisticDecoder` (never imported
+    here to keep the legacy module graph unchanged).
     """
 
     comps = connected_components(line)
@@ -954,6 +963,12 @@ def segment_line(
         )
     lattice = build_lattice(comps, candidates, line)
     geometry_db = getattr(scorer, "geometry", None)
+    if prob_decoder is not None:
+        return prob_decoder.decode_lattice(
+            lattice,
+            domain=prob_domain,
+            allowed_ids=allowed_ids,
+        )
     if lexicon is not None:
         lex = (
             lexicon

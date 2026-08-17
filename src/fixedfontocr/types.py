@@ -78,6 +78,34 @@ class Component:
 
 
 @dataclass(frozen=True)
+class RawEvidence:
+    """Un-fused raw classifier evidence of one visual candidate (v2 only).
+
+    This is the *frozen* raw material the probabilistic decoder consumes:
+    per fused Top-K character the raw template score and raw CNN logit, the
+    CNN top-1/top-2 logits, the template winner prototype metadata of the
+    template-chosen character, and the normalized binary glyph the
+    classifiers saw. Nothing here is a fused ``visual_score``.
+
+    ``template_winner`` is ``(char_id, render_size, dx, dy, downsample_mode)``
+    of the template's own winner (``-1`` entries when the model has no
+    template stage); ``cnn_*`` fields are ``None`` for template-only models.
+    ``glyph`` is the normalized ``uint8`` bitmap (0/255), kept so the v2
+    feature extractor can re-derive per-character prototype evidence
+    without re-running the pipeline.
+    """
+
+    char_ids: tuple[int, ...] = ()
+    template_scores: tuple[float, ...] = ()  # raw 1 - dist/area per char id
+    cnn_logits: tuple[float, ...] = ()  # raw logit per char id (-inf when absent)
+    cnn_top1_logit: float = -np.inf
+    cnn_top2_logit: float = -np.inf
+    template_winner: tuple[int, int, int, int, int] = (-1, -1, -1, -1, -1)
+    glyph: np.ndarray | None = None
+    normalize_geometry: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
 class VisualScores:
     """Top-K classifier scores for one visual candidate.
 
@@ -108,6 +136,10 @@ class VisualScores:
     visual_score: float = 0.0
     confidence: float = 0.0
     geometry_included: bool = False
+    # Probabilistic decoder (v2): un-fused raw classifier evidence attached
+    # only when the model config opts in (decoder version >= 2). None for
+    # every legacy/v1 model, so v1 behaviour is byte-identical.
+    raw_evidence: RawEvidence | None = None
 
     @property
     def template_score(self) -> float:
@@ -246,6 +278,10 @@ class DecodePath:
     # must not silently fall back to Top-1.
     char_ids: tuple[int, ...] = field(default_factory=tuple)
     lattice: VisualLattice | None = None
+    # Probabilistic decoder (v2) diagnostics (best path only; None for v1):
+    # total log-probability, normalized score, per-term decomposition,
+    # selected line render state, runner-up margin, reject reason.
+    prob_diagnostics: dict | None = None
 
 
 @dataclass(frozen=True)

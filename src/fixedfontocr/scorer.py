@@ -36,7 +36,13 @@ from .preprocess import (
     normalize,
     normalize_grayscale,
 )
-from .types import CandidateScore, ClassificationBatch, VisualCandidate, VisualScores
+from .types import (
+    CandidateScore,
+    ClassificationBatch,
+    RawEvidence,
+    VisualCandidate,
+    VisualScores,
+)
 
 
 @dataclass(frozen=True)
@@ -443,6 +449,57 @@ def _unified_visual_scores(
     )
 
 
+def _raw_evidence(
+    vs: VisualScores | None,
+    template_entries: list[tuple[int, float]],
+    cnn_entries: list[tuple[int, float]],
+    cnn_top1_logit: float,
+    cnn_top2_logit: float,
+    tb,
+    i: int,
+    glyph: np.ndarray | None,
+    normalize_geometry: tuple[float, float] | None,
+) -> RawEvidence | None:
+    """Un-fused raw evidence aligned with ``vs.char_ids`` (v2 only).
+
+    The fused Top-K ids are the union of the template Top-K and the CNN
+    Top-K; this helper records, per fused id, the *raw* template score
+    (``1 - dist/area``, 0 when the template did not rank it) and the raw
+    CNN logit (``-inf`` when the CNN did not rank it), plus the template's
+    own winner prototype metadata. Nothing here is a weighted fusion.
+    """
+
+    if vs is None or not vs.char_ids:
+        return None
+    tpl_by = dict(template_entries)
+    cnn_by = dict(cnn_entries)
+    tpl_scores: list[float] = []
+    cnn_logits: list[float] = []
+    for cid in vs.char_ids:
+        tpl_scores.append(float(tpl_by.get(int(cid), 0.0)))
+        cnn_logits.append(float(cnn_by.get(int(cid), -np.inf)))
+    winner = (-1, -1, -1, -1, -1)
+    if tb is not None and getattr(tb, "best_prototypes", None) is not None:
+        if tb.best_prototypes.size > i and int(tb.best_prototypes[i]) >= 0:
+            winner = (
+                int(tb.ids[i]) if tb.ids.size > i else -1,
+                int(tb.prototype_render_sizes[i]),
+                int(tb.prototype_dx[i]),
+                int(tb.prototype_dy[i]),
+                int(tb.prototype_downsample_modes[i]),
+            )
+    return RawEvidence(
+        char_ids=tuple(int(c) for c in vs.char_ids),
+        template_scores=tuple(tpl_scores),
+        cnn_logits=tuple(cnn_logits),
+        cnn_top1_logit=float(cnn_top1_logit),
+        cnn_top2_logit=float(cnn_top2_logit),
+        template_winner=winner,
+        glyph=None if glyph is None else np.ascontiguousarray(glyph),
+        normalize_geometry=normalize_geometry,
+    )
+
+
 def _soft_glyph_batch(
     segments: list[Segment],
     soft: NDArray[np.uint8],
@@ -530,6 +587,12 @@ class SegmentScorer:
         self.geometry = model.geometry
         self.visual_weights = VisualWeights.from_config(model.config)
         self.calibration = VisualCalibration.from_config(model.config)
+        # Probabilistic decoder (v2): attach un-fused raw evidence to every
+        # candidate's VisualScores only when the model config opts in.
+        # Legacy/v1 models keep the exact same objects as before.
+        self.attach_raw_evidence = (
+            int((model.config.get("decoder") or {}).get("version", 1)) >= 2
+        )
         # CNN-only models cannot lean on template confidence; a merged
         # candidate must look like a real character before the DP may prefer
         # it over its components (see segmentation._drop_weak_merges).
@@ -651,6 +714,21 @@ class SegmentScorer:
                     vs = _unified_visual_scores(
                         fused, raw, "template", self.calibration
                     )
+                    if self.attach_raw_evidence and vs is not None:
+                        vs = replace(
+                            vs,
+                            raw_evidence=_raw_evidence(
+                                vs,
+                                _template_entries(tb, i),
+                                [],
+                                -np.inf,
+                                -np.inf,
+                                tb,
+                                i,
+                                glyphs[i] if glyphs is not None else None,
+                                geoms[i] if geoms is not None else None,
+                            ),
+                        )
                     out.append(
                         SegmentScore(
                             char_id=best[1],
@@ -768,6 +846,21 @@ class SegmentScorer:
                 vs = _unified_visual_scores(
                     fused, raw, score_type, self.calibration
                 )
+                if self.attach_raw_evidence and vs is not None:
+                    vs = replace(
+                        vs,
+                        raw_evidence=_raw_evidence(
+                            vs,
+                            template_entries,
+                            cnn_entries,
+                            float(cnn.top1[i]),
+                            float(cnn.top2[i]),
+                            tb,
+                            i,
+                            glyphs[i] if glyphs is not None else None,
+                            geoms[i] if geoms is not None else None,
+                        ),
+                    )
                 out.append(
                     SegmentScore(
                         char_id=best[1],
@@ -810,6 +903,21 @@ class SegmentScorer:
                 vs = _unified_visual_scores(
                     fused, raw, "cnn", self.calibration
                 )
+                if self.attach_raw_evidence and vs is not None:
+                    vs = replace(
+                        vs,
+                        raw_evidence=_raw_evidence(
+                            vs,
+                            [],
+                            _cnn_entries(cnn, i),
+                            float(cnn.top1[i]),
+                            float(cnn.top2[i]),
+                            None,
+                            i,
+                            glyphs[i] if glyphs is not None else None,
+                            geoms[i] if geoms is not None else None,
+                        ),
+                    )
                 out.append(
                     SegmentScore(
                         char_id=best[1],
@@ -923,6 +1031,21 @@ class SegmentScorer:
                 vs = _unified_visual_scores(
                     fused, raw, score_type, self.calibration
                 )
+                if self.attach_raw_evidence and vs is not None:
+                    vs = replace(
+                        vs,
+                        raw_evidence=_raw_evidence(
+                            vs,
+                            template_entries,
+                            cnn_entries,
+                            float(cnn.top1[i]),
+                            float(cnn.top2[i]),
+                            tb,
+                            i,
+                            glyphs[i] if glyphs is not None else None,
+                            geoms[i] if geoms is not None else None,
+                        ),
+                    )
                 out.append(
                     SegmentScore(
                         char_id=best[1],

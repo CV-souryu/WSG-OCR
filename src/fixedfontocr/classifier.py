@@ -536,6 +536,179 @@ class TemplateV2Classifier(Classifier):
             return "?", 0.0
         return self.charset[cid], float(tb.scores[0])
 
+    def char_template_evidence(
+        self,
+        glyph: NDArray[np.uint8],
+        char_ids: list[int] | tuple[int, ...],
+    ) -> list[dict]:
+        """Per-character template evidence for one normalized glyph (v2).
+
+        For every ``char_id`` this re-scans only that character's own
+        ``prototypes_per_char`` prototypes (49 XOR+popcounts) and returns:
+
+        * ``best_dist`` / ``best_score`` (``1 - dist/area``) of the
+          character's best prototype;
+        * ``winner_meta`` ``(render_size, dx, dy, downsample_mode)`` of
+          that prototype (ties -> lowest prototype index);
+        * ``coarse_hit`` -- whether any prototype of the character passed
+          the coarse geometry prefilter for this glyph;
+        * ``states`` -- per ``(render_size, downsample_mode)`` best score
+          over that character's prototypes (the line render-state table),
+          with the clean high-res prototype keyed as ``"clean"``.
+
+        The scan is a pure function of ``(glyph, char_id)`` and the frozen
+        template data, so it is deterministic and backend-independent (the
+        GPU matcher is byte-exact against this CPU reference).
+        """
+
+        glyphs = np.asarray(glyph, dtype=np.uint8)
+        if glyphs.ndim == 2:
+            glyphs = glyphs[None, :, :]
+        if glyphs.ndim != 3 or glyphs.shape[1:] != (self.input_size, self.input_size):
+            raise ValueError(f"expected a {self.input_size}x{self.input_size} glyph")
+        glyph_bool = glyphs[0] > 0
+        feats, ink_tol = self._glyph_features_impl(glyph_bool)
+        bits_row = np.packbits(glyphs[0].reshape(-1), bitorder="little").view(np.uint64)
+        area = self.input_size * self.input_size
+        p = self.data.prototypes_per_char
+        out: list[dict] = []
+        for cid in char_ids:
+            cid = int(cid)
+            if not (0 <= cid < self.data.num_classes):
+                out.append(
+                    {
+                        "char_id": cid,
+                        "best_dist": area,
+                        "best_score": 0.0,
+                        "winner_meta": (-1, -1, -1, -1),
+                        "coarse_hit": False,
+                        "states": {},
+                    }
+                )
+                continue
+            proto_ids = np.arange(cid * p, (cid + 1) * p, dtype=np.int64)
+            ok = self._filter_mask(feats, ink_tol, *self._filter_features(proto_ids))
+            dists = self._distances(bits_row, proto_ids)
+            best_j = int(np.argmin(dists))
+            best_dist = int(dists[best_j])
+            meta = (
+                int(self.data.render_sizes.reshape(-1)[proto_ids[best_j]]),
+                int(self.data.dx.reshape(-1)[proto_ids[best_j]]),
+                int(self.data.dy.reshape(-1)[proto_ids[best_j]]),
+                int(self.data.downsample_modes.reshape(-1)[proto_ids[best_j]]),
+            )
+            sizes = self.data.render_sizes.reshape(-1)[proto_ids]
+            modes = self.data.downsample_modes.reshape(-1)[proto_ids]
+            states: dict[str, float] = {}
+            for (size, mode) in np.unique(np.stack([sizes, modes], axis=1), axis=0):
+                size_i, mode_i = int(size), int(mode)
+                sel = (sizes == size_i) & (modes == mode_i)
+                d = int(np.min(dists[sel]))
+                key = "clean" if mode_i == DOWNSAMPLE_CLEAN else f"{size_i}_{mode_i}"
+                states[key] = float(1.0 - d / area)
+            out.append(
+                {
+                    "char_id": cid,
+                    "best_dist": best_dist,
+                    "best_score": float(1.0 - best_dist / area),
+                    "winner_meta": meta,
+                    "coarse_hit": bool(np.any(ok)),
+                    "states": states,
+                }
+            )
+        return out
+
+    def char_template_evidence_batch(
+        self,
+        glyph: NDArray[np.uint8],
+        char_ids: list[int] | tuple[int, ...],
+    ) -> list[dict]:
+        """Vectorized :meth:`char_template_evidence` over several chars.
+
+        All characters' prototypes are scanned in ONE XOR+popcount call
+        (``len(char_ids) * prototypes_per_char`` prototypes), then reduced
+        per character -- the same results, ~5x less Python overhead.
+        """
+
+        glyphs = np.asarray(glyph, dtype=np.uint8)
+        if glyphs.ndim == 2:
+            glyphs = glyphs[None, :, :]
+        if glyphs.ndim != 3 or glyphs.shape[1:] != (self.input_size, self.input_size):
+            raise ValueError(f"expected a {self.input_size}x{self.input_size} glyph")
+        glyph_bool = glyphs[0] > 0
+        feats, ink_tol = self._glyph_features_impl(glyph_bool)
+        bits_row = np.packbits(glyphs[0].reshape(-1), bitorder="little").view(np.uint64)
+        area = self.input_size * self.input_size
+        p = self.data.prototypes_per_char
+        valid = [int(c) for c in char_ids if 0 <= int(c) < self.data.num_classes]
+        if not valid:
+            return [
+                {
+                    "char_id": int(c),
+                    "best_dist": area,
+                    "best_score": 0.0,
+                    "winner_meta": (-1, -1, -1, -1),
+                    "coarse_hit": False,
+                    "states": {},
+                }
+                for c in char_ids
+            ]
+        proto_ids = np.concatenate(
+            [np.arange(c * p, (c + 1) * p, dtype=np.int64) for c in valid]
+        )
+        ok = self._filter_mask(feats, ink_tol, *self._filter_features(proto_ids))
+        dists = self._distances(bits_row, proto_ids)
+        sizes = self.data.render_sizes.reshape(-1)[proto_ids]
+        modes = self.data.downsample_modes.reshape(-1)[proto_ids]
+        out: list[dict] = []
+        for c in char_ids:
+            c = int(c)
+            if not (0 <= c < self.data.num_classes):
+                out.append(
+                    {
+                        "char_id": c,
+                        "best_dist": area,
+                        "best_score": 0.0,
+                        "winner_meta": (-1, -1, -1, -1),
+                        "coarse_hit": False,
+                        "states": {},
+                    }
+                )
+                continue
+            sl = slice(valid.index(c) * p, (valid.index(c) + 1) * p)
+            d = dists[sl]
+            okc = ok[sl]
+            sc = sizes[sl]
+            mc = modes[sl]
+            best_j = int(np.argmin(d))
+            states: dict[str, float] = {}
+            for (size, mode) in np.unique(np.stack([sc, mc], axis=1), axis=0):
+                size_i, mode_i = int(size), int(mode)
+                sel = (sc == size_i) & (mc == mode_i)
+                dd = int(np.min(d[sel]))
+                key = (
+                    "clean"
+                    if mode_i == DOWNSAMPLE_CLEAN
+                    else f"{size_i}_{mode_i}"
+                )
+                states[key] = float(1.0 - dd / area)
+            out.append(
+                {
+                    "char_id": c,
+                    "best_dist": int(d[best_j]),
+                    "best_score": float(1.0 - int(d[best_j]) / area),
+                    "winner_meta": (
+                        int(sc[best_j]),
+                        int(self.data.dx.reshape(-1)[proto_ids[sl][best_j]]),
+                        int(self.data.dy.reshape(-1)[proto_ids[sl][best_j]]),
+                        int(mc[best_j]),
+                    ),
+                    "coarse_hit": bool(np.any(okc)),
+                    "states": states,
+                }
+            )
+        return out
+
     def _allowed_prototypes(self, allowed_ids: set[int] | None) -> NDArray[np.int64]:
         """Global prototype indices for every (optionally restricted) char."""
         if allowed_ids is None:

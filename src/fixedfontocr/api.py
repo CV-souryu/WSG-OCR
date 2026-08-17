@@ -102,6 +102,14 @@ class FixedFontOCR:
             template_backend=self._template_backend,
             gpu_stage=self._gpu_stage,
         )
+        # Probabilistic decoder (v2): built only when the model config
+        # declares a fully valid ``decoder.version == 2`` block; every
+        # other model keeps the legacy/v1 decoder byte-identical.
+        from .prob_decoder import ProbabilisticDecoder
+
+        self._prob_decoder, self._prob_decoder_warning = (
+            ProbabilisticDecoder.try_build(self.model, self.profile)
+        )
 
     # ------------------------------------------------------------------
     # Backend selection
@@ -340,6 +348,20 @@ class FixedFontOCR:
         # ``dict`` mode decodes lexicon-free: the associative dictionary
         # layer runs on the decoded result afterwards (apply_lexicon), so
         # the frozen decoder never sees dictionary evidence in this mode.
+        prob_domain = None
+        if self._prob_decoder is not None:
+            from .domain_prior import domain_prior_from_config
+
+            prob_domain = domain_prior_from_config(
+                self._prob_decoder.cfg.domain_prior_cfg,
+                self.model.charset,
+                allowed_ids=allowed,
+                lexicon=(
+                    lexicon
+                    if lexicon_mode not in ("none", "dict")
+                    else None
+                ),
+            )
         for line in find_lines(mask, self.profile):
             path = segment_line(
                 line,
@@ -354,6 +376,8 @@ class FixedFontOCR:
                     else None
                 ),
                 decoder_config=DecoderConfig(),
+                prob_decoder=self._prob_decoder,
+                prob_domain=prob_domain,
             )
             if not path.candidates:
                 continue
@@ -486,7 +510,10 @@ class FixedFontOCR:
         if (
             char_id < 0
             or int(char_id) >= len(self.model.charset)
-            or self._candidate_char(candidate) == UNKNOWN_CHAR
+            or (
+                self._prob_decoder is None
+                and self._candidate_char(candidate) == UNKNOWN_CHAR
+            )
         ):
             return UNKNOWN_CHAR, 0.0
         cid = int(char_id)

@@ -97,6 +97,8 @@ DICT_MAX_DROPS = 3           # max visible chars dropped anywhere
 DICT_MATCH_MEAN_MIN = 0.70   # matched-char mean evidence floor (regular)
 DICT_CONTEXT_BONUS = 0.04    # tie-break bonus for caller-supplied context terms
 DICT_VERIFY_TEMPLATE_MIN = 0.60  # forced target must be template-plausible
+DICT_TEMPLATE_STRONG_MIN = 0.88  # full-window template recovery floor
+DICT_TEMPLATE_RERANK_MAX = 0.80  # weak fallback score eligible for reranking
 DICT_TOP_K = 5               # per-position visual Top-K consulted
 
 
@@ -577,6 +579,9 @@ def _topk_rank_weight(
 def _dict_evidence(
     result: OCRResult,
     charset: list[str] | None,
+    *,
+    template=None,
+    template_chars: Iterable[str] = (),
 ) -> list[dict[str, float]]:
     """Per-position visual support for the decoded path (Goal 1 Top-K).
 
@@ -594,6 +599,7 @@ def _dict_evidence(
         and result.path is not None
         and len(result.path.candidates) == n
     ):
+        charset_ids = {ch: i for i, ch in enumerate(charset)}
         for i, cand in enumerate(result.path.candidates):
             scores = cand.scores
             if scores is None or not scores.char_ids:
@@ -609,6 +615,22 @@ def _dict_evidence(
                     positions[i][charset[cid]] = _dict_rank_weight(
                         rank, conf
                     )
+            if template is not None and cand.segment is not None:
+                # The ordinary Top-K evidence is deliberately cheap, but a
+                # failed dictionary association can still lose the correct
+                # character before the real-glyph fallback gets a chance.
+                # Fixed-font template scores are independent evidence and
+                # are added only for the characters in the candidate term
+                # set supplied by the caller.
+                for ch in template_chars:
+                    cid = charset_ids.get(ch)
+                    if cid is None:
+                        continue
+                    _out, score = template.match(
+                        cand.segment.mask, None, {cid}
+                    )
+                    if score > positions[i].get(ch, 0.0):
+                        positions[i][ch] = float(score)
     return positions
 
 
@@ -619,6 +641,7 @@ def _dict_rank_weight(rank: int, confidence: float) -> float:
     return table[min(rank, len(table) - 1)] * (0.5 + 0.5 * confidence)
 
 
+@functools.lru_cache(maxsize=32)
 def _dict_char_index(lex: Lexicon) -> dict[str, set[str]]:
     """char -> set of terms containing it (candidate-term prefilter)."""
 
@@ -762,6 +785,9 @@ def _assoc_match(
     lex: Lexicon,
     charset: list[str] | None = None,
     context_terms: Iterable[str] = (),
+    *,
+    template=None,
+    all_terms: bool = False,
 ) -> tuple[LexiconMatch | None, bool, tuple[tuple[int, str], ...]]:
     """``assoc_match`` plus the winner's source.
 
@@ -774,16 +800,27 @@ def _assoc_match(
     text = normalize_text(result.text)
     if not text:
         return None, False, ()
-    positions = _dict_evidence(result, charset)
     m = len(text)
+    if all_terms:
+        candidates: set[str] = set(lex.terms)
+    else:
+        index = _dict_char_index(lex)
+        candidates = set()
+        for ch in set(text):
+            candidates |= index.get(ch, set())
+    template_chars: set[str] = set()
+    if template is not None:
+        for term in candidates:
+            template_chars.update(term)
+    positions = _dict_evidence(
+        result,
+        charset,
+        template=template,
+        template_chars=template_chars,
+    )
     if m != len(positions):
         return None, False, ()
     context: frozenset[str] = frozenset(context_terms)
-
-    index = _dict_char_index(lex)
-    candidates: set[str] = set()
-    for ch in set(text):
-        candidates |= index.get(ch, set())
 
     # term -> list of (score, k, mprime, drops, forced, subs) hypotheses.
     hypotheses: dict[str, list[tuple[float, int, int, int, int, int]]] = {}
@@ -820,6 +857,21 @@ def _assoc_match(
             # already penalized per character, so they do not count twice).
             if n < m - drops:
                 score -= DICT_LEN_PEN * (m - drops - n)
+            if template is not None and drops:
+                # In this recovery pass a fully covered crop is more
+                # trustworthy than a longer term that explains only a
+                # substring and discards one visible glyph (e.g. the
+                # ``纳尔坡`` vs ``纳尔逊`` ambiguity).
+                score -= 0.10 * drops
+            if template is not None and not (
+                k == 0 and mprime == n and drops == 0
+            ) and (k == 0 or k + mprime == n):
+                # A fixed-font UI crop is much more often clipped at the
+                # left/right edge than cut out of the middle of a word.
+                # Use that geometry only in the template recovery pass and
+                # only as a near-tie prior; the normal Top-K association is
+                # byte-for-byte unchanged.
+                score += 0.03
             rows.append((score, k, mprime, drops, 0, subs, ()))
         # --- forced completion: prefix/suffix window, conflict-aware ---
         for k in (0, max(0, n - m)):
@@ -952,7 +1004,34 @@ def _assoc_match(
     exact_win = (
         k == 0 and mprime == len(best_term) and drops == 0 and text == best_term
     ) or drop_only
-    if not exact_win and second > best_score - DICT_UNIQUE_MARGIN:
+    strong_template_win = False
+    if (
+        template is not None
+        and not exact_win
+        and k == 0
+        and mprime == len(best_term)
+        and drops == 0
+        and mprime == m
+        and result.path is not None
+        and len(result.path.candidates) == m
+    ):
+        cid_map = {ch: i for i, ch in enumerate(charset or ())}
+        template_scores: list[float] = []
+        for cand, ch in zip(result.path.candidates, best_term):
+            cid = cid_map.get(ch)
+            if cid is None or cand.segment is None:
+                template_scores = []
+                break
+            _out, raw = template.match(cand.segment.mask, None, {cid})
+            template_scores.append(float(raw))
+        strong_template_win = bool(template_scores) and min(template_scores) >= (
+            DICT_TEMPLATE_STRONG_MIN
+        )
+    if (
+        not exact_win
+        and not strong_template_win
+        and second > best_score - DICT_UNIQUE_MARGIN
+    ):
         return None, False, ()
     return (
         _match(
@@ -973,6 +1052,8 @@ def _ncc_assoc_match(
     lex: Lexicon,
     bank: _realglyphs.RealGlyphBank,
     soft_glyphs: list[np.ndarray],
+    *,
+    all_terms: bool = False,
 ) -> LexiconMatch | None:
     """NCC arbitration over real-glyph prototypes (same gates as assoc).
 
@@ -980,6 +1061,14 @@ def _ncc_assoc_match(
     from real-game prototype NCC instead of classifier Top-K, so game
     renders are compared with game renders. Used only when the Top-K based
     match produced nothing, so existing hits are never re-arbitrated.
+
+    ``all_terms`` is a failure-only fallback for damaged classifier text.
+    The normal path prefilters terms by characters in the decoded text; when
+    the decoder has confused every character (for example ``塞甫`` for the
+    visible ``鹞鹰`` crop), that prefilter removes the correct term before
+    the real-glyph evidence gets a chance to help.  Scanning the complete
+    ship lexicon is intentionally opt-in because it is substantially more
+    expensive than the normal indexed path.
     """
 
     text = normalize_text(result.text)
@@ -989,10 +1078,13 @@ def _ncc_assoc_match(
     if m != len(soft_glyphs):
         return None
 
-    index = _dict_char_index(lex)
-    candidates: set[str] = set()
-    for ch in set(text):
-        candidates |= index.get(ch, set())
+    if all_terms:
+        candidates = set(lex.terms)
+    else:
+        index = _dict_char_index(lex)
+        candidates = set()
+        for ch in set(text):
+            candidates |= index.get(ch, set())
 
     # NCC evidence is a pure function of (glyph position, character), and
     # dozens of candidate terms share the same visible characters (common
@@ -1347,6 +1439,122 @@ def apply_lexicon(
         return result
     lex = load_lexicon(lexicon) if not isinstance(lexicon, Lexicon) else lexicon
 
+    # ``dict`` mode performs its own associative alignment below. It does
+    # not consume the ordinary ``Lexicon.match`` result, so avoid scanning
+    # the entire word list once before entering that path.
+    if normalized_mode == "dict":
+        matched, forced, conflicts = _assoc_match(
+            result, lex, charset, context_terms
+        )
+        assoc_matched = matched
+        # 命中后回图验证: a forced-completion hit must be template-
+        # plausible on the crop itself -- every conflict position is
+        # re-matched with the registered font's templates, and a target
+        # whose template score is too low rejects the whole hit.
+        if (
+            matched is not None
+            and forced
+            and conflicts
+            and template is not None
+            and charset
+        ):
+            cid_map = {c: i for i, c in enumerate(charset)}
+            for i, ch in conflicts:
+                if i >= len(result.path.candidates):
+                    continue
+                mask = result.path.candidates[i].segment.mask
+                target = cid_map.get(ch)
+                if target is None:
+                    continue
+                _out, tpl_score = template.match(mask, None, {target})
+                if tpl_score < DICT_VERIFY_TEMPLATE_MIN:
+                    matched = None
+                    break
+        if matched is None:
+            # A forced hypothesis rejected by image verification is still a
+            # failure for the purpose of the independent fallback passes.
+            assoc_matched = None
+        # Top-K 无解时, 用真实字形库做 NCC 仲裁 (游戏渲染 vs 游戏渲染)。
+        if matched is None and real_bank is not None and soft_glyphs:
+            matched = _ncc_assoc_match(result, lex, real_bank, soft_glyphs)
+            if matched is None:
+                # The character-index prefilter is deliberately cheap, but
+                # a fully confused OCR string can hide the correct term
+                # from it.  Retry only after the indexed NCC path fails.
+                matched = _ncc_assoc_match(
+                    result,
+                    lex,
+                    real_bank,
+                    soft_glyphs,
+                    all_terms=True,
+                )
+        if template is not None and (
+            assoc_matched is None
+            or (
+                matched is not None
+                and matched.kind != "exact"
+                and matched.score < DICT_TEMPLATE_RERANK_MAX
+            )
+        ):
+            # Failure-only template recovery.  The regular association is
+            # intentionally Top-K driven; when every target character is
+            # just outside that list, the registered fixed-font templates
+            # can still provide an independent per-position signal.  Keep
+            # the indexed pass bounded by terms sharing at least one visible
+            # character, then use the full lexicon only for fully confused
+            # crops. A strong real-glyph result remains authoritative.
+            template_indexed, _, _ = _assoc_match(
+                result,
+                lex,
+                charset,
+                context_terms,
+                template=template,
+            )
+            template_match = template_indexed
+            if template_match is None or template_match.kind != "exact":
+                template_all, _, _ = _assoc_match(
+                    result,
+                    lex,
+                    charset,
+                    context_terms,
+                    template=template,
+                    all_terms=True,
+                )
+                if (
+                    template_all is not None
+                    and (
+                        template_match is None
+                        or template_all.score > template_match.score
+                    )
+                ):
+                    template_match = template_all
+            if template_match is not None:
+                current_score = matched.score if matched is not None else -1.0
+                template_score = template_match.score
+                if (
+                    matched is None
+                    or template_score >= current_score + 0.05
+                ):
+                    matched = template_match
+        if matched is None:
+            return replace(
+                result,
+                text="",
+                confidence=0.0,
+                chars=(),
+                matched_term=None,
+                matched_span=None,
+                lexicon_match=None,
+                alternatives=(),
+            )
+        matched = replace(matched, mode="dict")
+        return replace(
+            result,
+            matched_term=matched.term,
+            matched_span=matched.span,
+            lexicon_match=matched,
+        )
+
     text = normalize_text(result.text)
     matches = lex.match(text)
     top = matches[0] if matches else None
@@ -1406,55 +1614,6 @@ def apply_lexicon(
         if guessed is not None:
             return guessed
         return out
-
-    if normalized_mode == "dict":
-        matched, forced, conflicts = _assoc_match(
-            result, lex, charset, context_terms
-        )
-        # 命中后回图验证: a forced-completion hit must be template-
-        # plausible on the crop itself -- every conflict position is
-        # re-matched with the registered font's templates, and a target
-        # whose template score is too low rejects the whole hit.
-        if (
-            matched is not None
-            and forced
-            and conflicts
-            and template is not None
-            and charset
-        ):
-            cid_map = {c: i for i, c in enumerate(charset)}
-            for i, ch in conflicts:
-                if i >= len(result.path.candidates):
-                    continue
-                mask = result.path.candidates[i].segment.mask
-                target = cid_map.get(ch)
-                if target is None:
-                    continue
-                _out, tpl_score = template.match(mask, None, {target})
-                if tpl_score < DICT_VERIFY_TEMPLATE_MIN:
-                    matched = None
-                    break
-        # Top-K 无解时, 用真实字形库做 NCC 仲裁 (游戏渲染 vs 游戏渲染)。
-        if matched is None and real_bank is not None and soft_glyphs:
-            matched = _ncc_assoc_match(result, lex, real_bank, soft_glyphs)
-        if matched is None:
-            return replace(
-                result,
-                text="",
-                confidence=0.0,
-                chars=(),
-                matched_term=None,
-                matched_span=None,
-                lexicon_match=None,
-                alternatives=(),
-            )
-        matched = replace(matched, mode="dict")
-        return replace(
-            result,
-            matched_term=matched.term,
-            matched_span=matched.span,
-            lexicon_match=matched,
-        )
 
     # strict
     if top is not None and top.kind == "exact":

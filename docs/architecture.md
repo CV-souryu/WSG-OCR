@@ -368,6 +368,17 @@ Z17    -> Z17
 
 No `stroke_width = 2` special case is needed.
 
+The lattice is measured by the **oracle lattice recall** metric
+(`src/fixedfontocr/oracle.py`, `docs/oracle_recall.md`): ignoring scores,
+is the ground-truth segmentation present in the candidate lattice?  A
+missing oracle path is a segmentation problem (no CNN can recover it); a
+present oracle path with a wrong decode is a classification/decoding
+problem.  The oracle's failure report names the missing cut position
+(straddled boundaries) and the per-character best coverage, which is what
+guides the semi-Markov lattice upgrade (forced cuts near font advance
+multiples, min-cost seam cuts) when fully-touching glyphs (`LV`, `4+3`,
+`U-`) have no vertical valley.
+
 ## Joint decoder (Goal 13)
 
 The decoder is the new architecture's core. Its inputs are the scored

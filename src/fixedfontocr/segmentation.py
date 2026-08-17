@@ -99,7 +99,7 @@ def build_candidates(
 
     if max_merge_components < 1:
         raise ValueError("max_merge_components must be >= 1")
-    atoms, expected_width = _expand_atoms(
+    atoms, expected_width = expand_atoms(
         comps,
         profile,
         max_merge_components,
@@ -261,14 +261,20 @@ def _split_atoms(
     return [_Atom(component_index=component_index, segment=p) for p in pieces]
 
 
-def _expand_atoms(
+def expand_atoms(
     comps: list[Component],
     profile: Profile,
     max_merge_components: int,
-    split_wide: bool,
+    split_wide: bool = True,
     geometry: FontGeometryDatabase | None = None,
 ) -> tuple[list[_Atom], float]:
-    """Build the atom sequence, keeping every original component reachable."""
+    """Build the atom sequence, keeping every original component reachable.
+
+    Public so diagnostic tools (e.g. the oracle lattice recall metric in
+    :mod:`fixedfontocr.oracle`) can inspect the exact atom sequence the
+    lattice is built from. ``build_candidates`` calls this internally;
+    the oracle calls it again so its atom view always matches the lattice.
+    """
 
     expected = _estimate_expected_width(comps, profile, geometry)
     atoms: list[_Atom] = []
@@ -292,6 +298,10 @@ def _expand_atoms(
     # 追赶者).
     atoms.sort(key=lambda atom: (atom.segment.x, atom.segment.y, atom.component_index))
     return atoms, expected
+
+
+# Private-name compatibility alias (pre-Goal-21 name).
+_expand_atoms = expand_atoms
 
 
 def _passes_filters(

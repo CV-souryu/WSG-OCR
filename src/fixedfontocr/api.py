@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +19,7 @@ from .backends import (
     benchmark_backends,
 )
 from .classifier import TemplateV2Classifier
-from .decoder import DecoderConfig
+from .decoder import DecoderConfig, decode_lattice
 from .frontend import extract_frontend
 from .geometry import char_geometry
 from .lexicon import Lexicon, apply_lexicon, is_lexicon_ref, load_lexicon
@@ -442,7 +442,7 @@ class FixedFontOCR:
                     )
                     for cand in paths[0].candidates
                 ]
-        return apply_lexicon(
+        lexicon_result = apply_lexicon(
             result,
             lexicon,
             lexicon_mode,
@@ -451,6 +451,128 @@ class FixedFontOCR:
             template=self._scorer.template,
             soft_glyphs=soft_glyphs,
             real_bank=bank_obj,
+        )
+        if (
+            lexicon_mode == "dict"
+            and self.backend == "cpu"
+            and lexicon is not None
+            and lexicon_result.matched_term is None
+        ):
+            # A dict-mode result is intentionally conservative: it keeps the
+            # visible text and only annotates a term.  If the frozen visual
+            # path contains segmentation fragments, however, the associative
+            # pass has no usable character sequence to align.  Retry only
+            # these misses with the lexicon-aware Top-K decoder.  This is a
+            # failure-only fallback, so existing dict hits and the public
+            # never-rewrite contract remain unchanged.
+            fallback = self._topk_fallback_from_lattice(
+                result,
+                lexicon,
+                context_terms,
+            )
+            if fallback is None:
+                # Multi-line or probabilistic paths may not expose a
+                # reusable scored lattice.  Keep the generic retry for
+                # those callers; the ship CPU path takes the fast branch.
+                fallback = self.recognize(
+                    image,
+                    allowed_chars=allowed_chars,
+                    lexicon=lexicon,
+                    lexicon_mode="topk",
+                    context_terms=context_terms,
+                )
+            fallback_kind = (
+                fallback.lexicon_match.kind
+                if fallback.lexicon_match is not None
+                else None
+            )
+            # A failure fallback may see a short dictionary substring inside
+            # unrelated noise (``...雷`` is one such crop).  That is not
+            # enough to turn dict-mode output into a ship term.  Full terms
+            # and the existing crop-aware kinds remain eligible.
+            if (
+                fallback.matched_term is not None
+                and fallback_kind
+                in {"exact", "prefix_crop", "suffix_crop", "inner_crop"}
+            ):
+                fallback_match = fallback.lexicon_match
+                if fallback_match is not None:
+                    fallback_match = replace(fallback_match, mode="dict")
+                return replace(
+                    result,
+                    matched_term=fallback.matched_term,
+                    matched_span=fallback.matched_span,
+                    lexicon_match=fallback_match,
+                )
+        return lexicon_result
+
+    def _topk_fallback_from_lattice(
+        self,
+        result: OCRResult,
+        lexicon: str | Path | Lexicon,
+        context_terms: Iterable[str] = (),
+    ) -> OCRResult | None:
+        """Retry a dict miss using the already-scored candidate lattice.
+
+        ``dict`` mode normally decodes without dictionary evidence so that
+        visible text is not rewritten by a weak word prior.  On a miss, the
+        old fallback re-ran frontend extraction, segmentation, and every
+        classifier batch.  Ship crops are single-line inputs, so reuse their
+        frozen lattice and pay only for the lexicon-aware beam decode.
+        """
+
+        if self._prob_decoder is not None:
+            return None
+        if result.path is None or result.path.lattice is None:
+            return None
+        lex = lexicon if isinstance(lexicon, Lexicon) else load_lexicon(lexicon)
+        path = decode_lattice(
+            result.path.lattice,
+            self.model.charset,
+            lex,
+            DecoderConfig(),
+            geometry=self._scorer.geometry,
+            beam=True,
+        )
+        if not path.candidates:
+            return None
+        decoded: list[tuple[VisualCandidate, str, float]] = []
+        for i, cand in enumerate(path.candidates):
+            cid = (
+                int(path.char_ids[i])
+                if i < len(path.char_ids)
+                else self._top_char_id(cand)
+            )
+            char, conf = self._path_char_result(cand, cid)
+            decoded.append((cand, char, conf))
+        if not decoded:
+            return None
+        text = "".join(char for _, char, _ in decoded)
+        confidence = float(np.mean([conf for _, _, conf in decoded]))
+        candidate_result = OCRResult(
+            text=text,
+            confidence=confidence,
+            chars=tuple(
+                CharResult(
+                    char=char,
+                    x=cand.segment.x,
+                    y=cand.segment.y,
+                    w=cand.segment.w,
+                    h=cand.segment.h,
+                    confidence=conf,
+                )
+                for cand, char, conf in decoded
+            ),
+            alternatives=self._alternatives([path]),
+            path=path,
+        )
+        return apply_lexicon(
+            candidate_result,
+            lex,
+            "topk",
+            charset=self.model.charset,
+            context_terms=context_terms,
+            template=self._scorer.template,
         )
 
     def _top_char_id(self, candidate: VisualCandidate) -> int:

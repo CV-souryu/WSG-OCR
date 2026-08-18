@@ -5,6 +5,17 @@ for the hard cases" strategy: the same model files feed a numpy CPU backend
 and a WGPU compute backend, and the engine benchmarks them at startup so
 `backend="auto"` picks the faster one per batch size instead of guessing.
 
+## Current project target: same-font game ship-name crops
+
+The target is ship-name OCR from the registered game font under
+`fonts/SourceHanSansSC/`, evaluated on real screenshot crops. `result.text`
+keeps the visible text; `result.matched_term` may identify the complete ship
+name without fabricating missing characters into `result.text`.
+
+For example, `C5   C1C2` may be a circular window of `C1C2C3C4C5`. This is a
+sequence/lexicon problem above the frozen local TinyCNN (`24x24` input), not a
+reason to expand the CNN dimensions.
+
 ## Repository layout
 
 ```
@@ -371,6 +382,36 @@ visible instead of being dropped. The corpus currently contains 256 real
 game samples (the Goal 18 100+ milestone); 500+ / 1000+ accumulation is the
 next step as more real screenshots are labeled.
 
+### `crops_items` acceptance set
+
+The focused acceptance set is:
+
+```text
+images: fonts/SourceHanSansSC/crops/crops_items/
+answer key: fonts/SourceHanSansSC/crops/crops_items_recognition.csv
+real glyph bank: fonts/SourceHanSansSC/crops/crops_items_recognition.csv.realglyphs.npz
+```
+
+There are currently 238 matching image rows: 235 labeled rows and 3 rows with
+an empty `预期值`, which are excluded from accuracy. The answer-key columns are:
+
+| column | meaning |
+| --- | --- |
+| `文件名` | image name under `crops_items/` |
+| `文本值` | expected visible OCR text (`result.text`) |
+| `预期值` | expected complete ship entity (`result.matched_term`) |
+| `识别结果` | generated output; not ground truth |
+
+The full CSV-driven parity check is
+`tests/test_goal20_crops_gpu.py::test_crops_gpu_dict_mode_csv_answers_single_submit`.
+It compares CPU/WGPU results against the labeled CSV rows. The CSV remains the
+source of truth regardless of backend.
+
+Do not use `crops_items_recognition_report.csv` as the answer key: it is a
+generated report of recognition results. When the CSV is updated, update the
+labels first and then regenerate/validate derived reports and the real-glyph
+bank.
+
 ## UI-limited charsets (`allowed_chars`)
 
 Fixed-font UI fields rarely use the full charset. Restrict the output
@@ -642,11 +683,10 @@ spacing, and normalized size. Pass a custom profile to
   the blob, or (b) the blob has zero template support and ≥ 2 of its
   atoms are full-size confident glyphs. Real glyphs keep their template-
   confirmed whole (raw score ≥ 0.9 / template-chosen Top-1). On the
-  labeled `fonts/SourceHanSansSC/crops/crops_items` corpus this fixes
-  `Z17`/`Z28`/`Z1`/`47工程` in every lexicon mode with zero regressions
-  against the CSV baseline, and dict+real-glyph-bank mode now resolves
-  233/235 labeled items (remaining rejects: a `4+3` blob read as `“` and
-  a crop missing half of `乌戈里尼·维瓦尔迪`).
+  CSV-keyed `fonts/SourceHanSansSC/crops/crops_items` corpus this protects
+  `Z17`/`Z28`/`Z1`/`47工程` from touching-glyph merge errors. The current
+  acceptance count is always computed from rows with a non-empty `预期值`;
+  historical recognition reports are not answer keys.
 - Goal 12 partial-word support is implemented: a screen crop of a
   dictionary term is matched as `prefix_crop` / `suffix_crop` / `inner_crop`
   while internally missing characters are ranked as `gap_crop` with a
@@ -764,8 +804,9 @@ spacing, and normalized size. Pass a custom profile to
   into the same encoder for soft-input hybrids, so a full OCR line
   (G2+G3+G4) comes out of ONE submit / ONE `map_sync` — the whole
   `recognize()` on the crops_items dict corpus is verified to be a single
-  GPU submission (trip-wired tests) with answers matching
-  `crops_items_recognition.csv` and `backend="wgpu" == backend="cpu"`.
+  GPU submission (trip-wired tests) with answers matching the non-empty
+  `预期值` rows in `crops_items_recognition.csv` and
+  `backend="wgpu" == backend="cpu"`.
   The visual DP intentionally stays on CPU: `decode_dp` uses f64
   arithmetic with a 1e-12 tie tolerance that f32 WGSL cannot reproduce,
   and it is microsecond-scale — fonts/goal keeps the decoder on the CPU
